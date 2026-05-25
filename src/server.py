@@ -5,9 +5,14 @@ ffmpeg subprocess that tiles the configured channels and pipes MPEG-TS output
 back to the client. The subprocess is killed when the client disconnects.
 Zero ffmpeg processes run when nobody is watching.
 
+Each channel is opened via Dispatcharr's ProxyServer internal API so that
+full fallback/profile behaviour is respected and connections appear in the
+Dispatcharr stats view with user-agent "multiview-plugin".
+
 Routes:
-  GET /health      Health check
-  GET /stream/{n}  MPEG-TS multiview stream for layout n (1-based)
+  GET /health              Health check
+  GET /stream/{n}          MPEG-TS multiview stream for layout n (1-based)
+  GET /internal/ch/{uuid}  Internal per-channel TS feed consumed by ffmpeg
 """
 
 import logging
@@ -16,6 +21,7 @@ import os
 import socket
 import subprocess
 import threading
+import uuid as _uuid_module
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +83,6 @@ def _featured_filter(n: int) -> tuple[str, list[str]]:
         parts.append(f"[{i}:v]scale={side_w}:{side_h}[s{i}]")
 
     if side_count == 1:
-        parts.append("[s1][main]hstack=inputs=2[v]")
-        # swap order so main is on left
         parts[-1] = "[main][s1]hstack=inputs=2[v]"
     else:
         side_inputs = "".join(f"[s{i}]" for i in range(1, n))
@@ -89,16 +93,12 @@ def _featured_filter(n: int) -> tuple[str, list[str]]:
     return filter_complex, ["-map", "[v]", "-map", "0:a"]
 
 
-def _build_ffmpeg_cmd(
-    input_urls: list[str],
-    layout: str,
-    dispatcharr_base_url: str,
-) -> list[str]:
+def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
     n = len(input_urls)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
 
     for url in input_urls:
-        cmd += ["-user_agent", "multiview-plugin", "-i", url]
+        cmd += ["-i", url]
 
     if layout == "featured":
         filter_complex, map_args = _featured_filter(n)
@@ -140,13 +140,17 @@ class MultiviewServer:
                 return [b"Invalid stream index\n"]
             return self._serve_stream(n, start_response)
 
+        if path.startswith("/internal/ch/"):
+            channel_id = path[len("/internal/ch/"):]
+            return self._serve_channel_internal(channel_id, start_response)
+
         start_response("404 Not Found", [("Content-Type", "text/plain")])
         return [b"Not Found\n"]
 
     def _serve_stream(self, n: int, start_response):
         logger.info(f"Stream request: layout {n}")
         try:
-            settings, input_urls, layout = self._resolve_layout(n)
+            input_urls, layout = self._resolve_layout(n)
         except LookupError as e:
             logger.warning(f"Layout {n} not ready: {e}")
             start_response("404 Not Found", [("Content-Type", "text/plain")])
@@ -156,10 +160,9 @@ class MultiviewServer:
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
             return [b"Server error\n"]
 
-        dispatcharr_url = settings.get("dispatcharr_base_url", "http://localhost:9191")
-        cmd = _build_ffmpeg_cmd(input_urls, layout, dispatcharr_url)
+        cmd = _build_ffmpeg_cmd(input_urls, layout)
         logger.info(
-            f"Starting ffmpeg: layout={n} inputs={len(input_urls)} layout_style={layout} "
+            f"Starting ffmpeg: layout={n} inputs={len(input_urls)} style={layout} "
             f"urls={input_urls}"
         )
 
@@ -205,11 +208,146 @@ class MultiviewServer:
 
         return stream_gen()
 
-    def _resolve_layout(self, n: int) -> tuple[dict, list[str], str]:
-        """Return (settings, [stream_urls], layout_name) for layout n."""
+    def _serve_channel_internal(self, channel_id: str, start_response):
+        """Serve a single channel's TS stream via Dispatcharr's ProxyServer.
+
+        This is the internal endpoint that ffmpeg calls as an input. It opens
+        the channel through Dispatcharr's proxy infrastructure (full fallback,
+        stream profiles, stats) without going through the HTTP proxy endpoint
+        (which may be behind a network-access CIDR check).
+        """
+        try:
+            _uuid_module.UUID(channel_id)
+        except ValueError:
+            start_response("400 Bad Request", [("Content-Type", "text/plain")])
+            return [b"Invalid channel UUID\n"]
+
+        logger.info(f"Internal channel request: {channel_id}")
+
+        try:
+            from apps.proxy.live_proxy.server import ProxyServer
+            from apps.proxy.live_proxy.services.channel_service import ChannelService
+            from apps.proxy.live_proxy.url_utils import generate_stream_url
+            from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
+            from apps.channels.models import Channel
+        except ImportError as e:
+            logger.error(f"Import error in _serve_channel_internal: {e}")
+            start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
+            return [b"Server error\n"]
+
+        try:
+            proxy_server = ProxyServer.get_instance()
+        except Exception as e:
+            logger.error(f"Could not get ProxyServer instance: {e}")
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Proxy server unavailable\n"]
+
+        channel_initializing = False
+
+        if not proxy_server.check_if_channel_exists(channel_id):
+            stream_url, stream_ua, transcode, profile_value = generate_stream_url(channel_id)
+            if not stream_url:
+                logger.warning(f"No stream available for channel {channel_id}")
+                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+                return [b"No stream available for this channel\n"]
+
+            # generate_stream_url set channel_stream:{ch.id} and stream_profile:{stream_id}
+            # in Redis — read them back so initialize_channel can record the full context
+            stream_id = None
+            m3u_profile_id = None
+            if proxy_server.redis_client:
+                try:
+                    ch = Channel.objects.get(uuid=channel_id)
+                    raw = proxy_server.redis_client.get(f"channel_stream:{ch.id}")
+                    if raw:
+                        stream_id = int(raw)
+                        raw2 = proxy_server.redis_client.get(f"stream_profile:{stream_id}")
+                        if raw2:
+                            m3u_profile_id = int(raw2)
+                except Exception as e:
+                    logger.warning(f"Could not read stream assignment from Redis: {e}")
+
+            success = ChannelService.initialize_channel(
+                channel_id,
+                stream_url,
+                stream_ua,
+                transcode,
+                profile_value,
+                stream_id,
+                m3u_profile_id,
+            )
+            if not success:
+                logger.error(f"Failed to initialize channel {channel_id}")
+                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+                return [b"Failed to initialize channel\n"]
+
+            channel_initializing = True
+        else:
+            # Channel already running — ensure this worker has a local buffer and
+            # client_manager (the channel may be owned by a different worker)
+            proxy_server.initialize_channel(None, channel_id, None)
+
+        # Wait for the buffer to be set up (initialize_channel creates it synchronously
+        # but guard in case of a race with channel teardown)
+        try:
+            import gevent
+            _sleep = gevent.sleep
+        except ImportError:
+            import time
+            _sleep = time.sleep
+
+        source_buffer = None
+        for _ in range(30):
+            source_buffer = proxy_server.get_buffer(channel_id)
+            if source_buffer is not None:
+                break
+            _sleep(0.2)
+
+        if source_buffer is None:
+            logger.warning(f"Buffer not available for channel {channel_id}")
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Stream buffer unavailable\n"]
+
+        for _ in range(15):
+            if channel_id in proxy_server.client_managers:
+                break
+            _sleep(0.2)
+
+        if channel_id not in proxy_server.client_managers:
+            logger.warning(f"Client manager not available for channel {channel_id}")
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Client manager unavailable\n"]
+
+        client_id = str(_uuid_module.uuid4())
+        proxy_server.client_managers[channel_id].add_client(
+            client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
+        )
+        logger.info(f"Registered multiview client {client_id} for channel {channel_id}")
+
+        start_response("200 OK", [
+            ("Content-Type", "video/mp2t"),
+            ("Cache-Control", "no-cache"),
+            ("Transfer-Encoding", "chunked"),
+        ])
+
+        def stream_gen():
+            gen = StreamGenerator(
+                channel_id=channel_id,
+                client_id=client_id,
+                client_ip="127.0.0.1",
+                client_user_agent="multiview-plugin",
+                channel_initializing=channel_initializing,
+                buffer=source_buffer,
+            )
+            yield from gen.generate()
+
+        return stream_gen()
+
+    def _resolve_layout(self, n: int) -> tuple[list[str], str]:
+        """Return ([internal_channel_urls], layout_name) for layout n."""
         from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
-        from .config import PLUGIN_DB_KEY, DEFAULT_DISPATCHARR_URL
+        from .config import PLUGIN_DB_KEY
 
         try:
             cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
@@ -217,28 +355,26 @@ class MultiviewServer:
         except Exception:
             settings = {}
 
-        dispatcharr_url = settings.get("dispatcharr_base_url", DEFAULT_DISPATCHARR_URL).rstrip("/")
         ch_count = max(2, int(settings.get(f"multiview_{n}_channel_count", 4)))
         layout = settings.get(f"multiview_{n}_layout", "auto")
 
-        logger.info(
-            f"Resolving layout {n}: ch_count={ch_count} style={layout} "
-            f"dispatcharr_url={dispatcharr_url}"
-        )
+        logger.info(f"Resolving layout {n}: ch_count={ch_count} style={layout}")
         input_urls = []
+
         for m in range(1, ch_count + 1):
-            ch_id = settings.get(f"multiview_{n}_channel_{m}", "_none")
-            if not ch_id or ch_id == "_none":
+            ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
+            if not ch_id_str or ch_id_str == "_none":
                 raise LookupError(f"Layout {n} channel {m} is not configured")
             try:
-                ch = Channel.objects.get(id=int(ch_id))
+                ch = Channel.objects.get(id=int(ch_id_str))
             except Channel.DoesNotExist:
-                raise LookupError(f"Channel id={ch_id} not found")
-            url = f"{dispatcharr_url}/proxy/ts/stream/{ch.uuid}"
-            logger.info(f"  channel {m}: id={ch_id} name={ch.name!r} url={url}")
+                raise LookupError(f"Channel id={ch_id_str} not found")
+
+            url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
+            logger.info(f"  channel {m}: id={ch_id_str} name={ch.name!r} url={url}")
             input_urls.append(url)
 
-        return settings, input_urls, layout
+        return input_urls, layout
 
     # -- Lifecycle -------------------------------------------------------------
 

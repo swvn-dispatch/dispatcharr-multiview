@@ -9,7 +9,6 @@ PLUGIN_DB_KEY = "multiview"
 
 DEFAULT_SERVER_PORT = 9292
 DEFAULT_SERVER_HOST = "0.0.0.0"
-DEFAULT_DISPATCHARR_URL = "http://localhost:9191"
 
 
 def _load_plugin_config() -> dict:
@@ -23,18 +22,6 @@ PLUGIN_CONFIG = _load_plugin_config()
 # ── Global fields (always shown) ─────────────────────────────────────────────
 
 _GLOBAL_FIELDS = [
-    {
-        "id": "dispatcharr_base_url",
-        "label": "Dispatcharr Base URL",
-        "type": "string",
-        "default": DEFAULT_DISPATCHARR_URL,
-        "description": (
-            "Internal base URL of your Dispatcharr instance. "
-            "FFmpeg uses this to fetch the individual channel streams. "
-            "Use http://localhost:PORT matching your Dispatcharr setup"
-        ),
-        "placeholder": "http://localhost:9191",
-    },
     {
         "id": "server_host",
         "label": "Streaming Server Host",
