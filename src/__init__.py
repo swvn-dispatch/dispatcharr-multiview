@@ -32,27 +32,11 @@ class Plugin:
     actions = [
         {
             "id": "generate_m3u",
-            "label": "Generate M3U",
+            "label": "Regenerate M3U",
             "description": "Write multiview.m3u to the plugin folder and create/update the M3U account in Dispatcharr",
-            "button_label": "Generate M3U",
+            "button_label": "Regenerate M3U",
             "button_variant": "filled",
             "button_color": "green",
-        },
-        {
-            "id": "start_server",
-            "label": "Start / Restart Server",
-            "description": "Start (or restart) the multiview streaming server",
-            "button_label": "Start / Restart Server",
-            "button_variant": "filled",
-            "button_color": "orange",
-        },
-        {
-            "id": "stop_server",
-            "label": "Stop Server",
-            "description": "Stop the multiview streaming server",
-            "button_label": "Stop Server",
-            "button_variant": "filled",
-            "button_color": "red",
         },
         {
             "id": "status",
@@ -63,6 +47,26 @@ class Plugin:
             "button_color": "blue",
         },
     ]
+
+    # -- Lifecycle (init) ------------------------------------------------------
+
+    def __init__(self):
+        try:
+            self._autostart()
+        except Exception as e:
+            logger.warning(f"Multiview server auto-start skipped: {e}")
+
+    def _autostart(self):
+        existing = get_server()
+        if existing and existing.is_running():
+            return
+        try:
+            from apps.plugins.models import PluginConfig
+            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
+            settings = cfg.settings
+        except Exception:
+            settings = {}
+        self._start_server(settings)
 
     # -- Dynamic fields --------------------------------------------------------
 
@@ -84,12 +88,6 @@ class Plugin:
 
         if action == "generate_m3u":
             return self._generate_m3u(settings)
-
-        if action == "start_server":
-            return self._start_server(settings)
-
-        if action == "stop_server":
-            return self._stop_server()
 
         if action == "status":
             return self._status()
@@ -161,15 +159,6 @@ class Plugin:
             "status": "error",
             "message": f"Failed to start server on {host}:{port} — port may be in use",
         }
-
-    # -- stop_server -----------------------------------------------------------
-
-    def _stop_server(self) -> dict:
-        server = get_server()
-        if server and server.is_running():
-            server.stop()
-            return {"status": "success", "message": "Multiview server stopped"}
-        return {"status": "success", "message": "Server was not running"}
 
     # -- status ----------------------------------------------------------------
 

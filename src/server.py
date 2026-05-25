@@ -98,7 +98,7 @@ def _build_ffmpeg_cmd(
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
 
     for url in input_urls:
-        cmd += ["-i", url]
+        cmd += ["-user_agent", "multiview-plugin", "-i", url]
 
     if layout == "featured":
         filter_complex, map_args = _featured_filter(n)
