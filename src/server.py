@@ -205,8 +205,8 @@ class MultiviewServer:
 
         input_urls = []
         for m in range(1, ch_count + 1):
-            ch_id = settings.get(f"multiview_{n}_channel_{m}", "")
-            if not ch_id:
+            ch_id = settings.get(f"multiview_{n}_channel_{m}", "_none")
+            if not ch_id or ch_id == "_none":
                 raise LookupError(f"Layout {n} channel {m} is not configured")
             try:
                 ch = Channel.objects.get(id=int(ch_id))

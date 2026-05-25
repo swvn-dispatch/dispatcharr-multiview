@@ -76,7 +76,7 @@ _LAYOUT_OPTIONS = [
 
 def _build_channel_options() -> list:
     """Return channel select options from the live DB at render time."""
-    opts = [{"value": "", "label": "— select channel —"}]
+    opts = [{"value": "_none", "label": "— select channel —"}]
     try:
         from apps.channels.models import Channel
 
@@ -140,7 +140,7 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
                 "id": f"multiview_{n}_channel_{m}",
                 "label": f"Layout {n} – Channel {m}{audio_note}",
                 "type": "select",
-                "default": "",
+                "default": "_none",
                 "options": channel_options,
                 "description": (
                     "Audio from channel 1 only; all other channels are muted in the output"
