@@ -298,7 +298,6 @@ class MultiviewServer:
                 return False
             channel_initializing = True
         else:
-            proxy_server.initialize_channel(None, channel_id, None)
             channel_initializing = False
 
         try:
@@ -345,23 +344,27 @@ class MultiviewServer:
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [b"Proxy server unavailable\n"]
 
-        try:
-            channel_initializing = self._ensure_channel_initialized(channel_id)
-        except Exception as e:
-            logger.error(f"Channel init error {channel_id}: {e}", exc_info=True)
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Failed to initialize channel\n"]
-
         source_buffer = proxy_server.get_buffer(channel_id)
-        if source_buffer is None:
-            logger.warning(f"Buffer not available for channel {channel_id}")
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Stream buffer unavailable\n"]
+        if source_buffer is not None and channel_id in proxy_server.client_managers:
+            channel_initializing = False
+        else:
+            try:
+                channel_initializing = self._ensure_channel_initialized(channel_id)
+            except Exception as e:
+                logger.error(f"Channel init error {channel_id}: {e}", exc_info=True)
+                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+                return [b"Failed to initialize channel\n"]
 
-        if channel_id not in proxy_server.client_managers:
-            logger.warning(f"Client manager not available for channel {channel_id}")
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Client manager unavailable\n"]
+            source_buffer = proxy_server.get_buffer(channel_id)
+            if source_buffer is None:
+                logger.warning(f"Buffer not available for channel {channel_id}")
+                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+                return [b"Stream buffer unavailable\n"]
+
+            if channel_id not in proxy_server.client_managers:
+                logger.warning(f"Client manager not available for channel {channel_id}")
+                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+                return [b"Client manager unavailable\n"]
 
         client_id = str(_uuid_module.uuid4())
         proxy_server.client_managers[channel_id].add_client(
