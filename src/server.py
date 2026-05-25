@@ -98,6 +98,7 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
     for url in input_urls:
         cmd += [
             "-f", "mpegts",
+            "-fflags", "+discardcorrupt+genpts+nobuffer",
             "-analyzeduration", "2000000",
             "-probesize", "1048576",
             "-thread_queue_size", "1024",
@@ -114,8 +115,13 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
 
     cmd += ["-filter_complex", filter_complex]
     cmd += map_args
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-level:v", "5.1"]
-    cmd += ["-c:a", "aac", "-b:a", "128k"]
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-level:v", "5.1",
+        "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+    ]
+    cmd += ["-c:a", "ac3"]
+    cmd += ["-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity"]
     cmd += ["-f", "mpegts", "pipe:1"]
     return cmd
 
