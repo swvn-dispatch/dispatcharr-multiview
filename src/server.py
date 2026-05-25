@@ -93,7 +93,7 @@ def _featured_filter(n: int) -> tuple[str, list[str]]:
 
 def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
     n = len(input_urls)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
 
     for url in input_urls:
         cmd += [
@@ -206,7 +206,7 @@ class MultiviewServer:
             ("Transfer-Encoding", "chunked"),
         ])
 
-        PRE_ROLL = 2 * 1024 * 1024
+        PRE_ROLL = 512 * 1024
         pre_roll_buf = bytearray()
 
         def stream_gen():
@@ -227,6 +227,12 @@ class MultiviewServer:
                         bytes_sent += len(chunk)
                         yield chunk
             finally:
+                if pre_roll_buf:
+                    try:
+                        yield bytes(pre_roll_buf)
+                        bytes_sent += len(pre_roll_buf)
+                    except Exception:
+                        pass
                 try:
                     proc.kill()
                     proc.wait()
