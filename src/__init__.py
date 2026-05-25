@@ -7,6 +7,7 @@ number of channel inputs and either an auto-grid or featured arrangement.
 
 import logging
 import os
+import socket
 
 from .config import (
     PLUGIN_CONFIG,
@@ -66,6 +67,13 @@ class Plugin:
             settings = cfg.settings
         except Exception:
             settings = {}
+        port = int(settings.get("server_port", DEFAULT_SERVER_PORT))
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                logger.info(f"Multiview server already running on port {port}")
+                return
+        except OSError:
+            pass
         self._start_server(settings)
 
     # -- Dynamic fields --------------------------------------------------------
@@ -164,13 +172,22 @@ class Plugin:
 
     def _status(self) -> dict:
         server = get_server()
-        if server and server.is_running():
-            return {
-                "status": "success",
-                "message": f"Server running on http://{server.host}:{server.port}/",
-                "running": True,
-            }
-        return {"status": "success", "message": "Server is not running", "running": False}
+        port = server.port if server else DEFAULT_SERVER_PORT
+        try:
+            from apps.plugins.models import PluginConfig
+            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
+            port = int(cfg.settings.get("server_port", port))
+        except Exception:
+            pass
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return {
+                    "status": "success",
+                    "message": f"Server running on http://127.0.0.1:{port}/",
+                    "running": True,
+                }
+        except OSError:
+            return {"status": "success", "message": "Server is not running", "running": False}
 
     # -- Lifecycle -------------------------------------------------------------
 
