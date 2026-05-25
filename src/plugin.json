@@ -1,0 +1,7 @@
+{
+  "name": "Multiview",
+  "version": "0.1.0",
+  "description": "Tile multiple Dispatcharr channel streams into multi-view outputs using FFmpeg",
+  "author": "sethwv",
+  "help_url": "https://github.com/swvn-dispatch/dispatcharr-multiview"
+}
