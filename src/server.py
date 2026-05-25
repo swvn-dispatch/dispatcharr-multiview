@@ -98,8 +98,8 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
     for url in input_urls:
         cmd += [
             "-f", "mpegts",
-            "-analyzeduration", "500000",
-            "-probesize", "32768",
+            "-analyzeduration", "2000000",
+            "-probesize", "1048576",
             "-thread_queue_size", "1024",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -114,7 +114,7 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
 
     cmd += ["-filter_complex", filter_complex]
     cmd += map_args
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"]
+    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-level:v", "5.1"]
     cmd += ["-c:a", "aac", "-b:a", "128k"]
     cmd += ["-f", "mpegts", "pipe:1"]
     return cmd
@@ -170,8 +170,7 @@ class MultiviewServer:
         channel_uuids = [url.rsplit("/", 1)[1] for url in input_urls]
         try:
             import gevent
-            pool = gevent.get_hub().threadpool
-            jobs = [pool.spawn(self._ensure_channel_initialized, uuid) for uuid in channel_uuids]
+            jobs = [gevent.spawn(self._ensure_channel_initialized, uuid) for uuid in channel_uuids]
             gevent.joinall(jobs, timeout=40)
             logger.info(f"Pre-warmed {len(channel_uuids)} channels")
         except ImportError:
