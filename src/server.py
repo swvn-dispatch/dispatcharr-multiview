@@ -99,7 +99,7 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
         cmd += [
             "-f", "mpegts",
             "-fflags", "+discardcorrupt+genpts+nobuffer",
-            "-analyzeduration", "2000000",
+            "-analyzeduration", "1000000",
             "-probesize", "1048576",
             "-thread_queue_size", "1024",
             "-reconnect", "1",
@@ -173,15 +173,6 @@ class MultiviewServer:
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
             return [b"Server error\n"]
 
-        channel_uuids = [url.rsplit("/", 1)[1] for url in input_urls]
-        try:
-            import gevent
-            jobs = [gevent.spawn(self._ensure_channel_initialized, uuid) for uuid in channel_uuids]
-            gevent.joinall(jobs, timeout=40)
-            logger.info(f"Pre-warmed {len(channel_uuids)} channels")
-        except ImportError:
-            pass
-
         cmd = _build_ffmpeg_cmd(input_urls, layout)
         logger.info(
             f"Starting ffmpeg: layout={n} inputs={len(input_urls)} style={layout} "
@@ -205,39 +196,28 @@ class MultiviewServer:
 
         threading.Thread(target=_log_stderr, daemon=True, name=f"ffmpeg-stderr-{n}").start()
 
-        start_response("200 OK", [
-            ("Content-Type", "video/mp2t"),
-            ("Cache-Control", "no-cache"),
-            ("Transfer-Encoding", "chunked"),
-        ])
-
-        PRE_ROLL = 512 * 1024
-        pre_roll_buf = bytearray()
-
         def stream_gen():
-            nonlocal pre_roll_buf
             bytes_sent = 0
             try:
+                first = proc.stdout.read(65536)
+                if not first:
+                    start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+                    yield b"Stream did not produce output\n"
+                    return
+                start_response("200 OK", [
+                    ("Content-Type", "video/mp2t"),
+                    ("Cache-Control", "no-cache"),
+                    ("Transfer-Encoding", "chunked"),
+                ])
+                bytes_sent = len(first)
+                yield first
                 while True:
                     chunk = proc.stdout.read(65536)
                     if not chunk:
                         break
-                    if pre_roll_buf is not None:
-                        pre_roll_buf.extend(chunk)
-                        if len(pre_roll_buf) >= PRE_ROLL:
-                            yield bytes(pre_roll_buf)
-                            bytes_sent += len(pre_roll_buf)
-                            pre_roll_buf = None
-                    else:
-                        bytes_sent += len(chunk)
-                        yield chunk
+                    bytes_sent += len(chunk)
+                    yield chunk
             finally:
-                if pre_roll_buf:
-                    try:
-                        yield bytes(pre_roll_buf)
-                        bytes_sent += len(pre_roll_buf)
-                    except Exception:
-                        pass
                 try:
                     proc.kill()
                     proc.wait()
@@ -344,27 +324,23 @@ class MultiviewServer:
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [b"Proxy server unavailable\n"]
 
+        try:
+            self._ensure_channel_initialized(channel_id)
+        except Exception as e:
+            logger.error(f"Channel init error {channel_id}: {e}", exc_info=True)
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Failed to initialize channel\n"]
+
         source_buffer = proxy_server.get_buffer(channel_id)
-        if source_buffer is not None and channel_id in proxy_server.client_managers:
-            channel_initializing = False
-        else:
-            try:
-                channel_initializing = self._ensure_channel_initialized(channel_id)
-            except Exception as e:
-                logger.error(f"Channel init error {channel_id}: {e}", exc_info=True)
-                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-                return [b"Failed to initialize channel\n"]
+        if source_buffer is None:
+            logger.warning(f"Buffer not available for channel {channel_id}")
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Stream buffer unavailable\n"]
 
-            source_buffer = proxy_server.get_buffer(channel_id)
-            if source_buffer is None:
-                logger.warning(f"Buffer not available for channel {channel_id}")
-                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-                return [b"Stream buffer unavailable\n"]
-
-            if channel_id not in proxy_server.client_managers:
-                logger.warning(f"Client manager not available for channel {channel_id}")
-                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-                return [b"Client manager unavailable\n"]
+        if channel_id not in proxy_server.client_managers:
+            logger.warning(f"Client manager not available for channel {channel_id}")
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Client manager unavailable\n"]
 
         client_id = str(_uuid_module.uuid4())
         proxy_server.client_managers[channel_id].add_client(
@@ -384,7 +360,7 @@ class MultiviewServer:
                 client_id=client_id,
                 client_ip="127.0.0.1",
                 client_user_agent="multiview-plugin",
-                channel_initializing=channel_initializing,
+                channel_initializing=True,
                 buffer=source_buffer,
             )
             yield from gen.generate()
