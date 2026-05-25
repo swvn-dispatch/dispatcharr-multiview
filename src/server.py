@@ -166,11 +166,11 @@ class MultiviewServer:
             f"urls={input_urls}"
         )
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            import gevent.subprocess as _gsp
+            proc = _gsp.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except ImportError:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def _log_stderr():
             try:
