@@ -144,9 +144,11 @@ class MultiviewServer:
         return [b"Not Found\n"]
 
     def _serve_stream(self, n: int, start_response):
+        logger.info(f"Stream request: layout {n}")
         try:
             settings, input_urls, layout = self._resolve_layout(n)
         except LookupError as e:
+            logger.warning(f"Layout {n} not ready: {e}")
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [str(e).encode()]
         except Exception as e:
@@ -156,13 +158,27 @@ class MultiviewServer:
 
         dispatcharr_url = settings.get("dispatcharr_base_url", "http://localhost:9191")
         cmd = _build_ffmpeg_cmd(input_urls, layout, dispatcharr_url)
-        logger.info(f"Starting ffmpeg for layout {n} with {len(input_urls)} inputs")
+        logger.info(
+            f"Starting ffmpeg: layout={n} inputs={len(input_urls)} layout_style={layout} "
+            f"urls={input_urls}"
+        )
 
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+
+        def _log_stderr():
+            try:
+                for raw in proc.stderr:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        logger.warning(f"ffmpeg layout={n}: {line}")
+            except Exception:
+                pass
+
+        threading.Thread(target=_log_stderr, daemon=True, name=f"ffmpeg-stderr-{n}").start()
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -171,11 +187,13 @@ class MultiviewServer:
         ])
 
         def stream_gen():
+            bytes_sent = 0
             try:
                 while True:
                     chunk = proc.stdout.read(65536)
                     if not chunk:
                         break
+                    bytes_sent += len(chunk)
                     yield chunk
             finally:
                 try:
@@ -183,7 +201,7 @@ class MultiviewServer:
                     proc.wait()
                 except Exception:
                     pass
-                logger.info(f"ffmpeg for layout {n} terminated")
+                logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
 
         return stream_gen()
 
@@ -203,6 +221,10 @@ class MultiviewServer:
         ch_count = max(2, int(settings.get(f"multiview_{n}_channel_count", 4)))
         layout = settings.get(f"multiview_{n}_layout", "auto")
 
+        logger.info(
+            f"Resolving layout {n}: ch_count={ch_count} style={layout} "
+            f"dispatcharr_url={dispatcharr_url}"
+        )
         input_urls = []
         for m in range(1, ch_count + 1):
             ch_id = settings.get(f"multiview_{n}_channel_{m}", "_none")
@@ -212,7 +234,9 @@ class MultiviewServer:
                 ch = Channel.objects.get(id=int(ch_id))
             except Channel.DoesNotExist:
                 raise LookupError(f"Channel id={ch_id} not found")
-            input_urls.append(f"{dispatcharr_url}/proxy/ts/stream/{ch.uuid}")
+            url = f"{dispatcharr_url}/proxy/ts/stream/{ch.uuid}"
+            logger.info(f"  channel {m}: id={ch_id} name={ch.name!r} url={url}")
+            input_urls.append(url)
 
         return settings, input_urls, layout
 

@@ -70,11 +70,15 @@ class Plugin:
         port = int(settings.get("server_port", DEFAULT_SERVER_PORT))
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                logger.info(f"Multiview server already running on port {port}")
+                logger.info(f"Multiview server already running on port {port} (skipping auto-start)")
                 return
         except OSError:
             pass
-        self._start_server(settings)
+        result = self._start_server(settings)
+        if result.get("status") == "success":
+            logger.info(f"Multiview auto-start: {result['message']}")
+        else:
+            logger.warning(f"Multiview auto-start failed: {result['message']}")
 
     # -- Dynamic fields --------------------------------------------------------
 
