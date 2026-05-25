@@ -5,30 +5,40 @@ using FFmpeg. Supports multiple named layouts, each with a configurable
 number of channel inputs and either an auto-grid or featured arrangement.
 """
 
+import json
 import logging
 import os
 import socket
 
-from .config import (
-    PLUGIN_CONFIG,
-    PLUGIN_FIELDS,
-    PLUGIN_DB_KEY,
-    DEFAULT_SERVER_PORT,
-    DEFAULT_SERVER_HOST,
-    build_plugin_fields,
-)
-from .server import MultiviewServer, get_server, set_server
-
 logger = logging.getLogger(__name__)
+
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+with open(os.path.join(_PLUGIN_DIR, "plugin.json")) as _f:
+    _PLUGIN_CONFIG = json.load(_f)
+
+PLUGIN_DB_KEY = "multiview"
+DEFAULT_SERVER_PORT = 9292
+DEFAULT_SERVER_HOST = "127.0.0.1"
+
+
+def _config():
+    import importlib
+    return importlib.import_module(".config", package=__package__)
+
+
+def _server():
+    import importlib
+    return importlib.import_module(".server", package=__package__)
 
 
 class Plugin:
     """Dispatcharr Plugin: Multiview stream tiling via FFmpeg."""
 
-    name        = PLUGIN_CONFIG["name"]
-    description = PLUGIN_CONFIG["description"]
-    version     = PLUGIN_CONFIG["version"]
-    author      = PLUGIN_CONFIG["author"]
+    name        = _PLUGIN_CONFIG["name"]
+    description = _PLUGIN_CONFIG["description"]
+    version     = _PLUGIN_CONFIG["version"]
+    author      = _PLUGIN_CONFIG["author"]
 
     actions = [
         {
@@ -58,12 +68,11 @@ class Plugin:
             logger.warning(f"Multiview server auto-start skipped: {e}")
 
     def _autostart(self):
-        existing = get_server()
+        existing = _server().get_server()
         if existing and existing.is_running():
             return
         try:
             with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
-                # logger.info(f"Multiview server already running on port {DEFAULT_SERVER_PORT} (skipping auto-start)")
                 return
         except OSError:
             pass
@@ -84,13 +93,11 @@ class Plugin:
             settings = cfg.settings
         except Exception:
             settings = {}
-        return build_plugin_fields(settings)
+        return _config().build_plugin_fields(settings)
 
     # -- Action dispatcher -----------------------------------------------------
 
     def run(self, action: str, params: dict, context: dict):
-        settings = context.get("settings", {})
-
         if action == "generate_m3u":
             return self._generate_m3u()
 
@@ -119,8 +126,7 @@ class Plugin:
 
         m3u_content = "\n".join(lines) + "\n"
 
-        plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        m3u_path = os.path.join(plugin_dir, "multiview.m3u")
+        m3u_path = os.path.join(_PLUGIN_DIR, "multiview.m3u")
         try:
             with open(m3u_path, "w") as f:
                 f.write(m3u_content)
@@ -157,11 +163,12 @@ class Plugin:
     # -- start_server ----------------------------------------------------------
 
     def _start_server(self) -> dict:
-        existing = get_server()
+        srv = _server()
+        existing = srv.get_server()
         if existing and existing.is_running():
             existing.stop()
 
-        server = MultiviewServer(host=DEFAULT_SERVER_HOST, port=DEFAULT_SERVER_PORT)
+        server = srv.MultiviewServer(host=DEFAULT_SERVER_HOST, port=DEFAULT_SERVER_PORT)
         if server.start():
             return {
                 "status": "success",
@@ -189,7 +196,8 @@ class Plugin:
 
     def stop(self, context: dict):
         """Called when the plugin is disabled or Dispatcharr shuts down."""
-        server = get_server()
+        srv = _server()
+        server = srv.get_server()
         if server and server.is_running():
             logger.info("Plugin stopping, shutting down multiview server")
             server.stop()
