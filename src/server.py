@@ -48,7 +48,7 @@ def _auto_grid_filter(n: int) -> tuple[str, list[str]]:
 
     scale_parts = [
         f"[{i}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
-        f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2[v{i}]"
+        f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
         for i in range(n)
     ]
 
@@ -76,23 +76,19 @@ def _featured_filter(n: int) -> tuple[str, list[str]]:
 
     parts = [
         f"[0:v]scale={main_w}:{main_h}:force_original_aspect_ratio=decrease,"
-        f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2[main]"
+        f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[main]"
     ]
     for i in range(1, n):
         parts.append(
             f"[{i}:v]scale={side_w}:{side_h}:force_original_aspect_ratio=decrease,"
-            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2[s{i}]"
+            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[s{i}]"
         )
 
-    if side_count == 1:
-        parts.append("[main][s1]hstack=inputs=2[v]")
-    else:
-        side_inputs = "".join(f"[s{i}]" for i in range(1, n))
-        parts.append(f"{side_inputs}vstack=inputs={side_count}[right]")
-        parts.append("[main][right]hstack=inputs=2[v]")
+    positions = ["0_0"] + [f"{main_w}_{(i - 1) * side_h}" for i in range(1, n)]
+    all_labels = "[main]" + "".join(f"[s{i}]" for i in range(1, n))
+    parts.append(f"{all_labels}xstack=inputs={n}:layout={'|'.join(positions)}[v]")
 
-    filter_complex = "; ".join(parts)
-    return filter_complex, ["-map", "[v]", "-map", "0:a"]
+    return "; ".join(parts), ["-map", "[v]", "-map", "0:a"]
 
 
 def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
@@ -101,6 +97,9 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
 
     for url in input_urls:
         cmd += [
+            "-f", "mpegts",
+            "-analyzeduration", "500000",
+            "-probesize", "32768",
             "-thread_queue_size", "1024",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -171,7 +170,8 @@ class MultiviewServer:
         channel_uuids = [url.rsplit("/", 1)[1] for url in input_urls]
         try:
             import gevent
-            jobs = [gevent.spawn(self._ensure_channel_initialized, uuid) for uuid in channel_uuids]
+            pool = gevent.get_hub().threadpool
+            jobs = [pool.spawn(self._ensure_channel_initialized, uuid) for uuid in channel_uuids]
             gevent.joinall(jobs, timeout=40)
             logger.info(f"Pre-warmed {len(channel_uuids)} channels")
         except ImportError:
@@ -238,6 +238,12 @@ class MultiviewServer:
 
     def _ensure_channel_initialized(self, channel_id: str) -> bool:
         """Initialize a channel via ProxyServer and wait for its buffer. Returns True if started fresh."""
+        try:
+            from django.db import close_old_connections
+            close_old_connections()
+        except Exception:
+            pass
+
         try:
             from apps.proxy.live_proxy.server import ProxyServer
             from apps.proxy.live_proxy.services.channel_service import ChannelService
