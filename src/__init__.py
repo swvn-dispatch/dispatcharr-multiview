@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class Plugin:
-    """Dispatcharr Plugin – Multiview stream tiling via FFmpeg."""
+    """Dispatcharr Plugin: Multiview stream tiling via FFmpeg."""
 
     name        = PLUGIN_CONFIG["name"]
     description = PLUGIN_CONFIG["description"]
@@ -63,7 +63,7 @@ class Plugin:
             return
         try:
             with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
-                logger.info(f"Multiview server already running on port {DEFAULT_SERVER_PORT} (skipping auto-start)")
+                # logger.info(f"Multiview server already running on port {DEFAULT_SERVER_PORT} (skipping auto-start)")
                 return
         except OSError:
             pass
@@ -169,7 +169,7 @@ class Plugin:
             }
         return {
             "status": "error",
-            "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT} — port may be in use",
+            "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}; port may be in use",
         }
 
     # -- status ----------------------------------------------------------------

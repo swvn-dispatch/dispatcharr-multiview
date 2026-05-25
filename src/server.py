@@ -37,14 +37,10 @@ def set_server(s):
     _server_instance = s
 
 
-# ── Layout helpers ────────────────────────────────────────────────────────────
+# Layout helpers
 
 def _auto_grid_filter(n: int) -> tuple[str, list[str]]:
-    """
-    Return (filter_complex, output_map_args) for an n-input square-ish grid.
-    All inputs are scaled to tile_w × tile_h then assembled with xstack.
-    Output resolution is 1920 × 1080.
-    """
+    """Return (filter_complex, output_map_args) for an n-input square-ish grid at 1920x1080."""
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
     tile_w = 1920 // cols
@@ -72,11 +68,7 @@ def _auto_grid_filter(n: int) -> tuple[str, list[str]]:
 
 
 def _featured_filter(n: int) -> tuple[str, list[str]]:
-    """
-    Return (filter_complex, output_map_args) for featured layout:
-    channel 0 fills the left 2/3 of a 1920×1080 frame;
-    channels 1..n-1 are stacked vertically in the right 1/3.
-    """
+    """Return (filter_complex, output_map_args) for featured layout: channel 0 left 2/3, rest stacked right."""
     main_w, main_h = 1280, 1080
     side_w = 640
     side_count = n - 1
@@ -129,7 +121,7 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
     return cmd
 
 
-# ── Server ────────────────────────────────────────────────────────────────────
+# Server
 
 class MultiviewServer:
     def __init__(self, host: str, port: int):
@@ -245,11 +237,7 @@ class MultiviewServer:
         return stream_gen()
 
     def _ensure_channel_initialized(self, channel_id: str) -> bool:
-        """Initialize a channel via Dispatcharr's ProxyServer and wait for its buffer.
-
-        Returns True if we started a fresh channel, False if it was already running.
-        Safe to call concurrently for different channel_ids from gevent greenlets.
-        """
+        """Initialize a channel via ProxyServer and wait for its buffer. Returns True if started fresh."""
         try:
             from apps.proxy.live_proxy.server import ProxyServer
             from apps.proxy.live_proxy.services.channel_service import ChannelService
@@ -316,13 +304,7 @@ class MultiviewServer:
         return channel_initializing
 
     def _serve_channel_internal(self, channel_id: str, start_response):
-        """Serve a single channel's TS stream via Dispatcharr's ProxyServer.
-
-        This is the internal endpoint that ffmpeg calls as an input. It opens
-        the channel through Dispatcharr's proxy infrastructure (full fallback,
-        stream profiles, stats) without going through the HTTP proxy endpoint
-        (which may be behind a network-access CIDR check).
-        """
+        """Internal endpoint consumed by ffmpeg. Opens the channel through ProxyServer."""
         try:
             _uuid_module.UUID(channel_id)
         except ValueError:

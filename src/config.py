@@ -3,7 +3,7 @@
 import json
 import os
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# Constants
 
 PLUGIN_DB_KEY = "multiview"
 
@@ -19,7 +19,7 @@ def _load_plugin_config() -> dict:
 
 PLUGIN_CONFIG = _load_plugin_config()
 
-# ── Global fields (always shown) ─────────────────────────────────────────────
+# Global fields
 
 _GLOBAL_FIELDS = []
 
@@ -36,7 +36,7 @@ _MULTIVIEW_COUNT_FIELD = {
     "placeholder": "1",
 }
 
-# ── Per-layout field builders ─────────────────────────────────────────────────
+# Per-layout field builders
 
 _LAYOUT_OPTIONS = [
     {"value": "auto", "label": "Auto Grid"},
@@ -46,13 +46,13 @@ _LAYOUT_OPTIONS = [
 
 def _build_channel_options() -> list:
     """Return channel select options from the live DB at render time."""
-    opts = [{"value": "_none", "label": "— select channel —"}]
+    opts = [{"value": "_none", "label": "Select a channel"}]
     try:
         from apps.channels.models import Channel
 
         for ch in Channel.objects.order_by("channel_number").values("id", "name", "channel_number"):
             num = int(ch["channel_number"]) if ch["channel_number"] is not None else ""
-            opts.append({"value": str(ch["id"]), "label": f"{num} – {ch['name']}"})
+            opts.append({"value": str(ch["id"]), "label": f"{num} - {ch['name']}"})
     except Exception:
         pass
     return opts
@@ -66,7 +66,7 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
     fields = [
         {
             "id": f"multiview_{n}_header",
-            "label": f"── Layout {n} ──────────────────────",
+            "label": f"Layout {n}",
             "type": "info",
             "description": "",
         },
@@ -108,7 +108,7 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
         fields.append(
             {
                 "id": f"multiview_{n}_channel_{m}",
-                "label": f"Layout {n} – Channel {m}{audio_note}",
+                "label": f"Layout {n}: Channel {m}{audio_note}",
                 "type": "select",
                 "default": "_none",
                 "options": channel_options,
