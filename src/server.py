@@ -50,7 +50,11 @@ def _auto_grid_filter(n: int) -> tuple[str, list[str]]:
     tile_w = 1920 // cols
     tile_h = 1080 // rows
 
-    scale_parts = [f"[{i}:v]scale={tile_w}:{tile_h}[v{i}]" for i in range(n)]
+    scale_parts = [
+        f"[{i}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
+        f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2[v{i}]"
+        for i in range(n)
+    ]
 
     positions = []
     for i in range(n):
@@ -78,12 +82,18 @@ def _featured_filter(n: int) -> tuple[str, list[str]]:
     side_count = n - 1
     side_h = 1080 // side_count if side_count > 0 else 1080
 
-    parts = [f"[0:v]scale={main_w}:{main_h}[main]"]
+    parts = [
+        f"[0:v]scale={main_w}:{main_h}:force_original_aspect_ratio=decrease,"
+        f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2[main]"
+    ]
     for i in range(1, n):
-        parts.append(f"[{i}:v]scale={side_w}:{side_h}[s{i}]")
+        parts.append(
+            f"[{i}:v]scale={side_w}:{side_h}:force_original_aspect_ratio=decrease,"
+            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2[s{i}]"
+        )
 
     if side_count == 1:
-        parts[-1] = "[main][s1]hstack=inputs=2[v]"
+        parts.append("[main][s1]hstack=inputs=2[v]")
     else:
         side_inputs = "".join(f"[s{i}]" for i in range(1, n))
         parts.append(f"{side_inputs}vstack=inputs={side_count}[right]")
@@ -98,7 +108,13 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
 
     for url in input_urls:
-        cmd += ["-i", url]
+        cmd += [
+            "-thread_queue_size", "1024",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-i", url,
+        ]
 
     if layout == "featured":
         filter_complex, map_args = _featured_filter(n)
@@ -160,6 +176,15 @@ class MultiviewServer:
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
             return [b"Server error\n"]
 
+        channel_uuids = [url.rsplit("/", 1)[1] for url in input_urls]
+        try:
+            import gevent
+            jobs = [gevent.spawn(self._ensure_channel_initialized, uuid) for uuid in channel_uuids]
+            gevent.joinall(jobs, timeout=40)
+            logger.info(f"Pre-warmed {len(channel_uuids)} channels")
+        except ImportError:
+            pass
+
         cmd = _build_ffmpeg_cmd(input_urls, layout)
         logger.info(
             f"Starting ffmpeg: layout={n} inputs={len(input_urls)} style={layout} "
@@ -189,15 +214,26 @@ class MultiviewServer:
             ("Transfer-Encoding", "chunked"),
         ])
 
+        PRE_ROLL = 2 * 1024 * 1024
+        pre_roll_buf = bytearray()
+
         def stream_gen():
+            nonlocal pre_roll_buf
             bytes_sent = 0
             try:
                 while True:
                     chunk = proc.stdout.read(65536)
                     if not chunk:
                         break
-                    bytes_sent += len(chunk)
-                    yield chunk
+                    if pre_roll_buf is not None:
+                        pre_roll_buf.extend(chunk)
+                        if len(pre_roll_buf) >= PRE_ROLL:
+                            yield bytes(pre_roll_buf)
+                            bytes_sent += len(pre_roll_buf)
+                            pre_roll_buf = None
+                    else:
+                        bytes_sent += len(chunk)
+                        yield chunk
             finally:
                 try:
                     proc.kill()
@@ -207,6 +243,77 @@ class MultiviewServer:
                 logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
 
         return stream_gen()
+
+    def _ensure_channel_initialized(self, channel_id: str) -> bool:
+        """Initialize a channel via Dispatcharr's ProxyServer and wait for its buffer.
+
+        Returns True if we started a fresh channel, False if it was already running.
+        Safe to call concurrently for different channel_ids from gevent greenlets.
+        """
+        try:
+            from apps.proxy.live_proxy.server import ProxyServer
+            from apps.proxy.live_proxy.services.channel_service import ChannelService
+            from apps.proxy.live_proxy.url_utils import generate_stream_url
+            from apps.channels.models import Channel
+        except ImportError as e:
+            logger.error(f"Import error in _ensure_channel_initialized: {e}")
+            return False
+
+        try:
+            proxy_server = ProxyServer.get_instance()
+        except Exception as e:
+            logger.error(f"Could not get ProxyServer instance: {e}")
+            return False
+
+        if not proxy_server.check_if_channel_exists(channel_id):
+            stream_url, stream_ua, transcode, profile_value = generate_stream_url(channel_id)
+            if not stream_url:
+                logger.warning(f"No stream available for channel {channel_id}")
+                return False
+
+            stream_id = m3u_profile_id = None
+            if proxy_server.redis_client:
+                try:
+                    ch = Channel.objects.get(uuid=channel_id)
+                    raw = proxy_server.redis_client.get(f"channel_stream:{ch.id}")
+                    if raw:
+                        stream_id = int(raw)
+                        raw2 = proxy_server.redis_client.get(f"stream_profile:{stream_id}")
+                        if raw2:
+                            m3u_profile_id = int(raw2)
+                except Exception as e:
+                    logger.warning(f"Could not read stream assignment from Redis: {e}")
+
+            success = ChannelService.initialize_channel(
+                channel_id, stream_url, stream_ua, transcode,
+                profile_value, stream_id, m3u_profile_id,
+            )
+            if not success:
+                logger.error(f"Failed to initialize channel {channel_id}")
+                return False
+            channel_initializing = True
+        else:
+            proxy_server.initialize_channel(None, channel_id, None)
+            channel_initializing = False
+
+        try:
+            import gevent
+            _sleep = gevent.sleep
+        except ImportError:
+            import time
+            _sleep = time.sleep
+
+        for _ in range(30):
+            if proxy_server.get_buffer(channel_id) is not None:
+                break
+            _sleep(0.2)
+
+        for _ in range(15):
+            if channel_id in proxy_server.client_managers:
+                break
+            _sleep(0.2)
+
+        return channel_initializing
 
     def _serve_channel_internal(self, channel_id: str, start_response):
         """Serve a single channel's TS stream via Dispatcharr's ProxyServer.
@@ -226,10 +333,7 @@ class MultiviewServer:
 
         try:
             from apps.proxy.live_proxy.server import ProxyServer
-            from apps.proxy.live_proxy.services.channel_service import ChannelService
-            from apps.proxy.live_proxy.url_utils import generate_stream_url
             from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
-            from apps.channels.models import Channel
         except ImportError as e:
             logger.error(f"Import error in _serve_channel_internal: {e}")
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
@@ -242,76 +346,18 @@ class MultiviewServer:
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [b"Proxy server unavailable\n"]
 
-        channel_initializing = False
-
-        if not proxy_server.check_if_channel_exists(channel_id):
-            stream_url, stream_ua, transcode, profile_value = generate_stream_url(channel_id)
-            if not stream_url:
-                logger.warning(f"No stream available for channel {channel_id}")
-                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-                return [b"No stream available for this channel\n"]
-
-            # generate_stream_url set channel_stream:{ch.id} and stream_profile:{stream_id}
-            # in Redis — read them back so initialize_channel can record the full context
-            stream_id = None
-            m3u_profile_id = None
-            if proxy_server.redis_client:
-                try:
-                    ch = Channel.objects.get(uuid=channel_id)
-                    raw = proxy_server.redis_client.get(f"channel_stream:{ch.id}")
-                    if raw:
-                        stream_id = int(raw)
-                        raw2 = proxy_server.redis_client.get(f"stream_profile:{stream_id}")
-                        if raw2:
-                            m3u_profile_id = int(raw2)
-                except Exception as e:
-                    logger.warning(f"Could not read stream assignment from Redis: {e}")
-
-            success = ChannelService.initialize_channel(
-                channel_id,
-                stream_url,
-                stream_ua,
-                transcode,
-                profile_value,
-                stream_id,
-                m3u_profile_id,
-            )
-            if not success:
-                logger.error(f"Failed to initialize channel {channel_id}")
-                start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-                return [b"Failed to initialize channel\n"]
-
-            channel_initializing = True
-        else:
-            # Channel already running — ensure this worker has a local buffer and
-            # client_manager (the channel may be owned by a different worker)
-            proxy_server.initialize_channel(None, channel_id, None)
-
-        # Wait for the buffer to be set up (initialize_channel creates it synchronously
-        # but guard in case of a race with channel teardown)
         try:
-            import gevent
-            _sleep = gevent.sleep
-        except ImportError:
-            import time
-            _sleep = time.sleep
+            channel_initializing = self._ensure_channel_initialized(channel_id)
+        except Exception as e:
+            logger.error(f"Channel init error {channel_id}: {e}", exc_info=True)
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Failed to initialize channel\n"]
 
-        source_buffer = None
-        for _ in range(30):
-            source_buffer = proxy_server.get_buffer(channel_id)
-            if source_buffer is not None:
-                break
-            _sleep(0.2)
-
+        source_buffer = proxy_server.get_buffer(channel_id)
         if source_buffer is None:
             logger.warning(f"Buffer not available for channel {channel_id}")
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [b"Stream buffer unavailable\n"]
-
-        for _ in range(15):
-            if channel_id in proxy_server.client_managers:
-                break
-            _sleep(0.2)
 
         if channel_id not in proxy_server.client_managers:
             logger.warning(f"Client manager not available for channel {channel_id}")

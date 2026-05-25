@@ -8,7 +8,7 @@ import os
 PLUGIN_DB_KEY = "multiview"
 
 DEFAULT_SERVER_PORT = 9292
-DEFAULT_SERVER_HOST = "0.0.0.0"
+DEFAULT_SERVER_HOST = "127.0.0.1"
 
 
 def _load_plugin_config() -> dict:
@@ -21,24 +21,7 @@ PLUGIN_CONFIG = _load_plugin_config()
 
 # ── Global fields (always shown) ─────────────────────────────────────────────
 
-_GLOBAL_FIELDS = [
-    {
-        "id": "server_host",
-        "label": "Streaming Server Host",
-        "type": "string",
-        "default": DEFAULT_SERVER_HOST,
-        "description": "Host address for the multiview streaming server (0.0.0.0 for all interfaces)",
-        "placeholder": "0.0.0.0",
-    },
-    {
-        "id": "server_port",
-        "label": "Streaming Server Port",
-        "type": "number",
-        "default": DEFAULT_SERVER_PORT,
-        "description": "Port the multiview streaming server listens on",
-        "placeholder": str(DEFAULT_SERVER_PORT),
-    },
-]
+_GLOBAL_FIELDS = []
 
 _MULTIVIEW_COUNT_FIELD = {
     "id": "multiview_count",

@@ -62,19 +62,12 @@ class Plugin:
         if existing and existing.is_running():
             return
         try:
-            from apps.plugins.models import PluginConfig
-            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings = cfg.settings
-        except Exception:
-            settings = {}
-        port = int(settings.get("server_port", DEFAULT_SERVER_PORT))
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                logger.info(f"Multiview server already running on port {port} (skipping auto-start)")
+            with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
+                logger.info(f"Multiview server already running on port {DEFAULT_SERVER_PORT} (skipping auto-start)")
                 return
         except OSError:
             pass
-        result = self._start_server(settings)
+        result = self._start_server()
         if result.get("status") == "success":
             logger.info(f"Multiview auto-start: {result['message']}")
         else:
@@ -99,7 +92,7 @@ class Plugin:
         settings = context.get("settings", {})
 
         if action == "generate_m3u":
-            return self._generate_m3u(settings)
+            return self._generate_m3u()
 
         if action == "status":
             return self._status()
@@ -108,14 +101,19 @@ class Plugin:
 
     # -- generate_m3u ----------------------------------------------------------
 
-    def _generate_m3u(self, settings: dict) -> dict:
-        port = int(settings.get("server_port", DEFAULT_SERVER_PORT))
+    def _generate_m3u(self) -> dict:
+        try:
+            from apps.plugins.models import PluginConfig
+            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
+            settings = cfg.settings
+        except Exception:
+            settings = {}
         mv_count = max(1, int(settings.get("multiview_count", 1)))
 
         lines = ["#EXTM3U"]
         for n in range(1, mv_count + 1):
             name = settings.get(f"multiview_{n}_name", f"Multiview {n}") or f"Multiview {n}"
-            stream_url = f"http://localhost:{port}/stream/{n}"
+            stream_url = f"http://localhost:{DEFAULT_SERVER_PORT}/stream/{n}"
             lines.append(f'#EXTINF:-1 tvg-name="{name}",{name}')
             lines.append(stream_url)
 
@@ -131,7 +129,7 @@ class Plugin:
 
         try:
             from apps.m3u.models import M3UAccount
-            _, created = M3UAccount.objects.update_or_create(
+            account, created = M3UAccount.objects.update_or_create(
                 name="Dispatcharr Multiview",
                 defaults={
                     "file_path": m3u_path,
@@ -140,6 +138,11 @@ class Plugin:
                 },
             )
             verb = "created" if created else "updated"
+            try:
+                from apps.m3u.tasks import refresh_single_m3u_account
+                refresh_single_m3u_account.delay(account.id)
+            except Exception as e:
+                logger.warning(f"Could not trigger M3U refresh: {e}")
             return {
                 "status": "success",
                 "message": f"M3U written to {m3u_path} | M3U account {verb} in Dispatcharr",
@@ -153,41 +156,30 @@ class Plugin:
 
     # -- start_server ----------------------------------------------------------
 
-    def _start_server(self, settings: dict) -> dict:
+    def _start_server(self) -> dict:
         existing = get_server()
         if existing and existing.is_running():
             existing.stop()
 
-        port = int(settings.get("server_port", DEFAULT_SERVER_PORT))
-        host = settings.get("server_host", DEFAULT_SERVER_HOST) or DEFAULT_SERVER_HOST
-
-        server = MultiviewServer(host=host, port=port)
+        server = MultiviewServer(host=DEFAULT_SERVER_HOST, port=DEFAULT_SERVER_PORT)
         if server.start():
             return {
                 "status": "success",
-                "message": f"Multiview server started on http://{host}:{port}/",
+                "message": f"Multiview server started on http://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}/",
             }
         return {
             "status": "error",
-            "message": f"Failed to start server on {host}:{port} — port may be in use",
+            "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT} — port may be in use",
         }
 
     # -- status ----------------------------------------------------------------
 
     def _status(self) -> dict:
-        server = get_server()
-        port = server.port if server else DEFAULT_SERVER_PORT
         try:
-            from apps.plugins.models import PluginConfig
-            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            port = int(cfg.settings.get("server_port", port))
-        except Exception:
-            pass
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
                 return {
                     "status": "success",
-                    "message": f"Server running on http://127.0.0.1:{port}/",
+                    "message": f"Server running on http://127.0.0.1:{DEFAULT_SERVER_PORT}/",
                     "running": True,
                 }
         except OSError:
