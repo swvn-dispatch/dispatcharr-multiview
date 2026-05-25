@@ -235,7 +235,7 @@ def _build_multiview_block(n: int, ch_count: int, selector_type: str = "classic"
     fields = [
         {
             "id": f"multiview_{n}_header",
-            "label": f"Layout {n}",
+            "label": f"── Layout {n} ──────────────────────",
             "type": "info",
             "description": "",
         },
