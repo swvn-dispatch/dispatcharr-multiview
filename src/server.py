@@ -219,6 +219,9 @@ def _build_placeholder_cmd(
     # Determine which tiles have usable local logos
     usable = [_usable_logo(u) for u in logo_urls]
 
+    # Determine which tiles have usable local logos
+    usable = [_usable_logo(u) for u in logo_urls]
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     for tw, th in tile_sizes:
         cmd += ["-f", "lavfi", "-i", f"color=c=black:size={tw}x{th}:r=30000/1001"]
