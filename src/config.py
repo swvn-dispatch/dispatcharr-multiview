@@ -44,13 +44,34 @@ _LAYOUT_OPTIONS = [
 ]
 
 
+def _get_multiview_channel_ids() -> set:
+    """Return the set of Channel IDs that belong to the Dispatcharr Multiview M3U account."""
+    try:
+        from apps.m3u.models import M3UAccount
+        from apps.channels.models import Channel
+        acct = M3UAccount.objects.filter(name="Dispatcharr Multiview").first()
+        if not acct:
+            return set()
+        for field in ("m3u_account", "account", "m3u_account_id", "source"):
+            try:
+                ids = set(Channel.objects.filter(**{field: acct}).values_list("id", flat=True))
+                return ids
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return set()
+
+
 def _build_channel_options() -> list:
-    """Return channel select options from the live DB at render time."""
+    """Return channel select options from the live DB, excluding multiview output channels."""
+    excluded = _get_multiview_channel_ids()
     opts = [{"value": "_none", "label": "Select a channel"}]
     try:
         from apps.channels.models import Channel
-
         for ch in Channel.objects.order_by("channel_number").values("id", "name", "channel_number"):
+            if ch["id"] in excluded:
+                continue
             num = int(ch["channel_number"]) if ch["channel_number"] is not None else ""
             opts.append({"value": str(ch["id"]), "label": f"{num} - {ch['name']}"})
     except Exception:
@@ -61,7 +82,6 @@ def _build_channel_options() -> list:
 def _build_multiview_block(n: int, ch_count: int) -> list:
     """Return the list of fields for multiview layout block *n* with *ch_count* channel slots."""
     channel_options = _build_channel_options()
-    num = str(n)
 
     fields = [
         {
@@ -95,9 +115,11 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
             "type": "number",
             "default": 4,
             "min": 2,
+            "max": 9,
             "description": (
                 f"Number of channels to tile in layout {n}. "
-                "After changing, save and refresh to see the new channel slots"
+                "Recommended maximum is 4; higher counts may not start correctly. "
+                "After changing, save and refresh to see the new channel slots."
             ),
             "placeholder": "4",
         },
