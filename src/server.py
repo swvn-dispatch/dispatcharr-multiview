@@ -39,15 +39,15 @@ def set_server(s):
 
 # Layout helpers
 
-def _auto_grid_filter(n: int) -> tuple[str, list[str]]:
-    """Return (filter_complex, output_map_args) for an n-input square-ish grid at 1920x1080."""
+def _auto_grid_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
+    """Return (filter_complex, output_map_args) for an n-input square-ish grid."""
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
-    tile_w = 1920 // cols
-    tile_h = 1080 // rows
+    tile_w = out_w // cols
+    tile_h = out_h // rows
 
     scale_parts = [
-        f"[{i}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
+        f"[{i}:v]fps=30000/1001,scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
         f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
         for i in range(n)
     ]
@@ -67,20 +67,21 @@ def _auto_grid_filter(n: int) -> tuple[str, list[str]]:
     return filter_complex, ["-map", "[v]", "-map", "0:a"]
 
 
-def _featured_filter(n: int) -> tuple[str, list[str]]:
+def _featured_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
     """Return (filter_complex, output_map_args) for featured layout: channel 0 left 2/3, rest stacked right."""
-    main_w, main_h = 1280, 1080
-    side_w = 640
+    main_w = round(out_w * 2 / 3)
+    side_w = out_w - main_w
+    main_h = out_h
     side_count = n - 1
-    side_h = 1080 // side_count if side_count > 0 else 1080
+    side_h = out_h // side_count if side_count > 0 else out_h
 
     parts = [
-        f"[0:v]scale={main_w}:{main_h}:force_original_aspect_ratio=decrease,"
+        f"[0:v]fps=30000/1001,scale={main_w}:{main_h}:force_original_aspect_ratio=decrease,"
         f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[main]"
     ]
     for i in range(1, n):
         parts.append(
-            f"[{i}:v]scale={side_w}:{side_h}:force_original_aspect_ratio=decrease,"
+            f"[{i}:v]fps=30000/1001,scale={side_w}:{side_h}:force_original_aspect_ratio=decrease,"
             f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[s{i}]"
         )
 
@@ -91,9 +92,25 @@ def _featured_filter(n: int) -> tuple[str, list[str]]:
     return "; ".join(parts), ["-map", "[v]", "-map", "0:a"]
 
 
-def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
+def _build_ffmpeg_cmd(input_urls: list[str], layout: str, settings: dict) -> list[str]:
     n = len(input_urls)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+
+    resolution   = settings.get("output_resolution", "1920x1080")
+    try:
+        out_w, out_h = (int(x) for x in resolution.split("x"))
+    except Exception:
+        out_w, out_h = 1920, 1080
+    bitrate      = int(settings.get("output_bitrate", 8000))
+    crf          = int(settings.get("output_crf", 23))
+    preset       = settings.get("encoder_preset", "ultrafast")
+    encoder      = settings.get("video_encoder", "libx264")
+    vaapi_device = settings.get("vaapi_device", "/dev/dri/renderD128")
+
+    if encoder == "h264_vaapi":
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+               "-vaapi_device", vaapi_device]
+    else:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
 
     for url in input_urls:
         cmd += [
@@ -109,18 +126,62 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str) -> list[str]:
         ]
 
     if layout == "featured":
-        filter_complex, map_args = _featured_filter(n)
+        filter_complex, map_args = _featured_filter(n, out_w, out_h)
     else:
-        filter_complex, map_args = _auto_grid_filter(n)
+        filter_complex, map_args = _auto_grid_filter(n, out_w, out_h)
+
+    if encoder == "h264_vaapi":
+        filter_complex = filter_complex.replace("[v]", "[vraw]", 1)
+        filter_complex += "; [vraw]hwupload,format=vaapi[v]"
 
     cmd += ["-filter_complex", filter_complex]
     cmd += map_args
-    cmd += [
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-level:v", "5.1",
-        "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
-        "-force_key_frames", "expr:gte(t,n_forced*2)",
-    ]
+
+    if encoder == "h264_nvenc":
+        cmd += [
+            "-c:v", "h264_nvenc",
+            "-preset", preset,
+            "-tune", "ll",
+            "-rc", "vbr",
+            "-cq", str(crf),
+            "-maxrate", f"{bitrate}k",
+            "-bufsize", f"{bitrate * 2}k",
+            "-g", "60", "-keyint_min", "60",
+        ]
+    elif encoder == "h264_qsv":
+        cmd += [
+            "-c:v", "h264_qsv",
+            "-preset", preset,
+            "-global_quality", str(crf),
+            "-b:v", f"{bitrate}k",
+            "-maxrate", f"{bitrate}k",
+            "-bufsize", f"{bitrate * 2}k",
+            "-g", "60", "-low_power", "1",
+        ]
+    elif encoder == "h264_vaapi":
+        cmd += [
+            "-c:v", "h264_vaapi",
+            "-b:v", f"{bitrate}k",
+            "-maxrate", f"{bitrate}k",
+            "-bufsize", f"{bitrate * 2}k",
+            "-g", "60",
+        ]
+    else:  # libx264
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-tune", "zerolatency",
+            "-level:v", "5.1",
+            "-crf", str(crf),
+            "-maxrate", f"{bitrate}k",
+            "-bufsize", f"{bitrate * 2}k",
+            "-g", "60", "-keyint_min", "60",
+            "-sc_threshold", "0",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+        ]
+
     cmd += ["-c:a", "ac3"]
+    cmd += ["-max_muxing_queue_size", "1024"]
     cmd += ["-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity"]
     cmd += ["-f", "mpegts", "pipe:1"]
     return cmd
@@ -173,9 +234,18 @@ class MultiviewServer:
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
             return [b"Server error\n"]
 
-        cmd = _build_ffmpeg_cmd(input_urls, layout)
+        try:
+            from apps.plugins.models import PluginConfig
+            cfg = PluginConfig.objects.get(key="multiview")
+            enc_settings = cfg.settings
+        except Exception:
+            enc_settings = {}
+
+        cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings)
         logger.info(
             f"Starting ffmpeg: layout={n} inputs={len(input_urls)} style={layout} "
+            f"encoder={enc_settings.get('video_encoder', 'libx264')} "
+            f"resolution={enc_settings.get('output_resolution', '1920x1080')} "
             f"urls={input_urls}"
         )
 
