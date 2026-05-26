@@ -92,19 +92,83 @@ def _featured_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
     return "; ".join(parts), ["-map", "[v]", "-map", "0:a"]
 
 
+def _log_stderr(proc, label):
+    try:
+        for raw in proc.stderr:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                logger.warning(f"ffmpeg {label}: {line}")
+    except Exception:
+        pass
+
+
+def _build_placeholder_cmd(
+    channel_names: list[str], layout: str, out_w: int, out_h: int
+) -> list[str]:
+    n = len(channel_names)
+
+    if layout == "featured":
+        main_w = round(out_w * 2 / 3)
+        side_w = out_w - main_w
+        side_count = n - 1
+        side_h = out_h // side_count if side_count > 0 else out_h
+        tile_sizes = [(main_w, out_h)] + [(side_w, side_h)] * (n - 1)
+        positions  = ["0_0"] + [f"{main_w}_{i * side_h}" for i in range(side_count)]
+    else:
+        cols = math.ceil(math.sqrt(n))
+        tile_w = out_w // cols
+        tile_h = out_h // math.ceil(n / cols)
+        tile_sizes = [(tile_w, tile_h)] * n
+        positions = []
+        for i in range(n):
+            c, r = i % cols, i // cols
+            x = "0" if c == 0 else ("w0" if c == 1 else f"{c}*w0")
+            y = "0" if r == 0 else ("h0" if r == 1 else f"{r}*h0")
+            positions.append(f"{x}_{y}")
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+    for tw, th in tile_sizes:
+        cmd += ["-f", "lavfi", "-i", f"color=c=0x0d1117:size={tw}x{th}:r=30000/1001"]
+    cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
+
+    filter_parts = []
+    for i, (name, (tw, th)) in enumerate(zip(channel_names, tile_sizes)):
+        safe = name.replace("\\", "").replace("'", "").replace(":", " ")
+        fs = max(16, min(tw, th) // 12)
+        filter_parts.append(
+            f"[{i}:v]drawtext=text='Loading\\n{safe}':"
+            f"fontcolor=white:fontsize={fs}:x=(w-tw)/2:y=(h-th)/2:line_spacing=6[t{i}]"
+        )
+
+    inputs_str = "".join(f"[t{i}]" for i in range(n))
+    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}[v]"
+    filter_complex = "; ".join(filter_parts) + "; " + xstack
+
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", f"{n}:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-c:a", "ac3",
+        "-t", "60",
+        "-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity",
+        "-f", "mpegts", "pipe:1",
+    ]
+    return cmd
+
+
 def _build_ffmpeg_cmd(input_urls: list[str], layout: str, settings: dict) -> list[str]:
     n = len(input_urls)
 
-    resolution   = settings.get("output_resolution", "1920x1080")
+    resolution   = settings.get("output_resolution") or "1920x1080"
     try:
         out_w, out_h = (int(x) for x in resolution.split("x"))
     except Exception:
         out_w, out_h = 1920, 1080
-    bitrate      = int(settings.get("output_bitrate", 8000))
-    crf          = int(settings.get("output_crf", 23))
-    preset       = settings.get("encoder_preset", "ultrafast")
-    encoder      = settings.get("video_encoder", "libx264")
-    vaapi_device = settings.get("vaapi_device", "/dev/dri/renderD128")
+    bitrate      = int(settings.get("output_bitrate") or 8000)
+    crf          = int(settings.get("output_crf") or 23)
+    preset       = settings.get("encoder_preset") or "ultrafast"
+    encoder      = settings.get("video_encoder") or "libx264"
+    vaapi_device = settings.get("vaapi_device") or "/dev/dri/renderD128"
 
     if encoder == "h264_vaapi":
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -137,10 +201,12 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str, settings: dict) -> lis
     cmd += ["-filter_complex", filter_complex]
     cmd += map_args
 
+    _NVENC_VALID_PRESETS = {"p1", "p2", "p3", "p4", "p5", "p6", "p7"}
     if encoder == "h264_nvenc":
+        nvenc_preset = preset if preset in _NVENC_VALID_PRESETS else "p1"
         cmd += [
             "-c:v", "h264_nvenc",
-            "-preset", preset,
+            "-preset", nvenc_preset,
             "-tune", "ll",
             "-rc", "vbr",
             "-cq", str(crf),
@@ -149,9 +215,11 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str, settings: dict) -> lis
             "-g", "60", "-keyint_min", "60",
         ]
     elif encoder == "h264_qsv":
+        _qsv_valid = {"veryfast", "faster", "fast", "medium", "slow"}
+        qsv_preset = preset if preset in _qsv_valid else "veryfast"
         cmd += [
             "-c:v", "h264_qsv",
-            "-preset", preset,
+            "-preset", qsv_preset,
             "-global_quality", str(crf),
             "-b:v", f"{bitrate}k",
             "-maxrate", f"{bitrate}k",
@@ -224,7 +292,7 @@ class MultiviewServer:
     def _serve_stream(self, n: int, start_response):
         logger.info(f"Stream request: layout {n}")
         try:
-            input_urls, layout = self._resolve_layout(n)
+            input_urls, layout, channel_names = self._resolve_layout(n)
         except LookupError as e:
             logger.warning(f"Layout {n} not ready: {e}")
             start_response("404 Not Found", [("Content-Type", "text/plain")])
@@ -241,59 +309,122 @@ class MultiviewServer:
         except Exception:
             enc_settings = {}
 
-        cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings)
-        logger.info(
-            f"Starting ffmpeg: layout={n} inputs={len(input_urls)} style={layout} "
-            f"encoder={enc_settings.get('video_encoder', 'libx264')} "
-            f"resolution={enc_settings.get('output_resolution', '1920x1080')} "
-            f"urls={input_urls}"
-        )
+        resolution = enc_settings.get("output_resolution", "1920x1080")
+        try:
+            out_w, out_h = (int(x) for x in resolution.split("x"))
+        except Exception:
+            out_w, out_h = 1920, 1080
 
         try:
+            import gevent as _gevent
+            import gevent.queue as _gqueue
+            import gevent.event as _gevent_event
             import gevent.subprocess as _gsp
-            proc = _gsp.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _Popen = _gsp.Popen
+            _has_gevent = True
         except ImportError:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _Popen = subprocess.Popen
+            _has_gevent = False
 
-        def _log_stderr():
-            try:
-                for raw in proc.stderr:
-                    line = raw.decode("utf-8", errors="replace").rstrip()
-                    if line:
-                        logger.warning(f"ffmpeg layout={n}: {line}")
-            except Exception:
-                pass
+        placeholder_cmd = _build_placeholder_cmd(channel_names, layout, out_w, out_h)
+        real_cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings)
 
-        threading.Thread(target=_log_stderr, daemon=True, name=f"ffmpeg-stderr-{n}").start()
+        logger.info(
+            f"Starting placeholder + real ffmpeg: layout={n} inputs={len(input_urls)} "
+            f"style={layout} encoder={enc_settings.get('video_encoder', 'libx264')} "
+            f"resolution={resolution}"
+        )
 
-        def stream_gen():
-            bytes_sent = 0
-            try:
-                first = proc.stdout.read(65536)
-                if not first:
-                    start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-                    yield b"Stream did not produce output\n"
-                    return
-                start_response("200 OK", [
-                    ("Content-Type", "video/mp2t"),
-                    ("Cache-Control", "no-cache"),
-                    ("Transfer-Encoding", "chunked"),
-                ])
-                bytes_sent = len(first)
-                yield first
-                while True:
-                    chunk = proc.stdout.read(65536)
-                    if not chunk:
-                        break
-                    bytes_sent += len(chunk)
-                    yield chunk
-            finally:
+        logger.debug(f"placeholder_cmd: {placeholder_cmd}")
+        logger.debug(f"real_cmd: {real_cmd}")
+        placeholder_proc = _Popen(placeholder_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        real_proc = _Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        threading.Thread(
+            target=_log_stderr, args=(real_proc, f"layout={n}"),
+            daemon=True, name=f"ffmpeg-stderr-{n}",
+        ).start()
+
+        start_response("200 OK", [
+            ("Content-Type", "video/mp2t"),
+            ("Cache-Control", "no-cache"),
+            ("Transfer-Encoding", "chunked"),
+        ])
+
+        if _has_gevent:
+            q = _gqueue.Queue(maxsize=8)
+            real_ready = _gevent_event.Event()
+
+            def _read_placeholder():
                 try:
-                    proc.kill()
-                    proc.wait()
-                except Exception:
-                    pass
-                logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
+                    while not real_ready.is_set():
+                        chunk = placeholder_proc.stdout.read(65536)
+                        if not chunk:
+                            break
+                        q.put(chunk)
+                finally:
+                    try:
+                        placeholder_proc.kill()
+                        placeholder_proc.wait()
+                    except Exception:
+                        pass
+
+            def _read_real():
+                try:
+                    first = real_proc.stdout.read(65536)
+                    if not first:
+                        q.put(None)
+                        return
+                    real_ready.set()
+                    q.put(first)
+                    while True:
+                        chunk = real_proc.stdout.read(65536)
+                        if not chunk:
+                            break
+                        q.put(chunk)
+                finally:
+                    q.put(None)
+
+            _gevent.spawn(_read_placeholder)
+            _gevent.spawn(_read_real)
+
+            def stream_gen():
+                bytes_sent = 0
+                try:
+                    while True:
+                        item = q.get()
+                        if item is None:
+                            break
+                        bytes_sent += len(item)
+                        yield item
+                finally:
+                    for proc in (real_proc, placeholder_proc):
+                        try:
+                            proc.kill()
+                            proc.wait()
+                        except Exception:
+                            pass
+                    logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
+
+        else:
+            def stream_gen():
+                bytes_sent = 0
+                try:
+                    for proc in (placeholder_proc, real_proc):
+                        while True:
+                            chunk = proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                            bytes_sent += len(chunk)
+                            yield chunk
+                finally:
+                    for proc in (placeholder_proc, real_proc):
+                        try:
+                            proc.kill()
+                            proc.wait()
+                        except Exception:
+                            pass
+                    logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
 
         return stream_gen()
 
@@ -471,8 +602,8 @@ class MultiviewServer:
 
         return stream_gen()
 
-    def _resolve_layout(self, n: int) -> tuple[list[str], str]:
-        """Return ([internal_channel_urls], layout_name) for layout n."""
+    def _resolve_layout(self, n: int) -> tuple[list[str], str, list[str]]:
+        """Return ([internal_channel_urls], layout_name, [channel_names]) for layout n."""
         from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
 
@@ -487,6 +618,7 @@ class MultiviewServer:
 
         logger.info(f"Resolving layout {n}: ch_count={ch_count} style={layout}")
         input_urls = []
+        channel_names = []
 
         for m in range(1, ch_count + 1):
             ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
@@ -500,8 +632,9 @@ class MultiviewServer:
             url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
             logger.info(f"  channel {m}: id={ch_id_str} name={ch.name!r} url={url}")
             input_urls.append(url)
+            channel_names.append(ch.name)
 
-        return input_urls, layout
+        return input_urls, layout, channel_names
 
     # -- Lifecycle -------------------------------------------------------------
 
