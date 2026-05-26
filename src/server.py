@@ -262,6 +262,9 @@ def _build_placeholder_cmd(
     # Determine which tiles have usable local logos
     usable = [_usable_logo(u) for u in logo_urls]
 
+    # Determine which tiles have usable local logos
+    usable = [_usable_logo(u) for u in logo_urls]
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     for tw, th in tile_sizes:
         cmd += ["-f", "lavfi", "-i", f"color=c=0x0d1117:size={tw}x{th}:r=30000/1001"]
@@ -278,6 +281,15 @@ def _build_placeholder_cmd(
     for i, logo_path in enumerate(usable):
         if logo_path:
             cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
+            logo_input_idx[i] = next_idx
+            next_idx += 1
+
+    # Add logo file inputs and track their indices
+    logo_input_idx: dict[int, int] = {}
+    next_idx = n + 1
+    for i, logo_path in enumerate(usable):
+        if logo_path:
+            cmd += ["-i", logo_path]
             logo_input_idx[i] = next_idx
             next_idx += 1
 
