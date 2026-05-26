@@ -363,7 +363,16 @@ class MultiviewServer:
                 channel_initializing=True,
                 buffer=source_buffer,
             )
-            yield from gen.generate()
+            try:
+                yield from gen.generate()
+            finally:
+                try:
+                    mgr = proxy_server.client_managers.get(channel_id)
+                    if mgr is not None:
+                        mgr.remove_client(client_id)
+                        logger.info(f"Removed multiview client {client_id} from channel {channel_id}")
+                except Exception:
+                    pass
 
         return stream_gen()
 
