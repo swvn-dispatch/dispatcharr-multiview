@@ -133,7 +133,7 @@ class MultiviewServer:
         self.host = host
         self.port = port
         self._server = None
-        self._thread = None
+        self._greenlet = None
         self.running = False
 
     # -- WSGI ------------------------------------------------------------------
@@ -343,10 +343,15 @@ class MultiviewServer:
             return [b"Client manager unavailable\n"]
 
         client_id = str(_uuid_module.uuid4())
-        proxy_server.client_managers[channel_id].add_client(
-            client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
-        )
-        logger.info(f"Registered multiview client {client_id} for channel {channel_id}")
+        try:
+            proxy_server.client_managers[channel_id].add_client(
+                client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
+            )
+            logger.info(f"Registered multiview client {client_id} for channel {channel_id}")
+        except Exception as e:
+            logger.error(f"Failed to register client for channel {channel_id}: {e}")
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Failed to register client\n"]
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -354,17 +359,37 @@ class MultiviewServer:
             ("Transfer-Encoding", "chunked"),
         ])
 
+        try:
+            import gevent as _gv
+            _sleep = _gv.sleep
+        except ImportError:
+            import time
+            _sleep = time.sleep
+
         def stream_gen():
-            gen = StreamGenerator(
-                channel_id=channel_id,
-                client_id=client_id,
-                client_ip="127.0.0.1",
-                client_user_agent="multiview-plugin",
-                channel_initializing=True,
-                buffer=source_buffer,
-            )
             try:
-                yield from gen.generate()
+                while True:
+                    buf = proxy_server.get_buffer(channel_id)
+                    if buf is None:
+                        logger.warning(f"Buffer gone for {channel_id}, waiting 0.5s")
+                        _sleep(0.5)
+                        continue
+                    gen = StreamGenerator(
+                        channel_id=channel_id,
+                        client_id=client_id,
+                        client_ip="127.0.0.1",
+                        client_user_agent="multiview-plugin",
+                        channel_initializing=False,
+                        buffer=buf,
+                    )
+                    try:
+                        yield from gen.generate()
+                    except GeneratorExit:
+                        return
+                    except Exception as e:
+                        logger.warning(f"StreamGenerator error for {channel_id}: {e}")
+                    logger.info(f"StreamGenerator restarting for {channel_id}")
+                    _sleep(0.05)
             finally:
                 try:
                     mgr = proxy_server.client_managers.get(channel_id)
@@ -380,10 +405,9 @@ class MultiviewServer:
         """Return ([internal_channel_urls], layout_name) for layout n."""
         from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
-        from .config import PLUGIN_DB_KEY
 
         try:
-            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
+            cfg = PluginConfig.objects.get(key="multiview")
             settings = cfg.settings
         except Exception:
             settings = {}
@@ -444,8 +468,8 @@ class MultiviewServer:
                 finally:
                     self.running = False
 
-            self._thread = threading.Thread(target=_run, daemon=True, name="multiview-server")
-            self._thread.start()
+            import gevent as _gevent
+            self._greenlet = _gevent.spawn(_run)
             return True
 
         except ImportError:
