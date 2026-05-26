@@ -102,8 +102,23 @@ def _log_stderr(proc, label):
         pass
 
 
+def _usable_logo(url: str | None) -> str | None:
+    """Return url only if it's a local file path that exists on disk."""
+    if url and url.startswith("/"):
+        try:
+            if os.path.isfile(url):
+                return url
+        except Exception:
+            pass
+    return None
+
+
 def _build_placeholder_cmd(
-    channel_names: list[str], layout: str, out_w: int, out_h: int
+    channel_names: list[str],
+    logo_urls: list[str | None],
+    layout: str,
+    out_w: int,
+    out_h: int,
 ) -> list[str]:
     n = len(channel_names)
 
@@ -126,19 +141,45 @@ def _build_placeholder_cmd(
             y = "0" if r == 0 else ("h0" if r == 1 else f"{r}*h0")
             positions.append(f"{x}_{y}")
 
+    # Determine which tiles have usable local logos
+    usable = [_usable_logo(u) for u in logo_urls]
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     for tw, th in tile_sizes:
         cmd += ["-f", "lavfi", "-i", f"color=c=0x0d1117:size={tw}x{th}:r=30000/1001"]
     cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
 
+    # Add logo file inputs and track their indices
+    logo_input_idx: dict[int, int] = {}
+    next_idx = n + 1
+    for i, logo_path in enumerate(usable):
+        if logo_path:
+            cmd += ["-i", logo_path]
+            logo_input_idx[i] = next_idx
+            next_idx += 1
+
     filter_parts = []
     for i, (name, (tw, th)) in enumerate(zip(channel_names, tile_sizes)):
         safe = name.replace("\\", "").replace("'", "").replace(":", " ")
-        fs = max(16, min(tw, th) // 12)
-        filter_parts.append(
-            f"[{i}:v]drawtext=text='Loading\\n{safe}':"
-            f"fontcolor=white:fontsize={fs}:x=(w-tw)/2:y=(h-th)/2:line_spacing=6[t{i}]"
-        )
+        logo_path = logo_input_idx.get(i)
+
+        if logo_path is not None:
+            logo_h = min(th // 4, 120)
+            fs = max(16, min(tw, th) // 16)
+            logo_y = th // 6
+            text_y = th * 3 // 5
+            filter_parts.append(
+                f"[{logo_path}:v]scale=-1:{logo_h}:force_original_aspect_ratio=decrease,setsar=1[ls{i}];"
+                f"[{i}:v][ls{i}]overlay=x=(W-w)/2:y={logo_y}[lo{i}];"
+                f"[lo{i}]drawtext=text='{safe}':fontcolor=white:fontsize={fs}"
+                f":x=(w-tw)/2:y={text_y}[t{i}]"
+            )
+        else:
+            fs = max(16, min(tw, th) // 12)
+            filter_parts.append(
+                f"[{i}:v]drawtext=text='Loading\\n{safe}':"
+                f"fontcolor=white:fontsize={fs}:x=(w-tw)/2:y=(h-th)/2:line_spacing=6[t{i}]"
+            )
 
     inputs_str = "".join(f"[t{i}]" for i in range(n))
     xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}[v]"
@@ -292,7 +333,7 @@ class MultiviewServer:
     def _serve_stream(self, n: int, start_response):
         logger.info(f"Stream request: layout {n}")
         try:
-            input_urls, layout, channel_names = self._resolve_layout(n)
+            input_urls, layout, channel_names, logo_urls = self._resolve_layout(n)
         except LookupError as e:
             logger.warning(f"Layout {n} not ready: {e}")
             start_response("404 Not Found", [("Content-Type", "text/plain")])
@@ -326,7 +367,7 @@ class MultiviewServer:
             _Popen = subprocess.Popen
             _has_gevent = False
 
-        placeholder_cmd = _build_placeholder_cmd(channel_names, layout, out_w, out_h)
+        placeholder_cmd = _build_placeholder_cmd(channel_names, logo_urls, layout, out_w, out_h)
         real_cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings)
 
         logger.info(
@@ -352,16 +393,24 @@ class MultiviewServer:
         ])
 
         if _has_gevent:
-            q = _gqueue.Queue(maxsize=8)
-            real_ready = _gevent_event.Event()
+            # placeholder_q: placeholder chunks (small buffer, so we don't over-fill)
+            # real_first_q: the first chunk from real ffmpeg (signals it's alive)
+            placeholder_q = _gqueue.Queue(maxsize=4)
+            real_first_q  = _gqueue.Queue(maxsize=1)
+            real_ready     = _gevent_event.Event()
 
             def _read_placeholder():
                 try:
                     while not real_ready.is_set():
-                        chunk = placeholder_proc.stdout.read(65536)
+                        chunk = placeholder_proc.stdout.read(32768)
                         if not chunk:
                             break
-                        q.put(chunk)
+                        if real_ready.is_set():
+                            break
+                        try:
+                            placeholder_q.put(chunk, timeout=1)
+                        except Exception:
+                            break  # stream_gen stopped consuming
                 finally:
                     try:
                         placeholder_proc.kill()
@@ -369,34 +418,43 @@ class MultiviewServer:
                     except Exception:
                         pass
 
-            def _read_real():
-                try:
-                    first = real_proc.stdout.read(65536)
-                    if not first:
-                        q.put(None)
-                        return
-                    real_ready.set()
-                    q.put(first)
-                    while True:
-                        chunk = real_proc.stdout.read(65536)
-                        if not chunk:
-                            break
-                        q.put(chunk)
-                finally:
-                    q.put(None)
+            def _probe_real():
+                first = real_proc.stdout.read(65536)
+                real_first_q.put(first if first else b"")
+                real_ready.set()
 
             _gevent.spawn(_read_placeholder)
-            _gevent.spawn(_read_real)
+            _gevent.spawn(_probe_real)
 
             def stream_gen():
                 bytes_sent = 0
                 try:
+                    # Phase 1: stream placeholder until real ffmpeg produces output
+                    while not real_ready.is_set():
+                        try:
+                            chunk = placeholder_q.get(timeout=0.1)
+                            bytes_sent += len(chunk)
+                            yield chunk
+                        except _gqueue.Empty:
+                            continue
+
+                    # Phase 2: hand off to real ffmpeg immediately
+                    try:
+                        first = real_first_q.get(timeout=3)
+                    except _gqueue.Empty:
+                        first = b""
+                    if not first:
+                        return
+                    bytes_sent += len(first)
+                    yield first
+
+                    # Phase 3: stream rest of real ffmpeg directly (no queue)
                     while True:
-                        item = q.get()
-                        if item is None:
+                        chunk = real_proc.stdout.read(65536)
+                        if not chunk:
                             break
-                        bytes_sent += len(item)
-                        yield item
+                        bytes_sent += len(chunk)
+                        yield chunk
                 finally:
                     for proc in (real_proc, placeholder_proc):
                         try:
@@ -602,8 +660,8 @@ class MultiviewServer:
 
         return stream_gen()
 
-    def _resolve_layout(self, n: int) -> tuple[list[str], str, list[str]]:
-        """Return ([internal_channel_urls], layout_name, [channel_names]) for layout n."""
+    def _resolve_layout(self, n: int) -> tuple[list[str], str, list[str], list[str | None]]:
+        """Return ([internal_channel_urls], layout_name, [channel_names], [logo_urls]) for layout n."""
         from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
 
@@ -619,13 +677,14 @@ class MultiviewServer:
         logger.info(f"Resolving layout {n}: ch_count={ch_count} style={layout}")
         input_urls = []
         channel_names = []
+        logo_urls = []
 
         for m in range(1, ch_count + 1):
             ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
             if not ch_id_str or ch_id_str == "_none":
                 raise LookupError(f"Layout {n} channel {m} is not configured")
             try:
-                ch = Channel.objects.get(id=int(ch_id_str))
+                ch = Channel.objects.select_related("logo").get(id=int(ch_id_str))
             except Channel.DoesNotExist:
                 raise LookupError(f"Channel id={ch_id_str} not found")
 
@@ -633,8 +692,12 @@ class MultiviewServer:
             logger.info(f"  channel {m}: id={ch_id_str} name={ch.name!r} url={url}")
             input_urls.append(url)
             channel_names.append(ch.name)
+            try:
+                logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
+            except Exception:
+                logo_urls.append(None)
 
-        return input_urls, layout, channel_names
+        return input_urls, layout, channel_names, logo_urls
 
     # -- Lifecycle -------------------------------------------------------------
 
