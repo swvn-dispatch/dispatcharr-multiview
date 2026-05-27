@@ -88,10 +88,20 @@ def _featured_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
         f"[0:v]fps=30000/1001,scale={main_w}:{main_h}:force_original_aspect_ratio=decrease,"
         f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[main]"
     ]
+    side_count = n - 1
     for i in range(1, n):
+        slot = i - 1
+        if side_count == 1:
+            pad_y = "(oh-ih)/2"
+        elif slot == 0:
+            pad_y = "oh-ih"
+        elif slot == side_count - 1:
+            pad_y = "0"
+        else:
+            pad_y = "(oh-ih)/2"
         parts.append(
             f"[{i}:v]fps=30000/1001,scale={side_w}:{side_h}:force_original_aspect_ratio=decrease,"
-            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[s{i}]"
+            f"pad={side_w}:{side_h}:(ow-iw)/2:{pad_y}:color=black,setsar=1[s{i}]"
         )
 
     all_labels = "[main]" + "".join(f"[s{i}]" for i in range(1, n))
