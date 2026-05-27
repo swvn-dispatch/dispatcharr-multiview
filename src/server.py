@@ -57,7 +57,7 @@ def _auto_grid_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
         for i in range(n)
     ]
 
-    positions = _centered_grid_positions(n, cols, rows, tile_w)
+    positions = _centered_grid_positions(n, cols, rows, tile_w, tile_h)
 
     inputs_str = "".join(f"[v{i}]" for i in range(n))
     xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=0x0d1117[v]"
@@ -112,8 +112,13 @@ def _usable_logo(url: str | None) -> str | None:
     return None
 
 
-def _centered_grid_positions(n: int, cols: int, rows: int, tile_w: int) -> list[str]:
-    """xstack layout positions with the last partial row horizontally centered."""
+def _centered_grid_positions(n: int, cols: int, rows: int, tile_w: int, tile_h: int) -> list[str]:
+    """xstack layout positions with the last partial row horizontally centered.
+
+    All positions are hardcoded pixel values. xstack only supports addition in
+    layout expressions, so expressions like '2*w0' silently evaluate to 0 and
+    cause tiles to overlap. Pixel values avoid that entirely.
+    """
     last_row_count = n % cols or cols
     empty_cells = cols - last_row_count
     offset_x = (empty_cells * tile_w) // 2 if empty_cells > 0 else 0
@@ -122,11 +127,9 @@ def _centered_grid_positions(n: int, cols: int, rows: int, tile_w: int) -> list[
     for i in range(n):
         c = i % cols
         r = i // cols
-        if r == rows - 1 and empty_cells > 0:
-            x = str(c * tile_w + offset_x)
-        else:
-            x = "0" if c == 0 else ("w0" if c == 1 else f"{c}*w0")
-        y = "0" if r == 0 else ("h0" if r == 1 else f"{r}*h0")
+        is_last = r == rows - 1 and empty_cells > 0
+        x = c * tile_w + (offset_x if is_last else 0)
+        y = r * tile_h
         positions.append(f"{x}_{y}")
     return positions
 
@@ -257,7 +260,7 @@ def _build_placeholder_cmd(
         tile_w = out_w // cols
         tile_h = out_h // rows
         tile_sizes = [(tile_w, tile_h)] * n
-        positions = _centered_grid_positions(n, cols, rows, tile_w)
+        positions = _centered_grid_positions(n, cols, rows, tile_w, tile_h)
 
     # Determine which tiles have usable local logos
     usable = [_usable_logo(u) for u in logo_urls]
@@ -832,38 +835,60 @@ class MultiviewServer:
 
         ch_count = max(2, int(settings.get(f"multiview_{n}_channel_count", 4)))
         layout = settings.get(f"multiview_{n}_layout", "auto")
+        selector_type = settings.get(f"multiview_{n}_selector_type", "classic")
 
-        logger.info(f"Resolving layout {n}: ch_count={ch_count} style={layout}")
+        logger.info(f"Resolving layout {n}: ch_count={ch_count} style={layout} selector={selector_type}")
         input_urls = []
         channel_names = []
         logo_urls = []
 
-        for m in range(1, ch_count + 1):
-            ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
-            if not ch_id_str or ch_id_str == "_none":
-                logger.info(f"  channel {m}: skipped (not configured)")
-                continue
-            try:
-                ch = Channel.objects.select_related("logo").get(id=int(ch_id_str))
-            except Channel.DoesNotExist:
-                logger.warning(f"  channel {m}: id={ch_id_str} not found, skipping")
-                continue
-
-            url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
-            logger.info(f"  channel {m}: id={ch_id_str} name={ch.name!r} url={url}")
-            input_urls.append(url)
-            channel_names.append(ch.name)
-            try:
-                logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
-            except Exception:
-                logo_urls.append(None)
+        if selector_type == "regex":
+            pattern = settings.get(f"multiview_{n}_regex_pattern", "").strip()
+            if not pattern:
+                raise LookupError(f"Layout {n} is in regex mode but has no pattern configured")
+            matched = list(
+                Channel.objects.select_related("logo")
+                .filter(name__iregex=pattern)
+                .order_by("channel_number")[:ch_count]
+            )
+            for ch in matched:
+                url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
+                logger.info(f"  regex match: name={ch.name!r} url={url}")
+                input_urls.append(url)
+                channel_names.append(ch.name)
+                try:
+                    logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
+                except Exception:
+                    logo_urls.append(None)
+            audio_source = settings.get(f"multiview_{n}_audio_source", "regex_first")
+            if audio_source in ("regex_first", "regex_lowest"):
+                audio_source = "0"  # both map to index 0 of the channel_number-sorted list
+        else:
+            for m in range(1, ch_count + 1):
+                ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
+                if not ch_id_str or ch_id_str == "_none":
+                    logger.info(f"  channel {m}: skipped (not configured)")
+                    continue
+                try:
+                    ch = Channel.objects.select_related("logo").get(id=int(ch_id_str))
+                except Channel.DoesNotExist:
+                    logger.warning(f"  channel {m}: id={ch_id_str} not found, skipping")
+                    continue
+                url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
+                logger.info(f"  channel {m}: id={ch_id_str} name={ch.name!r} url={url}")
+                input_urls.append(url)
+                channel_names.append(ch.name)
+                try:
+                    logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
+                except Exception:
+                    logo_urls.append(None)
+            audio_source = settings.get(f"multiview_{n}_audio_source", "0")
 
         if len(input_urls) < 2:
             raise LookupError(
                 f"Layout {n} needs at least 2 configured channels (found {len(input_urls)})"
             )
 
-        audio_source = settings.get(f"multiview_{n}_audio_source", "0")
         return input_urls, layout, channel_names, logo_urls, audio_source
 
     # Lifecycle
