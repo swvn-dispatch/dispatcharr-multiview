@@ -52,7 +52,7 @@ def _auto_grid_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
 
     scale_parts = [
         f"[{i}:v]fps=30000/1001,scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
-        f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+        f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,setsar=1[v{i}]"
         for i in range(n)
     ]
 
@@ -81,12 +81,12 @@ def _featured_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
 
     parts = [
         f"[0:v]fps=30000/1001,scale={main_w}:{main_h}:force_original_aspect_ratio=decrease,"
-        f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[main]"
+        f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,setsar=1[main]"
     ]
     for i in range(1, n):
         parts.append(
             f"[{i}:v]fps=30000/1001,scale={side_w}:{side_h}:force_original_aspect_ratio=decrease,"
-            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2,setsar=1[s{i}]"
+            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,setsar=1[s{i}]"
         )
 
     positions = ["0_0"] + [f"{main_w}_{(i - 1) * side_h}" for i in range(1, n)]
@@ -115,6 +115,52 @@ def _usable_logo(url: str | None) -> str | None:
         except Exception:
             pass
     return None
+
+
+def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server):
+    """Yield MPEG-TS logo placeholder until channel_id's buffer is available again."""
+    try:
+        import gevent.subprocess as _gsp
+        _Popen = _gsp.Popen
+    except ImportError:
+        _Popen = subprocess.Popen
+
+    usable = _usable_logo(logo_url)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+           "-f", "lavfi", "-i", "color=c=0x0d1117:size=320x180:r=30000/1001",
+           "-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
+    if usable:
+        cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", usable]
+        filter_complex = (
+            "[2:v]scale=60:60:force_original_aspect_ratio=decrease,setsar=1[logo];"
+            "[0:v][logo]overlay=x=(W-w)/2:y=(H-h)/2[v]"
+        )
+        cmd += ["-filter_complex", filter_complex, "-map", "[v]"]
+    else:
+        cmd += ["-map", "0:v"]
+    cmd += [
+        "-map", "1:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-c:a", "ac3",
+        "-metadata:s:a:0", f"title={channel_name}",
+        "-f", "mpegts", "pipe:1",
+    ]
+
+    proc = _Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            chunk = proc.stdout.read(32768)
+            if not chunk:
+                break
+            yield chunk
+            if proxy_server.get_buffer(channel_id) is not None:
+                break
+    finally:
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
 
 
 def _build_placeholder_cmd(
@@ -578,28 +624,28 @@ class MultiviewServer:
             if not success:
                 logger.error(f"Failed to initialize channel {channel_id}")
                 return False
-            channel_initializing = True
+
+            try:
+                import gevent
+                _sleep = gevent.sleep
+            except ImportError:
+                import time
+                _sleep = time.sleep
+
+            for _ in range(30):
+                if proxy_server.get_buffer(channel_id) is not None:
+                    break
+                _sleep(0.2)
+
+            for _ in range(15):
+                if channel_id in proxy_server.client_managers:
+                    break
+                _sleep(0.2)
+
+            return True
         else:
-            channel_initializing = False
-
-        try:
-            import gevent
-            _sleep = gevent.sleep
-        except ImportError:
-            import time
-            _sleep = time.sleep
-
-        for _ in range(30):
-            if proxy_server.get_buffer(channel_id) is not None:
-                break
-            _sleep(0.2)
-
-        for _ in range(15):
-            if channel_id in proxy_server.client_managers:
-                break
-            _sleep(0.2)
-
-        return channel_initializing
+            logger.info(f"Channel {channel_id} already running — attaching directly")
+            return False
 
     def _serve_channel_internal(self, channel_id: str, start_response):
         """Internal endpoint consumed by ffmpeg. Opens the channel through ProxyServer."""
@@ -626,34 +672,24 @@ class MultiviewServer:
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [b"Proxy server unavailable\n"]
 
+        # Look up channel metadata for placeholder
+        channel_name = channel_id
+        logo_url = None
+        try:
+            from apps.channels.models import Channel
+            ch_obj = Channel.objects.select_related("logo").get(uuid=channel_id)
+            channel_name = ch_obj.name
+            logo_url = ch_obj.logo.url if ch_obj.logo_id is not None else None
+        except Exception:
+            pass
+
         try:
             self._ensure_channel_initialized(channel_id)
         except Exception as e:
-            logger.error(f"Channel init error {channel_id}: {e}", exc_info=True)
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Failed to initialize channel\n"]
-
-        source_buffer = proxy_server.get_buffer(channel_id)
-        if source_buffer is None:
-            logger.warning(f"Buffer not available for channel {channel_id}")
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Stream buffer unavailable\n"]
-
-        if channel_id not in proxy_server.client_managers:
-            logger.warning(f"Client manager not available for channel {channel_id}")
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Client manager unavailable\n"]
+            logger.warning(f"Channel init warning {channel_id}: {e}")
+            # Don't 503 — serve placeholder and wait for channel to become available
 
         client_id = str(_uuid_module.uuid4())
-        try:
-            proxy_server.client_managers[channel_id].add_client(
-                client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
-            )
-            logger.info(f"Registered multiview client {client_id} for channel {channel_id}")
-        except Exception as e:
-            logger.error(f"Failed to register client for channel {channel_id}: {e}")
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Failed to register client\n"]
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -665,17 +701,47 @@ class MultiviewServer:
             import gevent as _gv
             _sleep = _gv.sleep
         except ImportError:
-            import time
-            _sleep = time.sleep
+            import time as _time_mod
+            _sleep = _time_mod.sleep
 
         def stream_gen():
+            _active_client = False
             try:
                 while True:
                     buf = proxy_server.get_buffer(channel_id)
+
                     if buf is None:
-                        logger.warning(f"Buffer gone for {channel_id}, waiting 0.5s")
-                        _sleep(0.5)
+                        if _active_client:
+                            try:
+                                mgr = proxy_server.client_managers.get(channel_id)
+                                if mgr:
+                                    mgr.remove_client(client_id)
+                            except Exception:
+                                pass
+                            _active_client = False
+                        logger.info(f"Channel {channel_id} buffer gone — serving placeholder")
+                        yield from _single_channel_placeholder_gen(
+                            channel_id, channel_name, logo_url, proxy_server
+                        )
+                        logger.info(f"Channel {channel_id} buffer returned — resuming")
                         continue
+
+                    if not _active_client:
+                        mgr = proxy_server.client_managers.get(channel_id)
+                        if mgr is None:
+                            _sleep(0.5)
+                            continue
+                        try:
+                            mgr.add_client(
+                                client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
+                            )
+                            _active_client = True
+                            logger.info(f"Registered client {client_id} for {channel_id}")
+                        except Exception as e:
+                            logger.warning(f"add_client failed for {channel_id}: {e}")
+                            _sleep(0.5)
+                            continue
+
                     gen = StreamGenerator(
                         channel_id=channel_id,
                         client_id=client_id,
@@ -690,16 +756,19 @@ class MultiviewServer:
                         return
                     except Exception as e:
                         logger.warning(f"StreamGenerator error for {channel_id}: {e}")
+                    # StreamGenerator._cleanup() removed our client
+                    _active_client = False
                     logger.info(f"StreamGenerator restarting for {channel_id}")
                     _sleep(0.05)
             finally:
-                try:
-                    mgr = proxy_server.client_managers.get(channel_id)
-                    if mgr is not None:
-                        mgr.remove_client(client_id)
-                        logger.info(f"Removed multiview client {client_id} from channel {channel_id}")
-                except Exception:
-                    pass
+                if _active_client:
+                    try:
+                        mgr = proxy_server.client_managers.get(channel_id)
+                        if mgr is not None:
+                            mgr.remove_client(client_id)
+                            logger.info(f"Removed client {client_id} from {channel_id}")
+                    except Exception:
+                        pass
 
         return stream_gen()
 
@@ -725,11 +794,13 @@ class MultiviewServer:
         for m in range(1, ch_count + 1):
             ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
             if not ch_id_str or ch_id_str == "_none":
-                raise LookupError(f"Layout {n} channel {m} is not configured")
+                logger.info(f"  channel {m}: skipped (not configured)")
+                continue
             try:
                 ch = Channel.objects.select_related("logo").get(id=int(ch_id_str))
             except Channel.DoesNotExist:
-                raise LookupError(f"Channel id={ch_id_str} not found")
+                logger.warning(f"  channel {m}: id={ch_id_str} not found, skipping")
+                continue
 
             url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
             logger.info(f"  channel {m}: id={ch_id_str} name={ch.name!r} url={url}")
@@ -739,6 +810,11 @@ class MultiviewServer:
                 logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
             except Exception:
                 logo_urls.append(None)
+
+        if len(input_urls) < 2:
+            raise LookupError(
+                f"Layout {n} needs at least 2 configured channels (found {len(input_urls)})"
+            )
 
         audio_source = settings.get(f"multiview_{n}_audio_source", "0")
         return input_urls, layout, channel_names, logo_urls, audio_source
