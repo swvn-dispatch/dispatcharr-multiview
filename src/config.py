@@ -264,21 +264,35 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
     ]
 
     for m in range(1, ch_count + 1):
-        audio_note = " (audio source)" if m == 1 else " (muted)"
         fields.append(
             {
                 "id": f"multiview_{n}_channel_{m}",
-                "label": f"Layout {n}: Channel {m}{audio_note}",
+                "label": f"Layout {n}: Channel {m}",
                 "type": "select",
                 "default": "_none",
                 "options": channel_options,
-                "description": (
-                    "Audio from channel 1 only; all other channels are muted in the output"
-                    if m == 1
-                    else ""
-                ),
+                "description": "",
             }
         )
+
+    audio_opts = [{"value": "all", "label": "All channels (selectable in player)"}]
+    for m in range(1, ch_count + 1):
+        audio_opts.append({"value": str(m - 1), "label": f"Channel {m}"})
+
+    fields.append(
+        {
+            "id": f"multiview_{n}_audio_source",
+            "label": f"Layout {n} Audio Source",
+            "type": "select",
+            "default": "0",
+            "options": audio_opts,
+            "description": (
+                "Which channel's audio to include. "
+                "'All channels' outputs one audio track per tile; "
+                "players that support multi-track (VLC, Infuse, etc.) can switch between them."
+            ),
+        }
+    )
 
     return fields
 

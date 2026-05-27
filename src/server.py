@@ -68,7 +68,7 @@ def _auto_grid_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
     xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}[v]"
 
     filter_complex = "; ".join(scale_parts) + "; " + xstack
-    return filter_complex, ["-map", "[v]", "-map", "0:a"]
+    return filter_complex, ["-map", "[v]"]
 
 
 def _featured_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
@@ -93,7 +93,7 @@ def _featured_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
     all_labels = "[main]" + "".join(f"[s{i}]" for i in range(1, n))
     parts.append(f"{all_labels}xstack=inputs={n}:layout={'|'.join(positions)}[v]")
 
-    return "; ".join(parts), ["-map", "[v]", "-map", "0:a"]
+    return "; ".join(parts), ["-map", "[v]"]
 
 
 def _log_stderr(proc, label):
@@ -123,6 +123,7 @@ def _build_placeholder_cmd(
     layout: str,
     out_w: int,
     out_h: int,
+    audio_source: str = "0",
 ) -> list[str]:
     n = len(channel_names)
 
@@ -151,14 +152,16 @@ def _build_placeholder_cmd(
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     for tw, th in tile_sizes:
         cmd += ["-f", "lavfi", "-i", f"color=c=0x0d1117:size={tw}x{th}:r=30000/1001"]
-    cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
+    audio_count = n if audio_source == "all" else 1
+    for _ in range(audio_count):
+        cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
 
     # Add logo file inputs and track their indices.
     # -loop 1 makes ffmpeg loop the still image for the full -t duration;
     # without it the image is a single-frame stream and the overlay pipeline
     # terminates after ~1 frame.
     logo_input_idx: dict[int, int] = {}
-    next_idx = n + 1
+    next_idx = n + audio_count
     for i, logo_path in enumerate(usable):
         if logo_path:
             cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
@@ -184,9 +187,24 @@ def _build_placeholder_cmd(
 
     cmd += [
         "-filter_complex", filter_complex,
-        "-map", "[v]", "-map", f"{n}:a",
+        "-map", "[v]",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-c:a", "ac3",
+    ]
+
+    if audio_source == "all":
+        for i in range(n):
+            cmd += ["-map", f"{n + i}:a"]
+        cmd += ["-c:a", "ac3"]
+        for i, name in enumerate(channel_names):
+            cmd += [f"-metadata:s:a:{i}", f"title={name}"]
+    else:
+        audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
+        audio_idx = max(0, min(audio_idx, n - 1))
+        cmd += ["-map", f"{n}:a", "-c:a", "ac3"]
+        if channel_names and audio_idx < len(channel_names):
+            cmd += ["-metadata:s:a:0", f"title={channel_names[audio_idx]}"]
+
+    cmd += [
         "-t", str(max(5, n * 4)),
         "-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity",
         "-f", "mpegts", "pipe:1",
@@ -194,7 +212,13 @@ def _build_placeholder_cmd(
     return cmd
 
 
-def _build_ffmpeg_cmd(input_urls: list[str], layout: str, settings: dict) -> list[str]:
+def _build_ffmpeg_cmd(
+    input_urls: list[str],
+    layout: str,
+    settings: dict,
+    audio_source: str = "0",
+    channel_names: list[str] | None = None,
+) -> list[str]:
     n = len(input_urls)
 
     resolution   = settings.get("output_resolution") or "1920x1080"
@@ -286,7 +310,19 @@ def _build_ffmpeg_cmd(input_urls: list[str], layout: str, settings: dict) -> lis
             "-force_key_frames", "expr:gte(t,n_forced*2)",
         ]
 
-    cmd += ["-c:a", "ac3"]
+    if audio_source == "all":
+        for i in range(n):
+            cmd += ["-map", f"{i}:a?"]
+        cmd += ["-c:a", "ac3"]
+        for i, name in enumerate(channel_names or []):
+            cmd += [f"-metadata:s:a:{i}", f"title={name}"]
+    else:
+        audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
+        audio_idx = max(0, min(audio_idx, n - 1))
+        cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3"]
+        if channel_names and audio_idx < len(channel_names):
+            cmd += ["-metadata:s:a:0", f"title={channel_names[audio_idx]}"]
+
     cmd += ["-max_muxing_queue_size", "1024"]
     cmd += ["-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity"]
     cmd += ["-f", "mpegts", "pipe:1"]
@@ -330,7 +366,7 @@ class MultiviewServer:
     def _serve_stream(self, n: int, start_response):
         logger.info(f"Stream request: layout {n}")
         try:
-            input_urls, layout, channel_names, logo_urls = self._resolve_layout(n)
+            input_urls, layout, channel_names, logo_urls, audio_source = self._resolve_layout(n)
         except LookupError as e:
             logger.warning(f"Layout {n} not ready: {e}")
             start_response("404 Not Found", [("Content-Type", "text/plain")])
@@ -364,8 +400,8 @@ class MultiviewServer:
             _Popen = subprocess.Popen
             _has_gevent = False
 
-        placeholder_cmd = _build_placeholder_cmd(channel_names, logo_urls, layout, out_w, out_h)
-        real_cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings)
+        placeholder_cmd = _build_placeholder_cmd(channel_names, logo_urls, layout, out_w, out_h, audio_source)
+        real_cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings, audio_source, channel_names)
 
         logger.info(
             f"Starting placeholder + real ffmpeg: layout={n} inputs={len(input_urls)} "
@@ -667,7 +703,7 @@ class MultiviewServer:
 
         return stream_gen()
 
-    def _resolve_layout(self, n: int) -> tuple[list[str], str, list[str], list[str | None]]:
+    def _resolve_layout(self, n: int) -> tuple[list[str], str, list[str], list[str | None], str]:
         """Return ([internal_channel_urls], layout_name, [channel_names], [logo_urls]) for layout n."""
         from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
@@ -704,7 +740,8 @@ class MultiviewServer:
             except Exception:
                 logo_urls.append(None)
 
-        return input_urls, layout, channel_names, logo_urls
+        audio_source = settings.get(f"multiview_{n}_audio_source", "0")
+        return input_urls, layout, channel_names, logo_urls, audio_source
 
     # -- Lifecycle -------------------------------------------------------------
 
