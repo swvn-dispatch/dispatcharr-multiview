@@ -53,38 +53,47 @@ def _auto_grid_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
 
     scale_parts = [
         f"[{i}:v]fps=30000/1001,scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
-        f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,setsar=1[v{i}]"
+        f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[v{i}]"
         for i in range(n)
     ]
 
     positions = _centered_grid_positions(n, cols, rows, tile_w, tile_h)
 
     inputs_str = "".join(f"[v{i}]" for i in range(n))
-    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=0x0d1117[v]"
+    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=black[v]"
 
     filter_complex = "; ".join(scale_parts) + "; " + xstack
     return filter_complex, ["-map", "[v]"]
 
 
+def _featured_layout(n: int, out_w: int, out_h: int) -> tuple[int, int, int, int, list[str]]:
+    """Return (main_w, main_h, side_w, side_h, positions) for featured layout.
+
+    Side column width is the natural 16:9 width for the tile height, capped so
+    the featured stream always occupies at least 60% of the output width.
+    """
+    side_count = max(1, n - 1)
+    side_h = out_h // side_count
+    side_w = min(round(side_h * 16 / 9), round(out_w * 0.4))
+    main_w = out_w - side_w
+    positions = ["0_0"] + [f"{main_w}_{i * side_h}" for i in range(side_count)]
+    return main_w, out_h, side_w, side_h, positions
+
+
 def _featured_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
-    """Return (filter_complex, output_map_args) for featured layout: channel 0 left 2/3, rest stacked right."""
-    main_w = round(out_w * 2 / 3)
-    side_w = out_w - main_w
-    main_h = out_h
-    side_count = n - 1
-    side_h = out_h // side_count if side_count > 0 else out_h
+    """Return (filter_complex, output_map_args) for featured layout: channel 0 left, rest stacked right."""
+    main_w, main_h, side_w, side_h, positions = _featured_layout(n, out_w, out_h)
 
     parts = [
         f"[0:v]fps=30000/1001,scale={main_w}:{main_h}:force_original_aspect_ratio=decrease,"
-        f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,setsar=1[main]"
+        f"pad={main_w}:{main_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[main]"
     ]
     for i in range(1, n):
         parts.append(
             f"[{i}:v]fps=30000/1001,scale={side_w}:{side_h}:force_original_aspect_ratio=decrease,"
-            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,setsar=1[s{i}]"
+            f"pad={side_w}:{side_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[s{i}]"
         )
 
-    positions = ["0_0"] + [f"{main_w}_{(i - 1) * side_h}" for i in range(1, n)]
     all_labels = "[main]" + "".join(f"[s{i}]" for i in range(1, n))
     parts.append(f"{all_labels}xstack=inputs={n}:layout={'|'.join(positions)}[v]")
 
@@ -148,6 +157,26 @@ def _lang_code(name: str) -> str:
     return (initials + "   ")[:3].lower()
 
 
+def _deduplicate_lang_codes(names: list[str]) -> list[str]:
+    """Return lang codes for names, replacing the 3rd char with a 1-based index for duplicates.
+
+    e.g. ['TSN 1', 'TSN 2', 'TSN 3'] -> ['ts1', 'ts2', 'ts3']
+    """
+    raw = [_lang_code(n) for n in names]
+    counts: dict[str, int] = {}
+    for c in raw:
+        counts[c] = counts.get(c, 0) + 1
+    seen: dict[str, int] = {}
+    result = []
+    for code in raw:
+        if counts[code] > 1:
+            seen[code] = seen.get(code, 0) + 1
+            result.append(code[:2] + str(seen[code]))
+        else:
+            result.append(code)
+    return result
+
+
 def _parse_resolution(settings: dict) -> tuple[int, int]:
     try:
         w, h = (int(x) for x in (settings.get("output_resolution") or "1920x1080").split("x"))
@@ -185,9 +214,10 @@ def _audio_metadata_args(audio_source: str, channel_names: list[str], n: int) ->
     """Return -metadata:s:a:i args for audio track title and language."""
     args = []
     if audio_source == "all":
-        for i, name in enumerate(channel_names or []):
+        lang_codes = _deduplicate_lang_codes(channel_names or [])
+        for i, (name, code) in enumerate(zip(channel_names or [], lang_codes)):
             args += [f"-metadata:s:a:{i}", f"title={name}",
-                     f"-metadata:s:a:{i}", f"language={_lang_code(name)}"]
+                     f"-metadata:s:a:{i}", f"language={code}"]
     else:
         audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
         audio_idx = max(0, min(audio_idx, n - 1))
@@ -204,7 +234,7 @@ def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, pro
 
     usable = _usable_logo(logo_url)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-           "-f", "lavfi", "-i", "color=c=0x0d1117:size=320x180:r=30000/1001",
+           "-f", "lavfi", "-i", "color=c=black:size=320x180:r=30000/1001",
            "-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
     if usable:
         cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", usable]
@@ -248,12 +278,8 @@ def _build_placeholder_cmd(
     n = len(channel_names)
 
     if layout == "featured":
-        main_w = round(out_w * 2 / 3)
-        side_w = out_w - main_w
-        side_count = n - 1
-        side_h = out_h // side_count if side_count > 0 else out_h
-        tile_sizes = [(main_w, out_h)] + [(side_w, side_h)] * (n - 1)
-        positions  = ["0_0"] + [f"{main_w}_{i * side_h}" for i in range(side_count)]
+        main_w, main_h, side_w, side_h, positions = _featured_layout(n, out_w, out_h)
+        tile_sizes = [(main_w, main_h)] + [(side_w, side_h)] * (n - 1)
     else:
         cols = math.ceil(math.sqrt(n))
         rows = math.ceil(n / cols)
@@ -270,7 +296,7 @@ def _build_placeholder_cmd(
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     for tw, th in tile_sizes:
-        cmd += ["-f", "lavfi", "-i", f"color=c=0x0d1117:size={tw}x{th}:r=30000/1001"]
+        cmd += ["-f", "lavfi", "-i", f"color=c=black:size={tw}x{th}:r=30000/1001"]
     audio_count = n if audio_source == "all" else 1
     for _ in range(audio_count):
         cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
@@ -313,12 +339,17 @@ def _build_placeholder_cmd(
             filter_parts.append(f"[{i}:v]copy[t{i}]")
 
     inputs_str = "".join(f"[t{i}]" for i in range(n))
-    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=0x0d1117[v]"
-    filter_complex = "; ".join(filter_parts) + "; " + xstack
+    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=black[v]"
+    font_size = max(24, out_h // 30)
+    filter_complex = (
+        "; ".join(filter_parts) + "; " + xstack
+        + f"; [v]drawtext=text='Starting up...':fontcolor=white:fontsize={font_size}"
+          f":x=(w-text_w)/2:y=h-th-20:box=1:boxcolor=black@0.7:boxborderw=8[vo]"
+    )
 
     cmd += [
         "-filter_complex", filter_complex,
-        "-map", "[v]",
+        "-map", "[vo]",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
     ]
 
