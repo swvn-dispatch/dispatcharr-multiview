@@ -289,7 +289,7 @@ def _build_placeholder_cmd(
     # without it the image is a single-frame stream and the overlay pipeline
     # terminates after ~1 frame.
     logo_input_idx: dict[int, int] = {}
-    next_idx = n + 1
+    next_idx = n + audio_count
     for i, logo_path in enumerate(usable):
         if logo_path:
             cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
