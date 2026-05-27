@@ -187,8 +187,9 @@ _MULTIVIEW_COUNT_FIELD = {
 # Per-layout field builders
 
 _LAYOUT_OPTIONS = [
-    {"value": "auto", "label": "Auto Grid"},
-    {"value": "featured", "label": "Featured (main left, others stacked right)"},
+    {"value": "auto",         "label": "Auto Grid"},
+    {"value": "featured",     "label": "Featured (main left, others stacked right)"},
+    {"value": "top_featured", "label": "Top Featured (main top, others row bottom)"},
 ]
 
 
