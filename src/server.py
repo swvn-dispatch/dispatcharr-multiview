@@ -284,12 +284,15 @@ def _build_placeholder_cmd(
             logo_input_idx[i] = next_idx
             next_idx += 1
 
-    # Add logo file inputs and track their indices
+    # Add logo file inputs and track their indices.
+    # -loop 1 makes ffmpeg loop the still image for the full -t duration;
+    # without it the image is a single-frame stream and the overlay pipeline
+    # terminates after ~1 frame.
     logo_input_idx: dict[int, int] = {}
     next_idx = n + 1
     for i, logo_path in enumerate(usable):
         if logo_path:
-            cmd += ["-i", logo_path]
+            cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
             logo_input_idx[i] = next_idx
             next_idx += 1
 
