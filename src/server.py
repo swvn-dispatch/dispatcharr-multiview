@@ -25,6 +25,10 @@ import uuid as _uuid_module
 
 logger = logging.getLogger(__name__)
 
+# MPEG-TS null packets (PID 0x1FFF): transparent to every decoder,
+# used to keep the connection alive between placeholder end and real start.
+_NULL_TS_BURST = (bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes(184)) * 7
+
 _server_instance = None
 
 
@@ -149,37 +153,30 @@ def _build_placeholder_cmd(
         cmd += ["-f", "lavfi", "-i", f"color=c=0x0d1117:size={tw}x{th}:r=30000/1001"]
     cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
 
-    # Add logo file inputs and track their indices
+    # Add logo file inputs and track their indices.
+    # -loop 1 makes ffmpeg loop the still image for the full -t duration;
+    # without it the image is a single-frame stream and the overlay pipeline
+    # terminates after ~1 frame.
     logo_input_idx: dict[int, int] = {}
     next_idx = n + 1
     for i, logo_path in enumerate(usable):
         if logo_path:
-            cmd += ["-i", logo_path]
+            cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
             logo_input_idx[i] = next_idx
             next_idx += 1
 
     filter_parts = []
-    for i, (name, (tw, th)) in enumerate(zip(channel_names, tile_sizes)):
-        safe = name.replace("\\", "").replace("'", "").replace(":", " ")
-        logo_path = logo_input_idx.get(i)
-
-        if logo_path is not None:
-            logo_h = min(th // 4, 120)
-            fs = max(16, min(tw, th) // 16)
-            logo_y = th // 6
-            text_y = th * 3 // 5
+    for i, (tw, th) in enumerate(tile_sizes):
+        logo_idx = logo_input_idx.get(i)
+        if logo_idx is not None:
+            logo_size = min(tw, th) // 3
             filter_parts.append(
-                f"[{logo_path}:v]scale=-1:{logo_h}:force_original_aspect_ratio=decrease,setsar=1[ls{i}];"
-                f"[{i}:v][ls{i}]overlay=x=(W-w)/2:y={logo_y}[lo{i}];"
-                f"[lo{i}]drawtext=text='{safe}':fontcolor=white:fontsize={fs}"
-                f":x=(w-tw)/2:y={text_y}[t{i}]"
+                f"[{logo_idx}:v]scale={logo_size}:{logo_size}"
+                f":force_original_aspect_ratio=decrease,setsar=1[ls{i}];"
+                f"[{i}:v][ls{i}]overlay=x=(W-w)/2:y=(H-h)/2[t{i}]"
             )
         else:
-            fs = max(16, min(tw, th) // 12)
-            filter_parts.append(
-                f"[{i}:v]drawtext=text='Loading\\n{safe}':"
-                f"fontcolor=white:fontsize={fs}:x=(w-tw)/2:y=(h-th)/2:line_spacing=6[t{i}]"
-            )
+            filter_parts.append(f"[{i}:v]copy[t{i}]")
 
     inputs_str = "".join(f"[t{i}]" for i in range(n))
     xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}[v]"
@@ -190,7 +187,7 @@ def _build_placeholder_cmd(
         "-map", "[v]", "-map", f"{n}:a",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-c:a", "ac3",
-        "-t", "60",
+        "-t", str(max(5, n * 4)),
         "-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity",
         "-f", "mpegts", "pipe:1",
     ]
@@ -395,9 +392,10 @@ class MultiviewServer:
         if _has_gevent:
             # placeholder_q: placeholder chunks (small buffer, so we don't over-fill)
             # real_first_q: the first chunk from real ffmpeg (signals it's alive)
-            placeholder_q = _gqueue.Queue(maxsize=4)
-            real_first_q  = _gqueue.Queue(maxsize=1)
-            real_ready     = _gevent_event.Event()
+            placeholder_q    = _gqueue.Queue(maxsize=1)
+            real_first_q     = _gqueue.Queue(maxsize=1)
+            real_ready       = _gevent_event.Event()
+            placeholder_done = _gevent_event.Event()
 
             def _read_placeholder():
                 try:
@@ -410,8 +408,9 @@ class MultiviewServer:
                         try:
                             placeholder_q.put(chunk, timeout=1)
                         except Exception:
-                            break  # stream_gen stopped consuming
+                            break
                 finally:
+                    placeholder_done.set()
                     try:
                         placeholder_proc.kill()
                         placeholder_proc.wait()
@@ -429,8 +428,8 @@ class MultiviewServer:
             def stream_gen():
                 bytes_sent = 0
                 try:
-                    # Phase 1: stream placeholder until real ffmpeg produces output
-                    while not real_ready.is_set():
+                    # Phase 1: placeholder until it ends (-t 10) OR real is ready
+                    while not placeholder_done.is_set() and not real_ready.is_set():
                         try:
                             chunk = placeholder_q.get(timeout=0.1)
                             bytes_sent += len(chunk)
@@ -438,7 +437,15 @@ class MultiviewServer:
                         except _gqueue.Empty:
                             continue
 
-                    # Phase 2: hand off to real ffmpeg immediately
+                    # Phase 2: null-packet keepalive until real ffmpeg is ready.
+                    # Null packets (PID 0x1FFF) are transparent — decoders discard
+                    # them — so they don't fill the client's visible buffer.
+                    while not real_ready.is_set():
+                        yield _NULL_TS_BURST
+                        bytes_sent += len(_NULL_TS_BURST)
+                        _gevent.sleep(0.25)
+
+                    # Phase 3: hand off first real chunk
                     try:
                         first = real_first_q.get(timeout=3)
                     except _gqueue.Empty:
@@ -448,7 +455,7 @@ class MultiviewServer:
                     bytes_sent += len(first)
                     yield first
 
-                    # Phase 3: stream rest of real ffmpeg directly (no queue)
+                    # Phase 4: stream real ffmpeg
                     while True:
                         chunk = real_proc.stdout.read(65536)
                         if not chunk:
