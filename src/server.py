@@ -56,16 +56,10 @@ def _auto_grid_filter(n: int, out_w: int, out_h: int) -> tuple[str, list[str]]:
         for i in range(n)
     ]
 
-    positions = []
-    for i in range(n):
-        c = i % cols
-        r = i // cols
-        x = "0" if c == 0 else ("w0" if c == 1 else f"{c}*w0")
-        y = "0" if r == 0 else ("h0" if r == 1 else f"{r}*h0")
-        positions.append(f"{x}_{y}")
+    positions = _centered_grid_positions(n, cols, rows, tile_w)
 
     inputs_str = "".join(f"[v{i}]" for i in range(n))
-    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}[v]"
+    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=0x0d1117[v]"
 
     filter_complex = "; ".join(scale_parts) + "; " + xstack
     return filter_complex, ["-map", "[v]"]
@@ -115,6 +109,25 @@ def _usable_logo(url: str | None) -> str | None:
         except Exception:
             pass
     return None
+
+
+def _centered_grid_positions(n: int, cols: int, rows: int, tile_w: int) -> list[str]:
+    """xstack layout positions with the last partial row horizontally centered."""
+    last_row_count = n % cols or cols
+    empty_cells = cols - last_row_count
+    offset_x = (empty_cells * tile_w) // 2 if empty_cells > 0 else 0
+
+    positions = []
+    for i in range(n):
+        c = i % cols
+        r = i // cols
+        if r == rows - 1 and empty_cells > 0:
+            x = str(c * tile_w + offset_x)
+        else:
+            x = "0" if c == 0 else ("w0" if c == 1 else f"{c}*w0")
+        y = "0" if r == 0 else ("h0" if r == 1 else f"{r}*h0")
+        positions.append(f"{x}_{y}")
+    return positions
 
 
 def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server):
@@ -182,15 +195,11 @@ def _build_placeholder_cmd(
         positions  = ["0_0"] + [f"{main_w}_{i * side_h}" for i in range(side_count)]
     else:
         cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
         tile_w = out_w // cols
-        tile_h = out_h // math.ceil(n / cols)
+        tile_h = out_h // rows
         tile_sizes = [(tile_w, tile_h)] * n
-        positions = []
-        for i in range(n):
-            c, r = i % cols, i // cols
-            x = "0" if c == 0 else ("w0" if c == 1 else f"{c}*w0")
-            y = "0" if r == 0 else ("h0" if r == 1 else f"{r}*h0")
-            positions.append(f"{x}_{y}")
+        positions = _centered_grid_positions(n, cols, rows, tile_w)
 
     # Determine which tiles have usable local logos
     usable = [_usable_logo(u) for u in logo_urls]
@@ -228,7 +237,7 @@ def _build_placeholder_cmd(
             filter_parts.append(f"[{i}:v]copy[t{i}]")
 
     inputs_str = "".join(f"[t{i}]" for i in range(n))
-    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}[v]"
+    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=0x0d1117[v]"
     filter_complex = "; ".join(filter_parts) + "; " + xstack
 
     cmd += [
