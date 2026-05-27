@@ -52,6 +52,16 @@ _GLOBAL_FIELDS = [
         "placeholder": "8000",
         "description": "Hard ceiling on output video bitrate in kbps.",
     },
+    {
+        "id": "epg_refresh_hours",
+        "label": "Auto-Refresh Interval (hours)",
+        "type": "number",
+        "default": 24,
+        "min": 0,
+        "max": 168,
+        "placeholder": "24",
+        "description": "How often to automatically regenerate M3U and EPG. 0 = manual only (Regenerate M3U button).",
+    },
 ]
 
 _VIDEO_ENCODER_FIELD = {
@@ -333,6 +343,36 @@ def _build_multiview_block(n: int, ch_count: int, selector_type: str = "classic"
             ),
         }
     )
+
+    fields += [
+        {
+            "id": f"multiview_{n}_epg_title",
+            "label": f"Layout {n} EPG Title",
+            "type": "string",
+            "default": "",
+            "placeholder": f"Multiview {n}",
+            "description": "Program title shown in the EPG. Leave blank to use the layout name.",
+        },
+        {
+            "id": f"multiview_{n}_epg_subtitle",
+            "label": f"Layout {n} EPG Subtitle",
+            "type": "string",
+            "default": "",
+            "placeholder": "",
+            "description": "Optional subtitle shown below the title in the EPG.",
+        },
+        {
+            "id": f"multiview_{n}_epg_categories",
+            "label": f"Layout {n} EPG Categories",
+            "type": "string",
+            "default": "",
+            "placeholder": "Sports, News",
+            "description": (
+                "Comma-separated category tags. "
+                "EPG apps use these for colour coding (e.g. 'Sports' turns entries green in most players)."
+            ),
+        },
+    ]
 
     return fields
 

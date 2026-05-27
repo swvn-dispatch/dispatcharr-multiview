@@ -8,17 +8,18 @@ Each `/stream/{n}` request spawns an FFmpeg process that pulls per-channel feeds
 
 ## Configuration
 
-**Global:** output resolution, max bitrate, video encoder (libx264 / h264_nvenc / h264_qsv / h264_vaapi), encoder quality and preset.
+**Global:** output resolution, max bitrate, video encoder (libx264 / h264_nvenc / h264_qsv / h264_vaapi), encoder quality and preset, auto-refresh interval.
 
-**Per layout:** name, style (auto grid or featured), channel selection mode, channel count, audio source.
+**Per layout:** name, style (auto grid or featured), channel selection mode, channel count, audio source, EPG title/subtitle/categories.
 
 - **Auto grid:** square-ish grid sized from channel count, last row centred.
 - **Featured:** channel 1 fills the left portion; side streams stack on the right and are anchored to the right edge. The featured stream grows to claim horizontal space as side streams get shorter with higher counts (featured always takes at least 60% of the width).
 - **Classic selection:** pick channels from dropdowns.
 - **Regex selection:** enter a pattern (e.g. `TSN\s*\d`) and channels matching it are resolved automatically at stream time, sorted by channel number.
 - **Audio source:** single channel, or "All channels" for one AC3 track per tile (switch tracks in VLC/Infuse/mpv via the Audio Track menu). Duplicate track labels (e.g. three TSN channels) are automatically numbered: `ts1`, `ts2`, `ts3`.
+- **EPG categories:** comma-separated tags (e.g. `Sports, News`) written to the XMLTV `<category>` field. EPG apps use this for colour coding.
 
-After saving, click **Regenerate M3U** to write `multiview.m3u` and create/update the M3U account in Dispatcharr.
+After saving, click **Regenerate M3U** to write `multiview.m3u`, create/update the M3U account, and regenerate EPG data in Dispatcharr. The **Auto-Refresh Interval** setting controls how often this happens automatically (default: every 24 hours; 0 = manual only).
 
 ## Notes
 
