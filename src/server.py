@@ -138,17 +138,66 @@ def _lang_code(name: str) -> str:
     words = clean.split()
     if len(words) <= 1:
         return ((words[0] if words else "unk") + "   ")[:3].lower()
+    sig = [w for w in words if len(w) >= 2 and w.isupper()]
+    if sig:
+        return ("".join(sig) + "   ")[:3].lower()
     initials = "".join(w[0] for w in words if w)
     return (initials + "   ")[:3].lower()
 
 
-def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server):
-    """Yield MPEG-TS logo placeholder until channel_id's buffer is available again."""
+def _parse_resolution(settings: dict) -> tuple[int, int]:
+    try:
+        w, h = (int(x) for x in (settings.get("output_resolution") or "1920x1080").split("x"))
+        return w, h
+    except Exception:
+        return 1920, 1080
+
+
+def _kill_proc(proc) -> None:
+    try:
+        proc.kill()
+        proc.wait()
+    except Exception:
+        pass
+
+
+def _gevent_sleep():
+    try:
+        import gevent
+        return gevent.sleep
+    except ImportError:
+        import time
+        return time.sleep
+
+
+def _gevent_popen():
     try:
         import gevent.subprocess as _gsp
-        _Popen = _gsp.Popen
+        return _gsp.Popen
     except ImportError:
-        _Popen = subprocess.Popen
+        return subprocess.Popen
+
+
+def _audio_metadata_args(audio_source: str, channel_names: list[str], n: int) -> list:
+    """Return -metadata:s:a:i args for audio track title and language."""
+    args = []
+    if audio_source == "all":
+        for i, name in enumerate(channel_names or []):
+            args += [f"-metadata:s:a:{i}", f"title={name}",
+                     f"-metadata:s:a:{i}", f"language={_lang_code(name)}"]
+    else:
+        audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
+        audio_idx = max(0, min(audio_idx, n - 1))
+        if channel_names and audio_idx < len(channel_names):
+            name = channel_names[audio_idx]
+            args += ["-metadata:s:a:0", f"title={name}",
+                     "-metadata:s:a:0", f"language={_lang_code(name)}"]
+    return args
+
+
+def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server):
+    """Yield MPEG-TS logo placeholder until channel_id's buffer is available again."""
+    _Popen = _gevent_popen()
 
     usable = _usable_logo(logo_url)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -182,11 +231,7 @@ def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, pro
             if proxy_server.get_buffer(channel_id) is not None:
                 break
     finally:
-        try:
-            proc.kill()
-            proc.wait()
-        except Exception:
-            pass
+        _kill_proc(proc)
 
 
 def _build_placeholder_cmd(
@@ -263,17 +308,11 @@ def _build_placeholder_cmd(
         for i in range(n):
             cmd += ["-map", f"{n + i}:a"]
         cmd += ["-c:a", "ac3"]
-        for i, name in enumerate(channel_names):
-            cmd += [f"-metadata:s:a:{i}", f"title={name}",
-                    f"-metadata:s:a:{i}", f"language={_lang_code(name)}"]
     else:
         audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
         audio_idx = max(0, min(audio_idx, n - 1))
         cmd += ["-map", f"{n}:a", "-c:a", "ac3"]
-        if channel_names and audio_idx < len(channel_names):
-            _name = channel_names[audio_idx]
-            cmd += ["-metadata:s:a:0", f"title={_name}",
-                    "-metadata:s:a:0", f"language={_lang_code(_name)}"]
+    cmd += _audio_metadata_args(audio_source, channel_names, n)
 
     cmd += [
         "-t", str(max(5, n * 4)),
@@ -292,11 +331,7 @@ def _build_ffmpeg_cmd(
 ) -> list[str]:
     n = len(input_urls)
 
-    resolution   = settings.get("output_resolution") or "1920x1080"
-    try:
-        out_w, out_h = (int(x) for x in resolution.split("x"))
-    except Exception:
-        out_w, out_h = 1920, 1080
+    out_w, out_h = _parse_resolution(settings)
     bitrate      = int(settings.get("output_bitrate") or 8000)
     crf          = int(settings.get("output_crf") or 23)
     preset       = settings.get("encoder_preset") or "ultrafast"
@@ -385,17 +420,11 @@ def _build_ffmpeg_cmd(
         for i in range(n):
             cmd += ["-map", f"{i}:a?"]
         cmd += ["-c:a", "ac3"]
-        for i, name in enumerate(channel_names or []):
-            cmd += [f"-metadata:s:a:{i}", f"title={name}",
-                    f"-metadata:s:a:{i}", f"language={_lang_code(name)}"]
     else:
         audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
         audio_idx = max(0, min(audio_idx, n - 1))
         cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3"]
-        if channel_names and audio_idx < len(channel_names):
-            _name = channel_names[audio_idx]
-            cmd += ["-metadata:s:a:0", f"title={_name}",
-                    "-metadata:s:a:0", f"language={_lang_code(_name)}"]
+    cmd += _audio_metadata_args(audio_source, channel_names or [], n)
 
     cmd += ["-max_muxing_queue_size", "1024"]
     cmd += ["-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity"]
@@ -413,7 +442,7 @@ class MultiviewServer:
         self._greenlet = None
         self.running = False
 
-    # -- WSGI ------------------------------------------------------------------
+    # WSGI
 
     def wsgi_app(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
@@ -458,10 +487,7 @@ class MultiviewServer:
             enc_settings = {}
 
         resolution = enc_settings.get("output_resolution", "1920x1080")
-        try:
-            out_w, out_h = (int(x) for x in resolution.split("x"))
-        except Exception:
-            out_w, out_h = 1920, 1080
+        out_w, out_h = _parse_resolution(enc_settings)
 
         try:
             import gevent as _gevent
@@ -521,11 +547,7 @@ class MultiviewServer:
                             break
                 finally:
                     placeholder_done.set()
-                    try:
-                        placeholder_proc.kill()
-                        placeholder_proc.wait()
-                    except Exception:
-                        pass
+                    _kill_proc(placeholder_proc)
 
             def _probe_real():
                 first = real_proc.stdout.read(65536)
@@ -548,8 +570,8 @@ class MultiviewServer:
                             continue
 
                     # Phase 2: null-packet keepalive until real ffmpeg is ready.
-                    # Null packets (PID 0x1FFF) are transparent — decoders discard
-                    # them — so they don't fill the client's visible buffer.
+                    # Null packets (PID 0x1FFF) are transparent; decoders discard
+                    # them without filling the client's visible buffer.
                     while not real_ready.is_set():
                         yield _NULL_TS_BURST
                         bytes_sent += len(_NULL_TS_BURST)
@@ -574,11 +596,7 @@ class MultiviewServer:
                         yield chunk
                 finally:
                     for proc in (real_proc, placeholder_proc):
-                        try:
-                            proc.kill()
-                            proc.wait()
-                        except Exception:
-                            pass
+                        _kill_proc(proc)
                     logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
 
         else:
@@ -594,11 +612,7 @@ class MultiviewServer:
                             yield chunk
                 finally:
                     for proc in (placeholder_proc, real_proc):
-                        try:
-                            proc.kill()
-                            proc.wait()
-                        except Exception:
-                            pass
+                        _kill_proc(proc)
                     logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
 
         return stream_gen()
@@ -653,12 +667,7 @@ class MultiviewServer:
                 logger.error(f"Failed to initialize channel {channel_id}")
                 return False
 
-            try:
-                import gevent
-                _sleep = gevent.sleep
-            except ImportError:
-                import time
-                _sleep = time.sleep
+            _sleep = _gevent_sleep()
 
             for _ in range(30):
                 if proxy_server.get_buffer(channel_id) is not None:
@@ -672,7 +681,7 @@ class MultiviewServer:
 
             return True
         else:
-            logger.info(f"Channel {channel_id} already running — attaching directly")
+            logger.info(f"Channel {channel_id} already running, attaching directly")
             return False
 
     def _serve_channel_internal(self, channel_id: str, start_response):
@@ -715,7 +724,7 @@ class MultiviewServer:
             self._ensure_channel_initialized(channel_id)
         except Exception as e:
             logger.warning(f"Channel init warning {channel_id}: {e}")
-            # Don't 503 — serve placeholder and wait for channel to become available
+            # Don't 503; serve placeholder and wait for channel to become available
 
         client_id = str(_uuid_module.uuid4())
 
@@ -725,12 +734,7 @@ class MultiviewServer:
             ("Transfer-Encoding", "chunked"),
         ])
 
-        try:
-            import gevent as _gv
-            _sleep = _gv.sleep
-        except ImportError:
-            import time as _time_mod
-            _sleep = _time_mod.sleep
+        _sleep = _gevent_sleep()
 
         def stream_gen():
             _active_client = False
@@ -747,11 +751,11 @@ class MultiviewServer:
                             except Exception:
                                 pass
                             _active_client = False
-                        logger.info(f"Channel {channel_id} buffer gone — serving placeholder")
+                        logger.info(f"Channel {channel_id} buffer gone, serving placeholder")
                         yield from _single_channel_placeholder_gen(
                             channel_id, channel_name, logo_url, proxy_server
                         )
-                        logger.info(f"Channel {channel_id} buffer returned — resuming")
+                        logger.info(f"Channel {channel_id} buffer returned, resuming")
                         continue
 
                     if not _active_client:
@@ -847,7 +851,7 @@ class MultiviewServer:
         audio_source = settings.get(f"multiview_{n}_audio_source", "0")
         return input_urls, layout, channel_names, logo_urls, audio_source
 
-    # -- Lifecycle -------------------------------------------------------------
+    # Lifecycle
 
     def start(self) -> bool:
         if self.running:

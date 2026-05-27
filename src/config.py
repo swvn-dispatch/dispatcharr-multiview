@@ -71,7 +71,7 @@ def _x264_fields() -> list:
             "id": "output_crf",
             "label": "CRF (Quality)",
             "type": "number", "default": 23, "min": 0, "max": 51, "placeholder": "23",
-            "description": "Constant Rate Factor: lower = better quality, higher bitrate. 18–23 is visually lossless. Max bitrate cap still applies.",
+            "description": "Constant Rate Factor: lower = better quality, higher bitrate. 18-23 is visually lossless. Max bitrate cap still applies.",
         },
         {
             "id": "encoder_preset",

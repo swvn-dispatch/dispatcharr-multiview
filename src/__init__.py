@@ -51,7 +51,7 @@ class Plugin:
         },
     ]
 
-    # -- Lifecycle (init) ------------------------------------------------------
+    # Lifecycle (init)
 
     def __init__(self):
         try:
@@ -74,7 +74,7 @@ class Plugin:
         else:
             logger.warning(f"Multiview auto-start failed: {result['message']}")
 
-    # -- Dynamic fields --------------------------------------------------------
+    # Dynamic fields
 
     @property
     def fields(self):
@@ -87,7 +87,7 @@ class Plugin:
             settings = {}
         return _config().build_plugin_fields(settings)
 
-    # -- Action dispatcher -----------------------------------------------------
+    # Action dispatcher
 
     def run(self, action: str, params: dict, context: dict):
         if action == "generate_m3u":
@@ -95,7 +95,7 @@ class Plugin:
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
-    # -- generate_m3u ----------------------------------------------------------
+    # generate_m3u
 
     def _generate_m3u(self) -> dict:
         try:
@@ -150,7 +150,7 @@ class Plugin:
                 "message": f"M3U written to {m3u_path} (could not create M3U account: {e})",
             }
 
-    # -- start_server ----------------------------------------------------------
+    # start_server
 
     def _start_server(self) -> dict:
         srv = _server()
@@ -169,7 +169,7 @@ class Plugin:
             "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}; port may be in use",
         }
 
-    # -- Lifecycle -------------------------------------------------------------
+    # Lifecycle
 
     def stop(self, context: dict):
         """Called when the plugin is disabled or Dispatcharr shuts down."""
