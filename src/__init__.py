@@ -32,6 +32,11 @@ def _server():
     return importlib.import_module(".server", package=__package__)
 
 
+def _epg():
+    import importlib
+    return importlib.import_module(".epg", package=__package__)
+
+
 class Plugin:
     """Dispatcharr Plugin: Multiview stream tiling via FFmpeg."""
 
@@ -43,9 +48,9 @@ class Plugin:
     actions = [
         {
             "id": "generate_m3u",
-            "label": "Regenerate M3U",
-            "description": "Write multiview.m3u to the plugin folder and create/update the M3U account in Dispatcharr",
-            "button_label": "Regenerate M3U",
+            "label": "Regenerate M3U & EPG",
+            "description": "Write multiview.m3u and multiview_epg.xml, then refresh the M3U account and EPG source in Dispatcharr",
+            "button_label": "Regenerate M3U & EPG",
             "button_variant": "filled",
             "button_color": "green",
         },
@@ -71,6 +76,13 @@ class Plugin:
         result = self._start_server()
         if result.get("status") == "success":
             logger.info(f"Multiview auto-start: {result['message']}")
+            try:
+                from apps.plugins.models import PluginConfig
+                cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
+                interval_hours = int(cfg.settings.get("epg_refresh_hours", 24))
+            except Exception:
+                interval_hours = 24
+            self._schedule_auto_refresh(interval_hours)
         else:
             logger.warning(f"Multiview auto-start failed: {result['message']}")
 
@@ -110,7 +122,7 @@ class Plugin:
         for n in range(1, mv_count + 1):
             name = settings.get(f"multiview_{n}_name", f"Multiview {n}") or f"Multiview {n}"
             stream_url = f"http://localhost:{DEFAULT_SERVER_PORT}/stream/{n}"
-            lines.append(f'#EXTINF:-1 tvg-name="{name}",{name}')
+            lines.append(f'#EXTINF:-1 tvg-id="multiview_{n}" tvg-name="{name}",{name}')
             lines.append(stream_url)
 
         m3u_content = "\n".join(lines) + "\n"
@@ -121,6 +133,11 @@ class Plugin:
                 f.write(m3u_content)
         except OSError as e:
             return {"status": "error", "message": f"Failed to write M3U file: {e}"}
+
+        try:
+            _epg().generate_epg(settings, _PLUGIN_DIR)
+        except Exception as e:
+            logger.warning(f"EPG generation failed: {e}")
 
         try:
             from apps.m3u.models import M3UAccount
@@ -168,6 +185,29 @@ class Plugin:
             "status": "error",
             "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}; port may be in use",
         }
+
+    # Auto-refresh
+
+    def _refresh_loop(self, interval_secs: int):
+        import time
+        while True:
+            time.sleep(interval_secs)
+            try:
+                self._generate_m3u()
+            except Exception as e:
+                logger.warning(f"Multiview auto-refresh failed: {e}")
+
+    def _schedule_auto_refresh(self, interval_hours: int):
+        if interval_hours <= 0:
+            return
+        interval_secs = interval_hours * 3600
+        try:
+            import gevent
+            gevent.spawn(self._refresh_loop, interval_secs)
+        except ImportError:
+            import threading
+            t = threading.Thread(target=self._refresh_loop, args=(interval_secs,), daemon=True)
+            t.start()
 
     # Lifecycle
 

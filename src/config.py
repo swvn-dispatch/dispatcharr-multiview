@@ -52,6 +52,16 @@ _GLOBAL_FIELDS = [
         "placeholder": "8000",
         "description": "Hard ceiling on output video bitrate in kbps.",
     },
+    {
+        "id": "epg_refresh_hours",
+        "label": "Auto-Refresh Interval (hours)",
+        "type": "number",
+        "default": 24,
+        "min": 0,
+        "max": 168,
+        "placeholder": "24",
+        "description": "How often to automatically regenerate M3U and EPG. 0 = manual only (Regenerate M3U button).",
+    },
 ]
 
 _VIDEO_ENCODER_FIELD = {
@@ -177,8 +187,9 @@ _MULTIVIEW_COUNT_FIELD = {
 # Per-layout field builders
 
 _LAYOUT_OPTIONS = [
-    {"value": "auto", "label": "Auto Grid"},
-    {"value": "featured", "label": "Featured (main left, others stacked right)"},
+    {"value": "auto",         "label": "Auto Grid"},
+    {"value": "featured",     "label": "Featured (main left, others stacked right)"},
+    {"value": "top_featured", "label": "Top Featured (main top, others row bottom)"},
 ]
 
 
@@ -217,9 +228,9 @@ def _build_channel_options() -> list:
     return opts
 
 
-def _build_multiview_block(n: int, ch_count: int) -> list:
+def _build_multiview_block(n: int, ch_count: int, selector_type: str = "classic", regex_pattern: str = "") -> list:
     """Return the list of fields for multiview layout block *n* with *ch_count* channel slots."""
-    channel_options = _build_channel_options()
+    is_regex = selector_type == "regex"
 
     fields = [
         {
@@ -248,13 +259,31 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
             ),
         },
         {
+            "id": f"multiview_{n}_selector_type",
+            "label": f"Layout {n} Channel Selection",
+            "type": "select",
+            "default": "classic",
+            "options": [
+                {"value": "classic", "label": "Classic (dropdown)"},
+                {"value": "regex",   "label": "Regex (dynamic match)"},
+            ],
+            "description": (
+                "Classic: select channels from dropdowns. "
+                "Regex: channels matching a pattern are selected automatically at stream time. "
+                "After changing, save and refresh to see the relevant fields."
+            ),
+        },
+        {
             "id": f"multiview_{n}_channel_count",
-            "label": f"Layout {n} Channel Count",
+            "label": f"Layout {n} Max Channels" if is_regex else f"Layout {n} Channel Count",
             "type": "number",
             "default": 4,
             "min": 2,
             "max": 9,
             "description": (
+                f"Maximum number of matching channels to tile in layout {n}. "
+                "Recommended maximum is 4; higher counts may not start correctly."
+            ) if is_regex else (
                 f"Number of channels to tile in layout {n}. "
                 "Recommended maximum is 4; higher counts may not start correctly. "
                 "After changing, save and refresh to see the new channel slots."
@@ -263,28 +292,50 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
         },
     ]
 
-    for m in range(1, ch_count + 1):
+    if is_regex:
         fields.append(
             {
-                "id": f"multiview_{n}_channel_{m}",
-                "label": f"Layout {n}: Channel {m}",
-                "type": "select",
-                "default": "_none",
-                "options": channel_options,
-                "description": "",
+                "id": f"multiview_{n}_regex_pattern",
+                "label": f"Layout {n} Channel Pattern",
+                "type": "string",
+                "default": "",
+                "placeholder": r"e.g. TSN\s*\d or ^CA \|",
+                "description": (
+                    "Case-insensitive regex matched against channel names. "
+                    "Channels are sorted by channel number before tiling."
+                ),
             }
         )
-
-    audio_opts = [{"value": "all", "label": "All channels (selectable in player)"}]
-    for m in range(1, ch_count + 1):
-        audio_opts.append({"value": str(m - 1), "label": f"Channel {m}"})
+        audio_opts = [
+            {"value": "all",         "label": "All channels (selectable in player)"},
+            {"value": "regex_first", "label": "First matched channel"},
+            {"value": "regex_lowest","label": "Lowest channel number"},
+        ]
+        audio_default = "regex_first"
+    else:
+        channel_options = _build_channel_options()
+        for m in range(1, ch_count + 1):
+            fields.append(
+                {
+                    "id": f"multiview_{n}_channel_{m}",
+                    "label": f"Layout {n}: Channel {m}",
+                    "type": "select",
+                    "default": "_none",
+                    "options": channel_options,
+                    "description": "",
+                }
+            )
+        audio_opts = [{"value": "all", "label": "All channels (selectable in player)"}]
+        for m in range(1, ch_count + 1):
+            audio_opts.append({"value": str(m - 1), "label": f"Channel {m}"})
+        audio_default = "0"
 
     fields.append(
         {
             "id": f"multiview_{n}_audio_source",
             "label": f"Layout {n} Audio Source",
             "type": "select",
-            "default": "0",
+            "default": audio_default,
             "options": audio_opts,
             "description": (
                 "Which channel's audio to include. "
@@ -293,6 +344,36 @@ def _build_multiview_block(n: int, ch_count: int) -> list:
             ),
         }
     )
+
+    fields += [
+        {
+            "id": f"multiview_{n}_epg_title",
+            "label": f"Layout {n} EPG Title",
+            "type": "string",
+            "default": "",
+            "placeholder": f"Multiview {n}",
+            "description": "Program title shown in the EPG. Leave blank to use the layout name.",
+        },
+        {
+            "id": f"multiview_{n}_epg_subtitle",
+            "label": f"Layout {n} EPG Subtitle",
+            "type": "string",
+            "default": "",
+            "placeholder": "",
+            "description": "Optional subtitle shown below the title in the EPG.",
+        },
+        {
+            "id": f"multiview_{n}_epg_categories",
+            "label": f"Layout {n} EPG Categories",
+            "type": "string",
+            "default": "",
+            "placeholder": "Sports, News",
+            "description": (
+                "Comma-separated category tags. "
+                "EPG apps use these for colour coding (e.g. 'Sports' turns entries green in most players)."
+            ),
+        },
+    ]
 
     return fields
 
@@ -315,7 +396,9 @@ def build_plugin_fields(settings: dict) -> list:
 
     for n in range(1, mv_count + 1):
         ch_count = max(2, int(settings.get(f"multiview_{n}_channel_count", 4)))
-        fields.extend(_build_multiview_block(n, ch_count))
+        selector_type = settings.get(f"multiview_{n}_selector_type", "classic")
+        regex_pattern = settings.get(f"multiview_{n}_regex_pattern", "")
+        fields.extend(_build_multiview_block(n, ch_count, selector_type, regex_pattern))
 
     return fields
 
