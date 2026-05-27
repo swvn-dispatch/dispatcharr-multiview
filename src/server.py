@@ -18,6 +18,7 @@ Routes:
 import logging
 import math
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -130,6 +131,17 @@ def _centered_grid_positions(n: int, cols: int, rows: int, tile_w: int) -> list[
     return positions
 
 
+def _lang_code(name: str) -> str:
+    """Derive a 3-char lowercase language tag from a channel name for MPEG-TS PMT."""
+    name = re.sub(r'^[A-Z0-9]{2,5}\s*[|–—-]\s*', '', name)
+    clean = "".join(c for c in name if c.isalnum() or c == " ").strip()
+    words = clean.split()
+    if len(words) <= 1:
+        return ((words[0] if words else "unk") + "   ")[:3].lower()
+    initials = "".join(w[0] for w in words if w)
+    return (initials + "   ")[:3].lower()
+
+
 def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server):
     """Yield MPEG-TS logo placeholder until channel_id's buffer is available again."""
     try:
@@ -156,6 +168,7 @@ def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, pro
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-c:a", "ac3",
         "-metadata:s:a:0", f"title={channel_name}",
+        "-metadata:s:a:0", f"language={_lang_code(channel_name)}",
         "-f", "mpegts", "pipe:1",
     ]
 
@@ -251,13 +264,16 @@ def _build_placeholder_cmd(
             cmd += ["-map", f"{n + i}:a"]
         cmd += ["-c:a", "ac3"]
         for i, name in enumerate(channel_names):
-            cmd += [f"-metadata:s:a:{i}", f"title={name}"]
+            cmd += [f"-metadata:s:a:{i}", f"title={name}",
+                    f"-metadata:s:a:{i}", f"language={_lang_code(name)}"]
     else:
         audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
         audio_idx = max(0, min(audio_idx, n - 1))
         cmd += ["-map", f"{n}:a", "-c:a", "ac3"]
         if channel_names and audio_idx < len(channel_names):
-            cmd += ["-metadata:s:a:0", f"title={channel_names[audio_idx]}"]
+            _name = channel_names[audio_idx]
+            cmd += ["-metadata:s:a:0", f"title={_name}",
+                    "-metadata:s:a:0", f"language={_lang_code(_name)}"]
 
     cmd += [
         "-t", str(max(5, n * 4)),
@@ -370,13 +386,16 @@ def _build_ffmpeg_cmd(
             cmd += ["-map", f"{i}:a?"]
         cmd += ["-c:a", "ac3"]
         for i, name in enumerate(channel_names or []):
-            cmd += [f"-metadata:s:a:{i}", f"title={name}"]
+            cmd += [f"-metadata:s:a:{i}", f"title={name}",
+                    f"-metadata:s:a:{i}", f"language={_lang_code(name)}"]
     else:
         audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
         audio_idx = max(0, min(audio_idx, n - 1))
         cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3"]
         if channel_names and audio_idx < len(channel_names):
-            cmd += ["-metadata:s:a:0", f"title={channel_names[audio_idx]}"]
+            _name = channel_names[audio_idx]
+            cmd += ["-metadata:s:a:0", f"title={_name}",
+                    "-metadata:s:a:0", f"language={_lang_code(_name)}"]
 
     cmd += ["-max_muxing_queue_size", "1024"]
     cmd += ["-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity"]
