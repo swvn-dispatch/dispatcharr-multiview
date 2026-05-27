@@ -847,7 +847,6 @@ class MultiviewServer:
                     )
                     self.running = True
                     set_server(self)
-                    logger.info(f"Multiview server started on http://{self.host}:{self.port}/")
                     self._server.serve_forever()
                 except Exception as e:
                     logger.error(f"Multiview server crashed: {e}", exc_info=True)

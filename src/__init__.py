@@ -49,14 +49,6 @@ class Plugin:
             "button_variant": "filled",
             "button_color": "green",
         },
-        {
-            "id": "status",
-            "label": "Status",
-            "description": "Check whether the streaming server is running",
-            "button_label": "Check Status",
-            "button_variant": "filled",
-            "button_color": "blue",
-        },
     ]
 
     # -- Lifecycle (init) ------------------------------------------------------
@@ -101,9 +93,6 @@ class Plugin:
         if action == "generate_m3u":
             return self._generate_m3u()
 
-        if action == "status":
-            return self._status()
-
         return {"status": "error", "message": f"Unknown action: {action}"}
 
     # -- generate_m3u ----------------------------------------------------------
@@ -141,6 +130,7 @@ class Plugin:
                     "file_path": m3u_path,
                     "is_active": True,
                     "account_type": "STD",
+                    "refresh_interval": 0,
                 },
             )
             verb = "created" if created else "updated"
@@ -178,19 +168,6 @@ class Plugin:
             "status": "error",
             "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}; port may be in use",
         }
-
-    # -- status ----------------------------------------------------------------
-
-    def _status(self) -> dict:
-        try:
-            with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
-                return {
-                    "status": "success",
-                    "message": f"Server running on http://127.0.0.1:{DEFAULT_SERVER_PORT}/",
-                    "running": True,
-                }
-        except OSError:
-            return {"status": "success", "message": "Server is not running", "running": False}
 
     # -- Lifecycle -------------------------------------------------------------
 
