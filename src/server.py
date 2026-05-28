@@ -216,30 +216,12 @@ def _build_placeholder_cmd(
     # Determine which tiles have usable local logos
     usable = [_usable_logo(u) for u in logo_urls]
 
-    # Determine which tiles have usable local logos
-    usable = [_usable_logo(u) for u in logo_urls]
-
-    # Determine which tiles have usable local logos
-    usable = [_usable_logo(u) for u in logo_urls]
-
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
     for tw, th in tile_sizes:
         cmd += ["-f", "lavfi", "-i", f"color=c=black:size={tw}x{th}:r=30000/1001"]
     audio_count = n if audio_source == "all" else 1
     for _ in range(audio_count):
         cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
-
-    # Add logo file inputs and track their indices.
-    # -loop 1 makes ffmpeg loop the still image for the full -t duration;
-    # without it the image is a single-frame stream and the overlay pipeline
-    # terminates after ~1 frame.
-    logo_input_idx: dict[int, int] = {}
-    next_idx = n + audio_count
-    for i, logo_path in enumerate(usable):
-        if logo_path:
-            cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
-            logo_input_idx[i] = next_idx
-            next_idx += 1
 
     # Add logo file inputs and track their indices.
     # -loop 1 makes ffmpeg loop the still image for the full -t duration;
