@@ -584,18 +584,6 @@ class MultiviewServer:
                 logger.error(f"Failed to initialize channel {channel_id}")
                 return False
 
-            _sleep = _gevent_sleep()
-
-            for _ in range(30):
-                if proxy_server.get_buffer(channel_id) is not None:
-                    break
-                _sleep(0.2)
-
-            for _ in range(15):
-                if channel_id in proxy_server.client_managers:
-                    break
-                _sleep(0.2)
-
             return True
         else:
             logger.info(f"Channel {channel_id} already running, attaching directly")
@@ -809,16 +797,13 @@ class MultiviewServer:
             logger.warning("Multiview server is already running")
             return False
 
-        # Bind to port 0 — OS assigns a free port. Capture it now so callers
-        # can read self.port as soon as start() returns (no TIME_WAIT issues).
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind((self.host, 0))
-            self.port = sock.getsockname()[1]
-        except OSError as e:
-            logger.error(f"Cannot bind multiview socket: {e}")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((self.host, self.port))
             sock.close()
+        except OSError as e:
+            logger.error(f"Cannot bind to {self.host}:{self.port}: {e}")
             return False
 
         try:
@@ -826,8 +811,11 @@ class MultiviewServer:
 
             def _run():
                 try:
-                    # Pass pre-bound socket — WSGIServer skips its own bind()
-                    self._server = pywsgi.WSGIServer(sock, self.wsgi_app, log=None)
+                    self._server = pywsgi.WSGIServer(
+                        (self.host, self.port),
+                        self.wsgi_app,
+                        log=None,
+                    )
                     self.running = True
                     set_server(self)
                     self._server.serve_forever()
@@ -841,7 +829,6 @@ class MultiviewServer:
             return True
 
         except ImportError:
-            sock.close()
             logger.error("gevent is not installed; cannot start multiview server")
             return False
 
