@@ -470,59 +470,41 @@ class MultiviewServer:
         )
         logger.debug(f"real_cmd: {real_cmd}")
 
-        # Pre-warm all child channels in parallel. Each greenlet initializes its
-        # channel, waits for the buffer, then registers as a real StreamGenerator
-        # consumer so the ring buffer keeps advancing and the channel stays alive
-        # until the composition ffmpeg's own client takes over.
+        # Pre-warm: open a real HTTP connection to each per-channel endpoint so
+        # the placeholder TS (logo on black) is already flowing before the
+        # composition ffmpeg launches. Without this, real_proc connects to
+        # endpoints that have nothing yet and stalls during probe.
         if _has_gevent:
             def _prewarm(url):
                 uuid = url.rsplit('/', 1)[-1]
                 try:
-                    self._ensure_channel_initialized(uuid)
-                except Exception as e:
-                    logger.warning(f"Pre-warm init failed for {uuid}: {e}")
-                    return
-                _sleep = _gevent_sleep()
-                try:
+                    import http.client as _httpc
                     from apps.proxy.live_proxy.server import ProxyServer
-                    from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
                     proxy_server = ProxyServer.get_instance()
-                except Exception as e:
-                    logger.warning(f"Pre-warm import failed for {uuid}: {e}")
-                    return
-                # Wait for the buffer (up to 3 seconds)
-                buf = None
-                for _ in range(30):
-                    buf = proxy_server.get_buffer(uuid)
-                    if buf is not None:
-                        break
-                    _sleep(0.1)
-                if buf is None:
-                    logger.info(f"Pre-warm: no buffer for {uuid} after 3s")
-                    return
-                mgr = proxy_server.client_managers.get(uuid)
-                if not mgr:
-                    return
-                anchor_id = str(_uuid_module.uuid4())
-                if not mgr.add_client(anchor_id, "127.0.0.1", "multiview-prewarm", None, "mpegts", None):
-                    return
-                gen = StreamGenerator(
-                    channel_id=uuid,
-                    client_id=anchor_id,
-                    client_ip="127.0.0.1",
-                    client_user_agent="multiview-prewarm",
-                    channel_initializing=False,
-                    buffer=buf,
-                )
-                try:
-                    for _chunk in gen.generate():
-                        # Discard data; release once composition ffmpeg has attached
-                        if mgr.get_total_client_count() > 1:
+                    conn = _httpc.HTTPConnection("127.0.0.1", self.port, timeout=30)
+                    conn.request("GET", f"/internal/ch/{uuid}")
+                    resp = conn.getresponse()
+                    if resp.status != 200:
+                        return
+                    # Drain until this channel's real buffer is live, then release
+                    while True:
+                        chunk = resp.read(32768)
+                        if not chunk:
+                            break
+                        if proxy_server.get_buffer(uuid) is not None:
                             break
                 except Exception as e:
-                    logger.warning(f"Pre-warm stream error for {uuid}: {e}")
-            for url in input_urls:
-                _gevent.spawn(_prewarm, url)
+                    logger.warning(f"Pre-warm failed for {uuid}: {e}")
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            prewarm_tasks = [_gevent.spawn(_prewarm, url) for url in input_urls]
+            # Give placeholder streams time to start producing data
+            # before the composition ffmpeg probes its inputs.
+            _gevent.joinall(prewarm_tasks, timeout=0.5)
 
         real_proc = _Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
