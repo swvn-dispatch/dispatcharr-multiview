@@ -520,8 +520,30 @@ class MultiviewServer:
             # Wait up to 1 s for per-channel placeholders to start serving.
             _gevent.joinall(prewarm_tasks, timeout=1.0)
 
-        real_proc = _Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Use plain subprocess (not gevent) so stdout/stderr pipes are blocking.
+        # gevent.subprocess sets pipes to non-blocking mode, which breaks reads
+        # from real OS threads and causes _log_stderr to silently miss output.
+        real_proc = subprocess.Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+        # Both stdout and stderr are read in real threads (blocking I/O).
+        # Chunks are delivered to stream_gen via a gevent Queue, which is
+        # safe to put() from a thread and get() from a greenlet.
+        _chunk_q = _gqueue.Queue(maxsize=16) if _has_gevent else None
+
+        def _read_stdout():
+            try:
+                while True:
+                    chunk = real_proc.stdout.read(65536)
+                    if _chunk_q is not None:
+                        _chunk_q.put(chunk if chunk else b"")
+                    if not chunk:
+                        break
+            except Exception as exc:
+                logger.warning(f"ffmpeg stdout reader error layout={n}: {exc}")
+                if _chunk_q is not None:
+                    _chunk_q.put(b"")
+
+        threading.Thread(target=_read_stdout, daemon=True, name=f"ffmpeg-stdout-{n}").start()
         threading.Thread(
             target=_log_stderr, args=(real_proc, f"layout={n}"),
             daemon=True, name=f"ffmpeg-stderr-{n}",
@@ -533,37 +555,23 @@ class MultiviewServer:
             ("Transfer-Encoding", "chunked"),
         ])
 
-        if _has_gevent:
-            _real_first_q = _gqueue.Queue(maxsize=1)
-
-            def _probe_real():
-                first = real_proc.stdout.read(65536)
-                _real_first_q.put(first if first else b"")
-
-            _gevent.spawn(_probe_real)
-
         def stream_gen():
             bytes_sent = 0
             try:
-                if _has_gevent:
-                    # Send null TS packets while real_proc warms up so the client
-                    # stays connected during per-channel placeholder startup.
-                    while _real_first_q.empty():
-                        yield _NULL_TS_BURST
-                        bytes_sent += len(_NULL_TS_BURST)
-                        _gevent.sleep(0.1)
-                    first = _real_first_q.get()
-                    if not first:
-                        return
-                    bytes_sent += len(first)
-                    yield first
-
-                while True:
-                    chunk = real_proc.stdout.read(65536)
-                    if not chunk:
-                        break
-                    bytes_sent += len(chunk)
-                    yield chunk
+                if _chunk_q is not None:
+                    while True:
+                        chunk = _chunk_q.get()  # cooperative: yields to event loop while waiting
+                        if not chunk:
+                            break
+                        bytes_sent += len(chunk)
+                        yield chunk
+                else:
+                    while True:
+                        chunk = real_proc.stdout.read(65536)
+                        if not chunk:
+                            break
+                        bytes_sent += len(chunk)
+                        yield chunk
             except GeneratorExit:
                 pass
             finally:
