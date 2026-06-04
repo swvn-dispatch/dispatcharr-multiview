@@ -470,25 +470,39 @@ class MultiviewServer:
         )
         logger.debug(f"real_cmd: {real_cmd}")
 
-        # Pre-warm: open a real HTTP connection to each per-channel endpoint so
+        # Pre-warm: open a raw gevent socket to each per-channel endpoint so
         # the placeholder TS (logo on black) is already flowing before the
-        # composition ffmpeg launches. Without this, real_proc connects to
-        # endpoints that have nothing yet and stalls during probe.
+        # composition ffmpeg launches. http.client is avoided because its
+        # BufferedReader blocks gevent's event loop on Python 3.13+.
         if _has_gevent:
             def _prewarm(url):
                 uuid = url.rsplit('/', 1)[-1]
+                sock = None
                 try:
-                    import http.client as _httpc
+                    import gevent.socket as _gsock
                     from apps.proxy.live_proxy.server import ProxyServer
                     proxy_server = ProxyServer.get_instance()
-                    conn = _httpc.HTTPConnection("127.0.0.1", self.port, timeout=30)
-                    conn.request("GET", f"/internal/ch/{uuid}")
-                    resp = conn.getresponse()
-                    if resp.status != 200:
-                        return
-                    # Drain until this channel's real buffer is live, then release
+
+                    sock = _gsock.socket()
+                    sock.connect(("127.0.0.1", self.port))
+                    sock.sendall((
+                        f"GET /internal/ch/{uuid} HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{self.port}\r\n"
+                        f"Connection: close\r\n\r\n"
+                    ).encode())
+
+                    # Read until end of HTTP headers — at this point the
+                    # per-channel placeholder ffmpeg is running and serving TS.
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        data = sock.recv(4096)
+                        if not data:
+                            return
+                        buf += data
+
+                    # Drain body until the channel's real buffer is live.
                     while True:
-                        chunk = resp.read(32768)
+                        chunk = sock.recv(32768)
                         if not chunk:
                             break
                         if proxy_server.get_buffer(uuid) is not None:
@@ -496,15 +510,15 @@ class MultiviewServer:
                 except Exception as e:
                     logger.warning(f"Pre-warm failed for {uuid}: {e}")
                 finally:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                    if sock:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
 
             prewarm_tasks = [_gevent.spawn(_prewarm, url) for url in input_urls]
-            # Give placeholder streams time to start producing data
-            # before the composition ffmpeg probes its inputs.
-            _gevent.joinall(prewarm_tasks, timeout=0.5)
+            # Wait up to 1 s for per-channel placeholders to start serving.
+            _gevent.joinall(prewarm_tasks, timeout=1.0)
 
         real_proc = _Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
