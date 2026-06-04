@@ -68,11 +68,6 @@ class Plugin:
         existing = _server().get_server()
         if existing and existing.is_running():
             return
-        try:
-            with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
-                return
-        except OSError:
-            pass
         result = self._start_server()
         if result.get("status") == "success":
             logger.info(f"Multiview auto-start: {result['message']}")
@@ -121,7 +116,9 @@ class Plugin:
         lines = ["#EXTM3U"]
         for n in range(1, mv_count + 1):
             name = settings.get(f"multiview_{n}_name", f"Multiview {n}") or f"Multiview {n}"
-            stream_url = f"http://localhost:{DEFAULT_SERVER_PORT}/stream/{n}"
+            _srv = _server().get_server()
+            port = _srv.port if _srv else DEFAULT_SERVER_PORT
+            stream_url = f"http://localhost:{port}/stream/{n}"
             lines.append(f'#EXTINF:-1 tvg-id="multiview_{n}" tvg-name="{name}",{name}')
             lines.append(stream_url)
 
@@ -175,15 +172,21 @@ class Plugin:
         if existing and existing.is_running():
             existing.stop()
 
-        server = srv.MultiviewServer(host=DEFAULT_SERVER_HOST, port=DEFAULT_SERVER_PORT)
+        server = srv.MultiviewServer(host=DEFAULT_SERVER_HOST, port=0)
         if server.start():
+            actual_port = server.port
+            logger.info(f"Multiview server started on http://{DEFAULT_SERVER_HOST}:{actual_port}/")
+            try:
+                self._generate_m3u()
+            except Exception as e:
+                logger.warning(f"Post-start M3U refresh failed: {e}")
             return {
                 "status": "success",
-                "message": f"Multiview server started on http://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}/",
+                "message": f"Multiview server started on http://{DEFAULT_SERVER_HOST}:{actual_port}/",
             }
         return {
             "status": "error",
-            "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}; port may be in use",
+            "message": "Failed to start multiview server",
         }
 
     # Auto-refresh
