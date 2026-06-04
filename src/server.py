@@ -516,19 +516,24 @@ class MultiviewServer:
                         except Exception:
                             pass
 
-            prewarm_tasks = [_gevent.spawn(_prewarm, url) for url in input_urls]
-            # Wait up to 1 s for per-channel placeholders to start serving.
-            _gevent.joinall(prewarm_tasks, timeout=1.0)
+            # Spawn pre-warm in background — don't block here. The per-channel
+            # endpoints will start serving placeholder TS as soon as real_proc's
+            # connections arrive, and the pre-warm ensures channels are live ASAP.
+            for url in input_urls:
+                _gevent.spawn(_prewarm, url)
 
-        # Use plain subprocess so pipes are blocking (gevent.subprocess makes
-        # them non-blocking, which silently breaks thread reads of stderr).
-        real_proc = subprocess.Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # gevent.subprocess.Popen is correct here: its stdout is a
+        # FileObjectPosix whose .read() yields cooperatively in a greenlet.
+        # stderr is also read in a greenlet for the same reason.
+        real_proc = _Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # stderr: plain thread — blocking read works correctly on a regular pipe.
-        threading.Thread(
-            target=_log_stderr, args=(real_proc, f"layout={n}"),
-            daemon=True, name=f"ffmpeg-stderr-{n}",
-        ).start()
+        if _has_gevent:
+            _gevent.spawn(_log_stderr, real_proc, f"layout={n}")
+        else:
+            threading.Thread(
+                target=_log_stderr, args=(real_proc, f"layout={n}"),
+                daemon=True, name=f"ffmpeg-stderr-{n}",
+            ).start()
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -538,25 +543,17 @@ class MultiviewServer:
 
         def stream_gen():
             bytes_sent = 0
+            logger.info(f"Composition stream_gen started for layout={n}")
             try:
-                if _has_gevent:
-                    # gevent.queue.Queue.put() is NOT safe from real threads,
-                    # so we use the threadpool instead: spawn the blocking read
-                    # in a thread and .get() cooperatively from the greenlet.
-                    _tp = _gevent.get_hub().threadpool
-                    while True:
-                        chunk = _tp.spawn(real_proc.stdout.read, 65536).get()
-                        if not chunk:
-                            break
-                        bytes_sent += len(chunk)
-                        yield chunk
-                else:
-                    while True:
-                        chunk = real_proc.stdout.read(65536)
-                        if not chunk:
-                            break
-                        bytes_sent += len(chunk)
-                        yield chunk
+                while True:
+                    chunk = real_proc.stdout.read(65536)
+                    if not chunk:
+                        logger.warning(f"Composition ffmpeg layout={n} produced no more output")
+                        break
+                    if bytes_sent == 0:
+                        logger.info(f"Composition ffmpeg layout={n} first chunk: {len(chunk)} bytes")
+                    bytes_sent += len(chunk)
+                    yield chunk
             except GeneratorExit:
                 pass
             finally:
