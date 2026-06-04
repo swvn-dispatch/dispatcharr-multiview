@@ -520,30 +520,11 @@ class MultiviewServer:
             # Wait up to 1 s for per-channel placeholders to start serving.
             _gevent.joinall(prewarm_tasks, timeout=1.0)
 
-        # Use plain subprocess (not gevent) so stdout/stderr pipes are blocking.
-        # gevent.subprocess sets pipes to non-blocking mode, which breaks reads
-        # from real OS threads and causes _log_stderr to silently miss output.
+        # Use plain subprocess so pipes are blocking (gevent.subprocess makes
+        # them non-blocking, which silently breaks thread reads of stderr).
         real_proc = subprocess.Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Both stdout and stderr are read in real threads (blocking I/O).
-        # Chunks are delivered to stream_gen via a gevent Queue, which is
-        # safe to put() from a thread and get() from a greenlet.
-        _chunk_q = _gqueue.Queue(maxsize=16) if _has_gevent else None
-
-        def _read_stdout():
-            try:
-                while True:
-                    chunk = real_proc.stdout.read(65536)
-                    if _chunk_q is not None:
-                        _chunk_q.put(chunk if chunk else b"")
-                    if not chunk:
-                        break
-            except Exception as exc:
-                logger.warning(f"ffmpeg stdout reader error layout={n}: {exc}")
-                if _chunk_q is not None:
-                    _chunk_q.put(b"")
-
-        threading.Thread(target=_read_stdout, daemon=True, name=f"ffmpeg-stdout-{n}").start()
+        # stderr: plain thread — blocking read works correctly on a regular pipe.
         threading.Thread(
             target=_log_stderr, args=(real_proc, f"layout={n}"),
             daemon=True, name=f"ffmpeg-stderr-{n}",
@@ -558,9 +539,13 @@ class MultiviewServer:
         def stream_gen():
             bytes_sent = 0
             try:
-                if _chunk_q is not None:
+                if _has_gevent:
+                    # gevent.queue.Queue.put() is NOT safe from real threads,
+                    # so we use the threadpool instead: spawn the blocking read
+                    # in a thread and .get() cooperatively from the greenlet.
+                    _tp = _gevent.get_hub().threadpool
                     while True:
-                        chunk = _chunk_q.get()  # cooperative: yields to event loop while waiting
+                        chunk = _tp.spawn(real_proc.stdout.read, 65536).get()
                         if not chunk:
                             break
                         bytes_sent += len(chunk)
