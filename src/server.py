@@ -350,13 +350,16 @@ class MultiviewServer:
             logger.warning("Multiview server is already running")
             return False
 
+        # Bind to port 0 — OS assigns a free port. Capture it now so callers
+        # can read self.port as soon as start() returns (no TIME_WAIT issues).
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, self.port))
-            sock.close()
+            sock.bind((self.host, 0))
+            self.port = sock.getsockname()[1]
         except OSError as e:
-            logger.error(f"Cannot bind to {self.host}:{self.port}: {e}")
+            logger.error(f"Cannot bind multiview socket: {e}")
+            sock.close()
             return False
 
         try:
@@ -379,6 +382,7 @@ class MultiviewServer:
             self._greenlet = _gevent.spawn(_run)
             return True
         except ImportError:
+            sock.close()
             logger.error("gevent is not installed; cannot start multiview server")
             return False
 
