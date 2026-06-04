@@ -471,36 +471,56 @@ class MultiviewServer:
         logger.debug(f"real_cmd: {real_cmd}")
 
         # Pre-warm all child channels in parallel. Each greenlet initializes its
-        # channel, then holds a temporary "anchor" client so the channel's
-        # waiting_for_clients grace period cannot expire before the composition
-        # ffmpeg registers its own client. The anchor is released once a real
-        # client has attached (or after a 30-second safety timeout).
+        # channel, waits for the buffer, then registers as a real StreamGenerator
+        # consumer so the ring buffer keeps advancing and the channel stays alive
+        # until the composition ffmpeg's own client takes over.
         if _has_gevent:
             def _prewarm(url):
                 uuid = url.rsplit('/', 1)[-1]
                 try:
                     self._ensure_channel_initialized(uuid)
                 except Exception as e:
-                    logger.warning(f"Pre-warm failed for {uuid}: {e}")
+                    logger.warning(f"Pre-warm init failed for {uuid}: {e}")
                     return
+                _sleep = _gevent_sleep()
                 try:
                     from apps.proxy.live_proxy.server import ProxyServer
+                    from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
                     proxy_server = ProxyServer.get_instance()
-                    mgr = proxy_server.client_managers.get(uuid)
-                    if not mgr:
-                        return
-                    anchor_id = str(_uuid_module.uuid4())
-                    if not mgr.add_client(anchor_id, "127.0.0.1", "multiview-prewarm", None, "mpegts", None):
-                        return
-                    try:
-                        for _ in range(60):  # up to 30 seconds
-                            _gevent.sleep(0.5)
-                            if mgr.get_total_client_count() > 1:
-                                break
-                    finally:
-                        mgr.remove_client(anchor_id)
                 except Exception as e:
-                    logger.warning(f"Pre-warm anchor failed for {uuid}: {e}")
+                    logger.warning(f"Pre-warm import failed for {uuid}: {e}")
+                    return
+                # Wait for the buffer (up to 3 seconds)
+                buf = None
+                for _ in range(30):
+                    buf = proxy_server.get_buffer(uuid)
+                    if buf is not None:
+                        break
+                    _sleep(0.1)
+                if buf is None:
+                    logger.info(f"Pre-warm: no buffer for {uuid} after 3s")
+                    return
+                mgr = proxy_server.client_managers.get(uuid)
+                if not mgr:
+                    return
+                anchor_id = str(_uuid_module.uuid4())
+                if not mgr.add_client(anchor_id, "127.0.0.1", "multiview-prewarm", None, "mpegts", None):
+                    return
+                gen = StreamGenerator(
+                    channel_id=uuid,
+                    client_id=anchor_id,
+                    client_ip="127.0.0.1",
+                    client_user_agent="multiview-prewarm",
+                    channel_initializing=False,
+                    buffer=buf,
+                )
+                try:
+                    for _chunk in gen.generate():
+                        # Discard data; release once composition ffmpeg has attached
+                        if mgr.get_total_client_count() > 1:
+                            break
+                except Exception as e:
+                    logger.warning(f"Pre-warm stream error for {uuid}: {e}")
             for url in input_urls:
                 _gevent.spawn(_prewarm, url)
 
@@ -517,9 +537,31 @@ class MultiviewServer:
             ("Transfer-Encoding", "chunked"),
         ])
 
+        if _has_gevent:
+            _real_first_q = _gqueue.Queue(maxsize=1)
+
+            def _probe_real():
+                first = real_proc.stdout.read(65536)
+                _real_first_q.put(first if first else b"")
+
+            _gevent.spawn(_probe_real)
+
         def stream_gen():
             bytes_sent = 0
             try:
+                if _has_gevent:
+                    # Send null TS packets while real_proc warms up so the client
+                    # stays connected during per-channel placeholder startup.
+                    while _real_first_q.empty():
+                        yield _NULL_TS_BURST
+                        bytes_sent += len(_NULL_TS_BURST)
+                        _gevent.sleep(0.1)
+                    first = _real_first_q.get()
+                    if not first:
+                        return
+                    bytes_sent += len(first)
+                    yield first
+
                 while True:
                     chunk = real_proc.stdout.read(65536)
                     if not chunk:
