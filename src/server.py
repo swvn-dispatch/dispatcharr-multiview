@@ -687,8 +687,6 @@ class MultiviewServer:
             logger.warning(f"Channel init warning {channel_id}: {e}")
             # Don't 503; serve placeholder and wait for channel to become available
 
-        client_id = str(_uuid_module.uuid4())
-
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
@@ -699,6 +697,7 @@ class MultiviewServer:
 
         def stream_gen():
             _active_client = False
+            _current_client_id = None
             try:
                 while True:
                     buf = proxy_server.get_buffer(channel_id)
@@ -707,11 +706,12 @@ class MultiviewServer:
                         if _active_client:
                             try:
                                 mgr = proxy_server.client_managers.get(channel_id)
-                                if mgr:
-                                    mgr.remove_client(client_id)
+                                if mgr and _current_client_id:
+                                    mgr.remove_client(_current_client_id)
                             except Exception:
                                 pass
                             _active_client = False
+                            _current_client_id = None
                         logger.info(f"Channel {channel_id} buffer gone, serving placeholder")
                         yield from _single_channel_placeholder_gen(
                             channel_id, channel_name, logo_url, proxy_server
@@ -724,12 +724,17 @@ class MultiviewServer:
                         if mgr is None:
                             _sleep(0.5)
                             continue
+                        _current_client_id = str(_uuid_module.uuid4())
                         try:
-                            mgr.add_client(
-                                client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
+                            added = mgr.add_client(
+                                _current_client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
                             )
+                            if not added:
+                                logger.warning(f"add_client returned False for {channel_id}, retrying")
+                                _sleep(0.5)
+                                continue
                             _active_client = True
-                            logger.info(f"Registered client {client_id} for {channel_id}")
+                            logger.info(f"Registered client {_current_client_id} for {channel_id}")
                         except Exception as e:
                             logger.warning(f"add_client failed for {channel_id}: {e}")
                             _sleep(0.5)
@@ -737,7 +742,7 @@ class MultiviewServer:
 
                     gen = StreamGenerator(
                         channel_id=channel_id,
-                        client_id=client_id,
+                        client_id=_current_client_id,
                         client_ip="127.0.0.1",
                         client_user_agent="multiview-plugin",
                         channel_initializing=False,
@@ -751,15 +756,16 @@ class MultiviewServer:
                         logger.warning(f"StreamGenerator error for {channel_id}: {e}")
                     # StreamGenerator._cleanup() removed our client
                     _active_client = False
+                    _current_client_id = None
                     logger.info(f"StreamGenerator restarting for {channel_id}")
                     _sleep(0.05)
             finally:
-                if _active_client:
+                if _active_client and _current_client_id:
                     try:
                         mgr = proxy_server.client_managers.get(channel_id)
                         if mgr is not None:
-                            mgr.remove_client(client_id)
-                            logger.info(f"Removed client {client_id} from {channel_id}")
+                            mgr.remove_client(_current_client_id)
+                            logger.info(f"Removed client {_current_client_id} from {channel_id}")
                     except Exception:
                         pass
 
