@@ -21,6 +21,25 @@ PLUGIN_DB_KEY = "multiview"
 DEFAULT_SERVER_PORT = 9292
 DEFAULT_SERVER_HOST = "127.0.0.1"
 
+_PORT_FILE = os.path.join(_PLUGIN_DIR, "multiview.port")
+_LOCK_FILE = os.path.join(_PLUGIN_DIR, "multiview.lock")
+
+
+def _read_port_file() -> "int | None":
+    try:
+        with open(_PORT_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _server_alive(port: int) -> bool:
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
 
 def _config():
     import importlib
@@ -65,21 +84,46 @@ class Plugin:
             logger.warning(f"Multiview server auto-start skipped: {e}")
 
     def _autostart(self):
+        import fcntl
+
         existing = _server().get_server()
         if existing and existing.is_running():
             return
-        result = self._start_server()
-        if result.get("status") == "success":
-            logger.info(f"Multiview auto-start: {result['message']}")
-            try:
-                from apps.plugins.models import PluginConfig
-                cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-                interval_hours = int(cfg.settings.get("epg_refresh_hours", 24))
-            except Exception:
-                interval_hours = 24
-            self._schedule_auto_refresh(interval_hours)
-        else:
-            logger.warning(f"Multiview auto-start failed: {result['message']}")
+
+        # Fast path: another worker's server is already alive
+        port = _read_port_file()
+        if port and _server_alive(port):
+            return
+
+        # Win the startup race across uWSGI workers (non-blocking exclusive lock)
+        lock_f = open(_LOCK_FILE, "w")
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            lock_f.close()
+            return  # Another worker is starting — let them handle it
+
+        try:
+            # Re-check inside the lock (race between fast-path check and lock acquire)
+            port = _read_port_file()
+            if port and _server_alive(port):
+                return
+
+            result = self._start_server()
+            if result.get("status") == "success":
+                logger.info(f"Multiview auto-start: {result['message']}")
+                try:
+                    from apps.plugins.models import PluginConfig
+                    cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
+                    interval_hours = int(cfg.settings.get("epg_refresh_hours", 24))
+                except Exception:
+                    interval_hours = 24
+                self._schedule_auto_refresh(interval_hours)
+            else:
+                logger.warning(f"Multiview auto-start failed: {result['message']}")
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
+            lock_f.close()
 
     # Dynamic fields
 
@@ -117,7 +161,10 @@ class Plugin:
         for n in range(1, mv_count + 1):
             name = settings.get(f"multiview_{n}_name", f"Multiview {n}") or f"Multiview {n}"
             _srv = _server().get_server()
-            port = _srv.port if _srv else DEFAULT_SERVER_PORT
+            if _srv:
+                port = _srv.port
+            else:
+                port = _read_port_file() or DEFAULT_SERVER_PORT
             stream_url = f"http://localhost:{port}/stream/{n}"
             lines.append(f'#EXTINF:-1 tvg-id="multiview_{n}" tvg-name="{name}",{name}')
             lines.append(stream_url)
@@ -175,6 +222,11 @@ class Plugin:
         server = srv.MultiviewServer(host=DEFAULT_SERVER_HOST, port=0)
         if server.start():
             actual_port = server.port
+            try:
+                with open(_PORT_FILE, "w") as f:
+                    f.write(str(actual_port))
+            except Exception as e:
+                logger.warning(f"Could not write port file: {e}")
             logger.info(f"Multiview server started on http://{DEFAULT_SERVER_HOST}:{actual_port}/")
             try:
                 self._generate_m3u()
@@ -221,3 +273,7 @@ class Plugin:
         if server and server.is_running():
             logger.info("Plugin stopping, shutting down multiview server")
             server.stop()
+        try:
+            os.unlink(_PORT_FILE)
+        except Exception:
+            pass
