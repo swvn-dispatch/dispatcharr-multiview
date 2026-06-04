@@ -461,18 +461,49 @@ class MultiviewServer:
             _Popen = subprocess.Popen
             _has_gevent = False
 
-        placeholder_cmd = _build_placeholder_cmd(channel_names, logo_urls, layout, out_w, out_h, audio_source)
         real_cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings, audio_source, channel_names)
 
         logger.info(
-            f"Starting placeholder + real ffmpeg: layout={n} inputs={len(input_urls)} "
+            f"Starting composition ffmpeg: layout={n} inputs={len(input_urls)} "
             f"style={layout} encoder={enc_settings.get('video_encoder', 'libx264')} "
             f"resolution={resolution}"
         )
-
-        logger.debug(f"placeholder_cmd: {placeholder_cmd}")
         logger.debug(f"real_cmd: {real_cmd}")
-        placeholder_proc = _Popen(placeholder_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        # Pre-warm all child channels in parallel. Each greenlet initializes its
+        # channel, then holds a temporary "anchor" client so the channel's
+        # waiting_for_clients grace period cannot expire before the composition
+        # ffmpeg registers its own client. The anchor is released once a real
+        # client has attached (or after a 30-second safety timeout).
+        if _has_gevent:
+            def _prewarm(url):
+                uuid = url.rsplit('/', 1)[-1]
+                try:
+                    self._ensure_channel_initialized(uuid)
+                except Exception as e:
+                    logger.warning(f"Pre-warm failed for {uuid}: {e}")
+                    return
+                try:
+                    from apps.proxy.live_proxy.server import ProxyServer
+                    proxy_server = ProxyServer.get_instance()
+                    mgr = proxy_server.client_managers.get(uuid)
+                    if not mgr:
+                        return
+                    anchor_id = str(_uuid_module.uuid4())
+                    if not mgr.add_client(anchor_id, "127.0.0.1", "multiview-prewarm", None, "mpegts", None):
+                        return
+                    try:
+                        for _ in range(60):  # up to 30 seconds
+                            _gevent.sleep(0.5)
+                            if mgr.get_total_client_count() > 1:
+                                break
+                    finally:
+                        mgr.remove_client(anchor_id)
+                except Exception as e:
+                    logger.warning(f"Pre-warm anchor failed for {uuid}: {e}")
+            for url in input_urls:
+                _gevent.spawn(_prewarm, url)
+
         real_proc = _Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         threading.Thread(
@@ -486,95 +517,20 @@ class MultiviewServer:
             ("Transfer-Encoding", "chunked"),
         ])
 
-        if _has_gevent:
-            # placeholder_q: placeholder chunks (small buffer, so we don't over-fill)
-            # real_first_q: the first chunk from real ffmpeg (signals it's alive)
-            placeholder_q    = _gqueue.Queue(maxsize=1)
-            real_first_q     = _gqueue.Queue(maxsize=1)
-            real_ready       = _gevent_event.Event()
-            placeholder_done = _gevent_event.Event()
-
-            def _read_placeholder():
-                try:
-                    while not real_ready.is_set():
-                        chunk = placeholder_proc.stdout.read(32768)
-                        if not chunk:
-                            break
-                        if real_ready.is_set():
-                            break
-                        try:
-                            placeholder_q.put(chunk, timeout=1)
-                        except Exception:
-                            break
-                finally:
-                    placeholder_done.set()
-                    _kill_proc(placeholder_proc)
-
-            def _probe_real():
-                first = real_proc.stdout.read(65536)
-                real_first_q.put(first if first else b"")
-                real_ready.set()
-
-            _gevent.spawn(_read_placeholder)
-            _gevent.spawn(_probe_real)
-
-            def stream_gen():
-                bytes_sent = 0
-                try:
-                    # Phase 1: placeholder until it ends (-t 10) OR real is ready
-                    while not placeholder_done.is_set() and not real_ready.is_set():
-                        try:
-                            chunk = placeholder_q.get(timeout=0.1)
-                            bytes_sent += len(chunk)
-                            yield chunk
-                        except _gqueue.Empty:
-                            continue
-
-                    # Phase 2: null-packet keepalive until real ffmpeg is ready.
-                    # Null packets (PID 0x1FFF) are transparent; decoders discard
-                    # them without filling the client's visible buffer.
-                    while not real_ready.is_set():
-                        yield _NULL_TS_BURST
-                        bytes_sent += len(_NULL_TS_BURST)
-                        _gevent.sleep(0.25)
-
-                    # Phase 3: hand off first real chunk
-                    try:
-                        first = real_first_q.get(timeout=3)
-                    except _gqueue.Empty:
-                        first = b""
-                    if not first:
-                        return
-                    bytes_sent += len(first)
-                    yield first
-
-                    # Phase 4: stream real ffmpeg
-                    while True:
-                        chunk = real_proc.stdout.read(65536)
-                        if not chunk:
-                            break
-                        bytes_sent += len(chunk)
-                        yield chunk
-                finally:
-                    for proc in (real_proc, placeholder_proc):
-                        _kill_proc(proc)
-                    logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
-
-        else:
-            def stream_gen():
-                bytes_sent = 0
-                try:
-                    for proc in (placeholder_proc, real_proc):
-                        while True:
-                            chunk = proc.stdout.read(65536)
-                            if not chunk:
-                                break
-                            bytes_sent += len(chunk)
-                            yield chunk
-                finally:
-                    for proc in (placeholder_proc, real_proc):
-                        _kill_proc(proc)
-                    logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
+        def stream_gen():
+            bytes_sent = 0
+            try:
+                while True:
+                    chunk = real_proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    bytes_sent += len(chunk)
+                    yield chunk
+            except GeneratorExit:
+                pass
+            finally:
+                _kill_proc(real_proc)
+                logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
 
         return stream_gen()
 
@@ -681,17 +637,23 @@ class MultiviewServer:
         except Exception:
             pass
 
-        try:
-            self._ensure_channel_initialized(channel_id)
-        except Exception as e:
-            logger.warning(f"Channel init warning {channel_id}: {e}")
-            # Don't 503; serve placeholder and wait for channel to become available
-
+        # Respond immediately so ffmpeg can start probing this input right away.
+        # Channel initialization runs in the background; stream_gen() serves
+        # the per-channel logo placeholder until the buffer becomes available.
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
             ("Transfer-Encoding", "chunked"),
         ])
+
+        try:
+            import gevent as _gevent_ch
+            _gevent_ch.spawn(self._ensure_channel_initialized, channel_id)
+        except ImportError:
+            try:
+                self._ensure_channel_initialized(channel_id)
+            except Exception as e:
+                logger.warning(f"Channel init warning {channel_id}: {e}")
 
         _sleep = _gevent_sleep()
 
