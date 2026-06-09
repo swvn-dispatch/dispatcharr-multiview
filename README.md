@@ -2,6 +2,12 @@
 
 > Dispatcharr plugin that combines multiple channel streams into a single tiled MPEG-TS output. Define named layouts, pick your channels, and each layout appears as a standard M3U channel you can open in any player.
 
+## Support
+
+This project is maintained in my spare time. If it's saved you some headaches, a tip is always appreciated.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/sethwv)
+
 ## How it works
 
 Each `/stream/{n}` request spawns an FFmpeg process that pulls per-channel feeds from an internal HTTP endpoint, tiles them with `xstack`, and pipes MPEG-TS to the client. A placeholder image runs in parallel during startup so the stream opens immediately. Channels are opened through Dispatcharr's ProxyServer so they appear in stats and respect stream profiles.
