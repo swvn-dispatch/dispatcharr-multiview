@@ -1,4 +1,4 @@
-"""Multiview streaming server.
+"""Multiview streaming server — Phase 1.
 
 Routes (gevent pywsgi on the plugin port):
 
@@ -35,20 +35,6 @@ _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compositor_w
 
 _server_instance = None
 
-# ---------------------------------------------------------------------------
-# Keepalive registry
-#
-# When the composition ffmpeg disconnects (Dispatcharr health timeout,
-# client closes stream, etc.) we want the child Dispatcharr channels to
-# survive long enough for the next connection attempt to reuse them instead
-# of restarting from scratch.  Each child channel gets one "keepalive"
-# client registered with Dispatcharr that is *not* tied to an HTTP
-# connection. The background cleanup greenlet (spawned per composition
-# stream) removes it after TTL seconds of inactivity.
-# ---------------------------------------------------------------------------
-_mv_keepalives: dict = {}   # uuid → (client_id, last_release_at, ref_count, drainer_greenlet)
-# ref_count > 0  → streaming consumer active; drainer sleeps, TTL paused
-# ref_count == 0 → no consumer; drainer runs to prevent ghost-removal, TTL counts down
 
 
 def _mv_keepalive_ensure(channel_id: str, proxy_server) -> "str | None":
@@ -342,9 +328,7 @@ class MultiviewServer:
     # --------------------------------------------------------------- handlers
 
     def _serve_stream(self, n: int, start_response):
-        # BRICK 2: real composition ffmpeg with per-channel HTTP inputs.
-        # No pre-warm yet — channels start via per-channel endpoint on demand.
-        logger.info(f"Stream request: layout {n} (brick-2 composition)")
+        logger.info(f"Stream request: layout {n}")
 
         try:
             tiles, layout, audio_source = self._resolve_layout(n)
