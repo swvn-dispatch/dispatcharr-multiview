@@ -34,6 +34,174 @@ _NULL_TS_BURST = (bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes(184)) * 7
 
 _server_instance = None
 
+# ---------------------------------------------------------------------------
+# Keepalive registry
+#
+# When the composition ffmpeg disconnects (Dispatcharr health timeout,
+# client closes stream, etc.) we want the child Dispatcharr channels to
+# survive long enough for the next connection attempt to reuse them instead
+# of restarting from scratch.  Each child channel gets one "keepalive"
+# client registered with Dispatcharr that is *not* tied to an HTTP
+# connection. The background cleanup greenlet (spawned per composition
+# stream) removes it after TTL seconds of inactivity.
+# ---------------------------------------------------------------------------
+_mv_keepalives: dict = {}   # uuid → (client_id, last_release_at, ref_count, drainer_greenlet)
+# ref_count > 0  → streaming consumer active; drainer sleeps, TTL paused
+# ref_count == 0 → no consumer; drainer runs to prevent ghost-removal, TTL counts down
+
+
+def _mv_keepalive_ensure(channel_id: str, proxy_server) -> "str | None":
+    """Register keepalive client (if absent), increment ref-count, and spawn drainer."""
+    import time as _t
+    import uuid as _u
+    if channel_id in _mv_keepalives:
+        cid, last, refs, drainer = _mv_keepalives[channel_id]
+        _mv_keepalives[channel_id] = (cid, last, refs + 1, drainer)
+        return cid
+    mgr = proxy_server.client_managers.get(channel_id)
+    if mgr is None:
+        return None
+    cid = str(_u.uuid4())
+    try:
+        if mgr.add_client(cid, "127.0.0.1", "multiview-keepalive", None, "mpegts", None):
+            drainer = None
+            try:
+                import gevent as _gv_ka
+                drainer = _gv_ka.spawn(_mv_keepalive_drain, channel_id, cid, proxy_server)
+            except Exception:
+                pass
+            _mv_keepalives[channel_id] = (cid, _t.time(), 1, drainer)
+            logger.info(f"Keepalive registered for {channel_id}")
+            return cid
+    except Exception as e:
+        logger.warning(f"Keepalive register failed for {channel_id}: {e}")
+    return None
+
+
+def _mv_keepalive_drain(channel_id: str, cid: str, proxy_server) -> None:
+    """Background greenlet: drain data for the keepalive client to prevent
+    Dispatcharr ghost-removal (last_active must stay fresh).
+
+    Only runs a StreamGenerator when ref_count == 0 (no active streaming
+    consumer).  While the streaming client is connected, it sleeps cheaply —
+    the streaming client's own generator keeps last_active current."""
+    try:
+        import gevent as _gv
+        from apps.proxy.live_proxy.output.ts.generator import StreamGenerator as _SG
+    except ImportError:
+        return
+
+    while True:
+        entry = _mv_keepalives.get(channel_id)
+        if entry is None or entry[0] != cid:
+            return
+
+        _, _, refs, _ = entry
+        if refs > 0:
+            # Streaming client is active; sleep, then refresh keepalive's
+            # last_active so Dispatcharr's ghost detector doesn't remove it.
+            _gv.sleep(1.0)
+            try:
+                import time as _t_ka
+                _mgr_ka = proxy_server.client_managers.get(channel_id)
+                if _mgr_ka and _mgr_ka.redis_client:
+                    _mgr_ka.redis_client.hset(
+                        f"live:channel:{channel_id}:clients:{cid}",
+                        "last_active", str(_t_ka.time()),
+                    )
+            except Exception:
+                pass
+            continue
+
+        # refs == 0: no streaming consumer — drain to keep last_active fresh.
+        buf = proxy_server.get_buffer(channel_id)
+        if buf is None:
+            _gv.sleep(0.5)
+            continue
+
+        mgr = proxy_server.client_managers.get(channel_id)
+        if mgr is None:
+            _gv.sleep(0.5)
+            continue
+
+        # Re-register if StreamGenerator._cleanup() removed the slot last iteration.
+        mgr.add_client(cid, "127.0.0.1", "multiview-keepalive", None, "mpegts", None)
+
+        try:
+            gen = _SG(
+                channel_id=channel_id,
+                client_id=cid,
+                client_ip="127.0.0.1",
+                client_user_agent="multiview-keepalive",
+                channel_initializing=False,
+                buffer=buf,
+            )
+            for _chunk in gen.generate():
+                _gv.sleep(0)
+                entry = _mv_keepalives.get(channel_id)
+                if entry is None or entry[0] != cid:
+                    return
+                if entry[2] > 0:
+                    # Streaming client reconnected; stop draining.
+                    break
+        except Exception:
+            _gv.sleep(0.1)
+
+
+def _mv_keepalive_release(channel_id: str) -> None:
+    """Decrement ref-count; TTL starts counting when it reaches zero."""
+    import time as _t
+    if channel_id in _mv_keepalives:
+        cid, _, refs, drainer = _mv_keepalives[channel_id]
+        _mv_keepalives[channel_id] = (cid, _t.time(), max(0, refs - 1), drainer)
+
+
+def _mv_keepalive_cleanup(proxy_server, ttl: float = 30.0) -> None:
+    """Remove keepalive clients idle (ref_count==0) longer than ttl seconds.
+    Kills drainer greenlet and removes Dispatcharr client slot."""
+    import time as _t
+    now = _t.time()
+    stale = [
+        u for u, (_, last, refs, _drainer) in list(_mv_keepalives.items())
+        if refs == 0 and now - last > ttl
+    ]
+    for uid in stale:
+        entry = _mv_keepalives.pop(uid, None)
+        if entry:
+            cid, _, _, drainer = entry
+            try:
+                if drainer is not None:
+                    drainer.kill(block=False)
+            except Exception:
+                pass
+            try:
+                mgr = proxy_server.client_managers.get(uid)
+                if mgr:
+                    mgr.remove_client(cid)
+                    logger.info(f"Keepalive expired and removed for {uid}")
+            except Exception:
+                pass
+
+
+def _mv_keepalive_shutdown(proxy_server) -> None:
+    """Kill all drainer greenlets and remove all keepalive clients immediately.
+    Called when the multiview composition stops to avoid channels lingering."""
+    entries = list(_mv_keepalives.items())
+    _mv_keepalives.clear()
+    for uid, (cid, _, _, drainer) in entries:
+        try:
+            if drainer is not None:
+                drainer.kill(block=False)
+        except Exception:
+            pass
+        try:
+            mgr = proxy_server.client_managers.get(uid)
+            if mgr:
+                mgr.remove_client(cid)
+                logger.info(f"Keepalive shutdown: removed {uid}")
+        except Exception:
+            pass
+
 
 def get_server() -> "MultiviewServer | None":
     return _server_instance
@@ -150,12 +318,19 @@ def _audio_metadata_args(audio_source: str, channel_names: list[str], n: int) ->
     return args
 
 
-def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server):
-    """Yield MPEG-TS logo placeholder until channel_id's buffer is available again."""
+def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server, stop_event=None, max_duration=None):
+    """Yield MPEG-TS logo placeholder until channel_id's buffer is available again.
+
+    If stop_event is provided, exits when that event is set rather than polling the buffer.
+    If max_duration (seconds) is provided, exits after that time regardless of buffer state.
+    """
+    import time as _t_ph
     _Popen = _gevent_popen()
+    _deadline = (_t_ph.monotonic() + max_duration) if max_duration is not None else None
 
     usable = _usable_logo(logo_url)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+           "-re",
            "-f", "lavfi", "-i", "color=c=black:size=320x180:r=30000/1001",
            "-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
     if usable:
@@ -183,7 +358,12 @@ def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, pro
             if not chunk:
                 break
             yield chunk
-            if proxy_server.get_buffer(channel_id) is not None:
+            if _deadline is not None and _t_ph.monotonic() >= _deadline:
+                break
+            if stop_event is not None:
+                if stop_event.is_set():
+                    break
+            elif proxy_server.get_buffer(channel_id) is not None:
                 break
     finally:
         _kill_proc(proc)
@@ -306,9 +486,10 @@ def _build_ffmpeg_cmd(
     for url in input_urls:
         cmd += [
             "-f", "mpegts",
+            "-use_wallclock_as_timestamps", "1",
             "-fflags", "+discardcorrupt+genpts+nobuffer",
-            "-analyzeduration", "1000000",
-            "-probesize", "1048576",
+            "-analyzeduration", "100000",
+            "-probesize", "32768",
             "-thread_queue_size", "1024",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -364,9 +545,12 @@ def _build_ffmpeg_cmd(
             "-g", "60",
         ]
     else:  # libx264
+        _x264_valid = {"ultrafast", "superfast", "veryfast", "faster", "fast",
+                       "medium", "slow", "slower", "veryslow", "placebo"}
+        x264_preset = preset if preset in _x264_valid else "ultrafast"
         cmd += [
             "-c:v", "libx264",
-            "-preset", preset,
+            "-preset", x264_preset,
             "-tune", "zerolatency",
             "-level:v", "5.1",
             "-crf", str(crf),
@@ -380,11 +564,11 @@ def _build_ffmpeg_cmd(
     if audio_source == "all":
         for i in range(n):
             cmd += ["-map", f"{i}:a?"]
-        cmd += ["-c:a", "ac3"]
+        cmd += ["-c:a", "ac3", "-af", "aresample=async=1000"]
     else:
         audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
         audio_idx = max(0, min(audio_idx, n - 1))
-        cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3"]
+        cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3", "-af", "aresample=async=1000"]
     cmd += _audio_metadata_args(audio_source, channel_names or [], n)
 
     cmd += ["-max_muxing_queue_size", "1024"]
@@ -428,112 +612,90 @@ class MultiviewServer:
         return [b"Not Found\n"]
 
     def _serve_stream(self, n: int, start_response):
-        logger.info(f"Stream request: layout {n}")
+        # BRICK 2: real composition ffmpeg with per-channel HTTP inputs.
+        # No pre-warm yet — channels start via per-channel endpoint on demand.
+        logger.info(f"Stream request: layout {n} (brick-2 composition)")
+
         try:
             input_urls, layout, channel_names, logo_urls, audio_source = self._resolve_layout(n)
         except LookupError as e:
-            logger.warning(f"Layout {n} not ready: {e}")
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [str(e).encode()]
         except Exception as e:
-            logger.error(f"Error resolving layout {n}: {e}", exc_info=True)
+            logger.error(f"Layout {n} error: {e}", exc_info=True)
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
-            return [b"Server error\n"]
+            return [b"error\n"]
 
         try:
             from apps.plugins.models import PluginConfig
-            cfg = PluginConfig.objects.get(key="multiview")
-            enc_settings = cfg.settings
+            enc_settings = PluginConfig.objects.get(key="multiview").settings
         except Exception:
             enc_settings = {}
 
-        resolution = enc_settings.get("output_resolution", "1920x1080")
-        out_w, out_h = _parse_resolution(enc_settings)
-
         try:
             import gevent as _gevent
-            import gevent.queue as _gqueue
-            import gevent.event as _gevent_event
             import gevent.subprocess as _gsp
+            import gevent.event as _gevent_event
             _Popen = _gsp.Popen
-            _has_gevent = True
         except ImportError:
             _Popen = subprocess.Popen
-            _has_gevent = False
+            _gevent = None
+            _gevent_event = None
 
-        real_cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings, audio_source, channel_names)
+        # Sequential channel init: start each child channel one at a time
+        # (0.5 s stagger) so we don't thundering-herd Dispatcharr at startup
+        # or on retry.  Runs in the background so composition ffmpeg can begin
+        # serving placeholder TS immediately — channels join the grid as they
+        # become ready.
+        try:
+            from apps.proxy.live_proxy.server import ProxyServer as _PSInit
+            _ps_init = _PSInit.get_instance()
+        except Exception:
+            _ps_init = None
 
-        logger.info(
-            f"Starting composition ffmpeg: layout={n} inputs={len(input_urls)} "
-            f"style={layout} encoder={enc_settings.get('video_encoder', 'libx264')} "
-            f"resolution={resolution}"
-        )
-        logger.debug(f"real_cmd: {real_cmd}")
+        _cleanup_greenlet = None
+        if _gevent:
+            import threading as _threading_init
+            def _init_channels_sequential():
+                for _url in input_urls:
+                    _uid = _url.rsplit("/", 1)[-1]
+                    try:
+                        # Native thread: blocking Django/socket calls inside
+                        # _ensure_channel_initialized won't freeze the gevent
+                        # event loop (which would starve stream_gen placeholders).
+                        t = _threading_init.Thread(
+                            target=self._ensure_channel_initialized,
+                            args=(_uid,),
+                            daemon=True,
+                        )
+                        t.start()
+                    except Exception as _e:
+                        logger.warning(f"Sequential init error {_uid}: {_e}")
+                    _gevent.sleep(0.5)
 
-        # Pre-warm: open a raw gevent socket to each per-channel endpoint so
-        # the placeholder TS (logo on black) is already flowing before the
-        # composition ffmpeg launches. http.client is avoided because its
-        # BufferedReader blocks gevent's event loop on Python 3.13+.
-        if _has_gevent:
-            def _prewarm(url):
-                uuid = url.rsplit('/', 1)[-1]
-                sock = None
-                try:
-                    import gevent.socket as _gsock
-                    from apps.proxy.live_proxy.server import ProxyServer
-                    proxy_server = ProxyServer.get_instance()
+            _gevent.spawn(_init_channels_sequential)
 
-                    sock = _gsock.socket()
-                    sock.connect(("127.0.0.1", self.port))
-                    sock.sendall((
-                        f"GET /internal/ch/{uuid} HTTP/1.1\r\n"
-                        f"Host: 127.0.0.1:{self.port}\r\n"
-                        f"Connection: close\r\n\r\n"
-                    ).encode())
-
-                    # Read until end of HTTP headers — at this point the
-                    # per-channel placeholder ffmpeg is running and serving TS.
-                    buf = b""
-                    while b"\r\n\r\n" not in buf:
-                        data = sock.recv(4096)
-                        if not data:
-                            return
-                        buf += data
-
-                    # Drain body until the channel's real buffer is live.
+            if _ps_init is not None:
+                def _cleanup_loop():
                     while True:
-                        chunk = sock.recv(32768)
-                        if not chunk:
-                            break
-                        if proxy_server.get_buffer(uuid) is not None:
-                            break
-                except Exception as e:
-                    logger.warning(f"Pre-warm failed for {uuid}: {e}")
-                finally:
-                    if sock:
+                        _gevent.sleep(5)
                         try:
-                            sock.close()
+                            _mv_keepalive_cleanup(_ps_init)
                         except Exception:
                             pass
 
-            # Spawn pre-warm in background — don't block here. The per-channel
-            # endpoints will start serving placeholder TS as soon as real_proc's
-            # connections arrive, and the pre-warm ensures channels are live ASAP.
-            for url in input_urls:
-                _gevent.spawn(_prewarm, url)
+                _cleanup_greenlet = _gevent.spawn(_cleanup_loop)
 
-        # gevent.subprocess.Popen is correct here: its stdout is a
-        # FileObjectPosix whose .read() yields cooperatively in a greenlet.
-        # stderr is also read in a greenlet for the same reason.
-        real_proc = _Popen(real_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings, audio_source, channel_names)
+        logger.info(f"multiview composition cmd: {' '.join(cmd)}")
 
-        if _has_gevent:
-            _gevent.spawn(_log_stderr, real_proc, f"layout={n}")
+        proc = _Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        if _gevent:
+            _gevent.spawn(_log_stderr, proc, f"layout={n}")
         else:
-            threading.Thread(
-                target=_log_stderr, args=(real_proc, f"layout={n}"),
-                daemon=True, name=f"ffmpeg-stderr-{n}",
-            ).start()
+            threading.Thread(target=_log_stderr, args=(proc, f"layout={n}"),
+                             daemon=True).start()
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -543,22 +705,32 @@ class MultiviewServer:
 
         def stream_gen():
             bytes_sent = 0
-            logger.info(f"Composition stream_gen started for layout={n}")
+            logger.info(f"multiview stream_gen started for layout={n}")
             try:
                 while True:
-                    chunk = real_proc.stdout.read(65536)
+                    chunk = proc.stdout.read(65536)
                     if not chunk:
-                        logger.warning(f"Composition ffmpeg layout={n} produced no more output")
+                        logger.warning(f"multiview ffmpeg exited after {bytes_sent:,} bytes")
                         break
                     if bytes_sent == 0:
-                        logger.info(f"Composition ffmpeg layout={n} first chunk: {len(chunk)} bytes")
+                        logger.info(f"multiview first chunk: {len(chunk)} bytes")
                     bytes_sent += len(chunk)
                     yield chunk
             except GeneratorExit:
                 pass
             finally:
-                _kill_proc(real_proc)
-                logger.info(f"ffmpeg layout={n} terminated after {bytes_sent:,} bytes")
+                _kill_proc(proc)
+                if _cleanup_greenlet is not None:
+                    try:
+                        _cleanup_greenlet.kill(block=False)
+                    except Exception:
+                        pass
+                if _ps_init is not None:
+                    try:
+                        _mv_keepalive_shutdown(_ps_init)
+                    except Exception:
+                        pass
+                logger.info(f"multiview terminated after {bytes_sent:,} bytes")
 
         return stream_gen()
 
@@ -586,9 +758,9 @@ class MultiviewServer:
             return False
 
         if not proxy_server.check_if_channel_exists(channel_id):
-            stream_url, stream_ua, transcode, profile_value = generate_stream_url(channel_id)
+            stream_url, stream_ua, transcode, profile_value, _slot_reserved, _err = generate_stream_url(channel_id)
             if not stream_url:
-                logger.warning(f"No stream available for channel {channel_id}")
+                logger.warning(f"No stream available for channel {channel_id}: {_err}")
                 return False
 
             stream_id = m3u_profile_id = None
@@ -663,19 +835,22 @@ class MultiviewServer:
         ])
 
         try:
-            import gevent as _gevent_ch
-            _gevent_ch.spawn(self._ensure_channel_initialized, channel_id)
-        except ImportError:
-            try:
-                self._ensure_channel_initialized(channel_id)
-            except Exception as e:
-                logger.warning(f"Channel init warning {channel_id}: {e}")
+            import threading as _threading_ch
+            _threading_ch.Thread(
+                target=self._ensure_channel_initialized,
+                args=(channel_id,),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            logger.warning(f"Channel init thread error {channel_id}: {e}")
 
         _sleep = _gevent_sleep()
 
         def stream_gen():
             _active_client = False
             _current_client_id = None
+            _keepalive_acquired = False  # ensure/release called at most once per connection
+            _stale_count = 0            # consecutive stale retries for backoff
             try:
                 while True:
                     buf = proxy_server.get_buffer(channel_id)
@@ -695,12 +870,22 @@ class MultiviewServer:
                             channel_id, channel_name, logo_url, proxy_server
                         )
                         logger.info(f"Channel {channel_id} buffer returned, resuming")
+                        _stale_count = 0
                         continue
 
                     if not _active_client:
                         mgr = proxy_server.client_managers.get(channel_id)
                         if mgr is None:
-                            _sleep(0.5)
+                            # Buffer exists but client manager not ready yet (init still running).
+                            # Keep xstack fed with placeholder while we wait; do not check
+                            # buffer-availability exit path (stop_event != None disables it).
+                            class _NeverSet:
+                                def is_set(self): return False
+                            logger.info(f"Channel {channel_id} client manager not ready yet, serving placeholder")
+                            yield from _single_channel_placeholder_gen(
+                                channel_id, channel_name, logo_url, proxy_server,
+                                stop_event=_NeverSet(), max_duration=2.0,
+                            )
                             continue
                         _current_client_id = str(_uuid_module.uuid4())
                         try:
@@ -713,6 +898,11 @@ class MultiviewServer:
                                 continue
                             _active_client = True
                             logger.info(f"Registered client {_current_client_id} for {channel_id}")
+                            # Register keepalive exactly once per HTTP connection.
+                            # Subsequent stale retries re-use the same keepalive slot.
+                            if not _keepalive_acquired:
+                                _mv_keepalive_ensure(channel_id, proxy_server)
+                                _keepalive_acquired = True
                         except Exception as e:
                             logger.warning(f"add_client failed for {channel_id}: {e}")
                             _sleep(0.5)
@@ -726,26 +916,96 @@ class MultiviewServer:
                         channel_initializing=False,
                         buffer=buf,
                     )
+                    _gen_iter = gen.generate()
+                    _stale = False
+
+                    # Serve placeholder TS while waiting for the first real
+                    # chunk from StreamGenerator. A freshly initialized channel
+                    # needs 3-8 s to connect and fill its buffer; simply
+                    # blocking here would stall the HTTP response to ffmpeg.
+                    # We spawn a greenlet to fetch the first chunk and keep
+                    # yielding placeholder until it arrives (or 20 s expires).
                     try:
-                        yield from gen.generate()
-                    except GeneratorExit:
-                        return
-                    except Exception as e:
-                        logger.warning(f"StreamGenerator error for {channel_id}: {e}")
+                        import gevent as _gv
+                        import gevent.event as _gv_event
+
+                        _stop_ph = _gv_event.Event()
+                        _first_box = [None]
+                        _first_ok = [False]
+
+                        def _get_first():
+                            try:
+                                _t2 = _gv.Timeout(20.0)
+                                _t2.start()
+                                try:
+                                    _first_box[0] = next(_gen_iter)
+                                    _first_ok[0] = True
+                                except _gv.Timeout:
+                                    logger.info(f"Channel {channel_id} timed out waiting for first chunk")
+                                except StopIteration:
+                                    pass
+                                finally:
+                                    _t2.cancel()
+                            except Exception as e:
+                                logger.warning(f"Channel {channel_id} first-chunk error: {e}")
+                            finally:
+                                _stop_ph.set()
+
+                        _fetcher = _gv.spawn(_get_first)
+                        try:
+                            yield from _single_channel_placeholder_gen(
+                                channel_id, channel_name, logo_url, proxy_server, _stop_ph
+                            )
+                        finally:
+                            _fetcher.kill(block=False)
+
+                        if _first_ok[0]:
+                            yield _first_box[0]
+                            try:
+                                yield from _gen_iter
+                            except GeneratorExit:
+                                return
+                            except Exception as e:
+                                logger.warning(f"StreamGenerator error for {channel_id}: {e}")
+                        else:
+                            _stale = True
+
+                    except ImportError:
+                        try:
+                            yield next(_gen_iter)
+                        except StopIteration:
+                            _stale = True
+
                     # StreamGenerator._cleanup() removed our client
                     _active_client = False
                     _current_client_id = None
-                    logger.info(f"StreamGenerator restarting for {channel_id}")
-                    _sleep(0.05)
+                    if _stale:
+                        _stale_count += 1
+                        # Exponential backoff: 0.5s, 1s, 2s, 4s, capped at 8s.
+                        # Prevents hammering add_client (which triggers plugin discovery)
+                        # when the upstream source is dead or slow to reconnect.
+                        _backoff = min(0.5 * (2 ** (_stale_count - 1)), 8.0)
+                        logger.info(f"StreamGenerator stale for {channel_id} (retry {_stale_count}, backoff {_backoff:.1f}s)")
+                        yield from _single_channel_placeholder_gen(
+                            channel_id, channel_name, logo_url, proxy_server,
+                            max_duration=_backoff,
+                        )
+                    else:
+                        _stale_count = 0
+                        logger.info(f"StreamGenerator restarting for {channel_id}")
+                        _sleep(0.05)
             finally:
                 if _active_client and _current_client_id:
                     try:
                         mgr = proxy_server.client_managers.get(channel_id)
                         if mgr is not None:
                             mgr.remove_client(_current_client_id)
-                            logger.info(f"Removed client {_current_client_id} from {channel_id}")
+                            logger.info(f"Removed streaming client {_current_client_id} from {channel_id}")
                     except Exception:
                         pass
+                # Decrement ref-count exactly once per HTTP connection.
+                if _keepalive_acquired:
+                    _mv_keepalive_release(channel_id)
 
         return stream_gen()
 
