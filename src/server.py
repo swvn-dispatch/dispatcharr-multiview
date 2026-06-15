@@ -35,6 +35,174 @@ _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compositor_w
 
 _server_instance = None
 
+# ---------------------------------------------------------------------------
+# Keepalive registry
+#
+# When the composition ffmpeg disconnects (Dispatcharr health timeout,
+# client closes stream, etc.) we want the child Dispatcharr channels to
+# survive long enough for the next connection attempt to reuse them instead
+# of restarting from scratch.  Each child channel gets one "keepalive"
+# client registered with Dispatcharr that is *not* tied to an HTTP
+# connection. The background cleanup greenlet (spawned per composition
+# stream) removes it after TTL seconds of inactivity.
+# ---------------------------------------------------------------------------
+_mv_keepalives: dict = {}   # uuid → (client_id, last_release_at, ref_count, drainer_greenlet)
+# ref_count > 0  → streaming consumer active; drainer sleeps, TTL paused
+# ref_count == 0 → no consumer; drainer runs to prevent ghost-removal, TTL counts down
+
+
+def _mv_keepalive_ensure(channel_id: str, proxy_server) -> "str | None":
+    """Register keepalive client (if absent), increment ref-count, and spawn drainer."""
+    import time as _t
+    import uuid as _u
+    if channel_id in _mv_keepalives:
+        cid, last, refs, drainer = _mv_keepalives[channel_id]
+        _mv_keepalives[channel_id] = (cid, last, refs + 1, drainer)
+        return cid
+    mgr = proxy_server.client_managers.get(channel_id)
+    if mgr is None:
+        return None
+    cid = str(_u.uuid4())
+    try:
+        if mgr.add_client(cid, "127.0.0.1", "multiview-keepalive", None, "mpegts", None):
+            drainer = None
+            try:
+                import gevent as _gv_ka
+                drainer = _gv_ka.spawn(_mv_keepalive_drain, channel_id, cid, proxy_server)
+            except Exception:
+                pass
+            _mv_keepalives[channel_id] = (cid, _t.time(), 1, drainer)
+            logger.info(f"Keepalive registered for {channel_id}")
+            return cid
+    except Exception as e:
+        logger.warning(f"Keepalive register failed for {channel_id}: {e}")
+    return None
+
+
+def _mv_keepalive_drain(channel_id: str, cid: str, proxy_server) -> None:
+    """Background greenlet: drain data for the keepalive client to prevent
+    Dispatcharr ghost-removal (last_active must stay fresh).
+
+    Only runs a StreamGenerator when ref_count == 0 (no active streaming
+    consumer).  While the streaming client is connected, it sleeps cheaply —
+    the streaming client's own generator keeps last_active current."""
+    try:
+        import gevent as _gv
+        from apps.proxy.live_proxy.output.ts.generator import StreamGenerator as _SG
+    except ImportError:
+        return
+
+    while True:
+        entry = _mv_keepalives.get(channel_id)
+        if entry is None or entry[0] != cid:
+            return
+
+        _, _, refs, _ = entry
+        if refs > 0:
+            # Streaming client is active; sleep, then refresh keepalive's
+            # last_active so Dispatcharr's ghost detector doesn't remove it.
+            _gv.sleep(1.0)
+            try:
+                import time as _t_ka
+                _mgr_ka = proxy_server.client_managers.get(channel_id)
+                if _mgr_ka and _mgr_ka.redis_client:
+                    _mgr_ka.redis_client.hset(
+                        f"live:channel:{channel_id}:clients:{cid}",
+                        "last_active", str(_t_ka.time()),
+                    )
+            except Exception:
+                pass
+            continue
+
+        # refs == 0: no streaming consumer — drain to keep last_active fresh.
+        buf = proxy_server.get_buffer(channel_id)
+        if buf is None:
+            _gv.sleep(0.5)
+            continue
+
+        mgr = proxy_server.client_managers.get(channel_id)
+        if mgr is None:
+            _gv.sleep(0.5)
+            continue
+
+        # Re-register if StreamGenerator._cleanup() removed the slot last iteration.
+        mgr.add_client(cid, "127.0.0.1", "multiview-keepalive", None, "mpegts", None)
+
+        try:
+            gen = _SG(
+                channel_id=channel_id,
+                client_id=cid,
+                client_ip="127.0.0.1",
+                client_user_agent="multiview-keepalive",
+                channel_initializing=False,
+                buffer=buf,
+            )
+            for _chunk in gen.generate():
+                _gv.sleep(0)
+                entry = _mv_keepalives.get(channel_id)
+                if entry is None or entry[0] != cid:
+                    return
+                if entry[2] > 0:
+                    # Streaming client reconnected; stop draining.
+                    break
+        except Exception:
+            _gv.sleep(0.1)
+
+
+def _mv_keepalive_release(channel_id: str) -> None:
+    """Decrement ref-count; TTL starts counting when it reaches zero."""
+    import time as _t
+    if channel_id in _mv_keepalives:
+        cid, _, refs, drainer = _mv_keepalives[channel_id]
+        _mv_keepalives[channel_id] = (cid, _t.time(), max(0, refs - 1), drainer)
+
+
+def _mv_keepalive_cleanup(proxy_server, ttl: float = 30.0) -> None:
+    """Remove keepalive clients idle (ref_count==0) longer than ttl seconds.
+    Kills drainer greenlet and removes Dispatcharr client slot."""
+    import time as _t
+    now = _t.time()
+    stale = [
+        u for u, (_, last, refs, _drainer) in list(_mv_keepalives.items())
+        if refs == 0 and now - last > ttl
+    ]
+    for uid in stale:
+        entry = _mv_keepalives.pop(uid, None)
+        if entry:
+            cid, _, _, drainer = entry
+            try:
+                if drainer is not None:
+                    drainer.kill(block=False)
+            except Exception:
+                pass
+            try:
+                mgr = proxy_server.client_managers.get(uid)
+                if mgr:
+                    mgr.remove_client(cid)
+                    logger.info(f"Keepalive expired and removed for {uid}")
+            except Exception:
+                pass
+
+
+def _mv_keepalive_shutdown(proxy_server) -> None:
+    """Kill all drainer greenlets and remove all keepalive clients immediately.
+    Called when the multiview composition stops to avoid channels lingering."""
+    entries = list(_mv_keepalives.items())
+    _mv_keepalives.clear()
+    for uid, (cid, _, _, drainer) in entries:
+        try:
+            if drainer is not None:
+                drainer.kill(block=False)
+        except Exception:
+            pass
+        try:
+            mgr = proxy_server.client_managers.get(uid)
+            if mgr:
+                mgr.remove_client(cid)
+                logger.info(f"Keepalive shutdown: removed {uid}")
+        except Exception:
+            pass
+
 
 def _python_exe() -> str:
     """Path to a real python interpreter for the worker process.
@@ -174,7 +342,10 @@ class MultiviewServer:
     # --------------------------------------------------------------- handlers
 
     def _serve_stream(self, n: int, start_response):
-        logger.info(f"Stream request: layout {n}")
+        # BRICK 2: real composition ffmpeg with per-channel HTTP inputs.
+        # No pre-warm yet — channels start via per-channel endpoint on demand.
+        logger.info(f"Stream request: layout {n} (brick-2 composition)")
+
         try:
             tiles, layout, audio_source = self._resolve_layout(n)
         except LookupError as e:
