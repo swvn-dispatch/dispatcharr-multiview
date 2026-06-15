@@ -1,22 +1,19 @@
-"""Multiview streaming server.
+"""Multiview streaming server — Phase 1.
 
-Runs a lightweight gevent WSGI server. Each /stream/{n} request spawns an
-ffmpeg subprocess that tiles the configured channels and pipes MPEG-TS output
-back to the client. The subprocess is killed when the client disconnects.
-Zero ffmpeg processes run when nobody is watching.
+Phase 1: main composite stream with a lavfi placeholder per channel slot.
+         The composition ffmpeg starts and streams immediately; channels show
+         a "Loading..." tile until Phase 2 replaces them with real streams.
 
-Each channel is opened via Dispatcharr's ProxyServer internal API so that
-full fallback/profile behaviour is respected and connections appear in the
-Dispatcharr stats view with user-agent "multiview-plugin".
+Phase 2 (future): per-channel endpoint switches from lavfi placeholder to a
+                  real Dispatcharr channel stream.
 
 Routes:
   GET /health              Health check
   GET /stream/{n}          MPEG-TS multiview stream for layout n (1-based)
-  GET /internal/ch/{uuid}  Internal per-channel TS feed consumed by ffmpeg
+  GET /internal/ch/{uuid}  Single-channel lavfi placeholder (Phase 1)
 """
 
 import logging
-import math
 import os
 import re
 import socket
@@ -28,182 +25,12 @@ from . import layouts as _layouts
 
 logger = logging.getLogger(__name__)
 
-# MPEG-TS null packets (PID 0x1FFF): transparent to every decoder,
-# used to keep the connection alive between placeholder end and real start.
-_NULL_TS_BURST = (bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes(184)) * 7
+CHUNK_SIZE = 65536
 
 _server_instance = None
 
-# ---------------------------------------------------------------------------
-# Keepalive registry
-#
-# When the composition ffmpeg disconnects (Dispatcharr health timeout,
-# client closes stream, etc.) we want the child Dispatcharr channels to
-# survive long enough for the next connection attempt to reuse them instead
-# of restarting from scratch.  Each child channel gets one "keepalive"
-# client registered with Dispatcharr that is *not* tied to an HTTP
-# connection. The background cleanup greenlet (spawned per composition
-# stream) removes it after TTL seconds of inactivity.
-# ---------------------------------------------------------------------------
-_mv_keepalives: dict = {}   # uuid → (client_id, last_release_at, ref_count, drainer_greenlet)
-# ref_count > 0  → streaming consumer active; drainer sleeps, TTL paused
-# ref_count == 0 → no consumer; drainer runs to prevent ghost-removal, TTL counts down
 
-
-def _mv_keepalive_ensure(channel_id: str, proxy_server) -> "str | None":
-    """Register keepalive client (if absent), increment ref-count, and spawn drainer."""
-    import time as _t
-    import uuid as _u
-    if channel_id in _mv_keepalives:
-        cid, last, refs, drainer = _mv_keepalives[channel_id]
-        _mv_keepalives[channel_id] = (cid, last, refs + 1, drainer)
-        return cid
-    mgr = proxy_server.client_managers.get(channel_id)
-    if mgr is None:
-        return None
-    cid = str(_u.uuid4())
-    try:
-        if mgr.add_client(cid, "127.0.0.1", "multiview-keepalive", None, "mpegts", None):
-            drainer = None
-            try:
-                import gevent as _gv_ka
-                drainer = _gv_ka.spawn(_mv_keepalive_drain, channel_id, cid, proxy_server)
-            except Exception:
-                pass
-            _mv_keepalives[channel_id] = (cid, _t.time(), 1, drainer)
-            logger.info(f"Keepalive registered for {channel_id}")
-            return cid
-    except Exception as e:
-        logger.warning(f"Keepalive register failed for {channel_id}: {e}")
-    return None
-
-
-def _mv_keepalive_drain(channel_id: str, cid: str, proxy_server) -> None:
-    """Background greenlet: drain data for the keepalive client to prevent
-    Dispatcharr ghost-removal (last_active must stay fresh).
-
-    Only runs a StreamGenerator when ref_count == 0 (no active streaming
-    consumer).  While the streaming client is connected, it sleeps cheaply —
-    the streaming client's own generator keeps last_active current."""
-    try:
-        import gevent as _gv
-        from apps.proxy.live_proxy.output.ts.generator import StreamGenerator as _SG
-    except ImportError:
-        return
-
-    while True:
-        entry = _mv_keepalives.get(channel_id)
-        if entry is None or entry[0] != cid:
-            return
-
-        _, _, refs, _ = entry
-        if refs > 0:
-            # Streaming client is active; sleep, then refresh keepalive's
-            # last_active so Dispatcharr's ghost detector doesn't remove it.
-            _gv.sleep(1.0)
-            try:
-                import time as _t_ka
-                _mgr_ka = proxy_server.client_managers.get(channel_id)
-                if _mgr_ka and _mgr_ka.redis_client:
-                    _mgr_ka.redis_client.hset(
-                        f"live:channel:{channel_id}:clients:{cid}",
-                        "last_active", str(_t_ka.time()),
-                    )
-            except Exception:
-                pass
-            continue
-
-        # refs == 0: no streaming consumer — drain to keep last_active fresh.
-        buf = proxy_server.get_buffer(channel_id)
-        if buf is None:
-            _gv.sleep(0.5)
-            continue
-
-        mgr = proxy_server.client_managers.get(channel_id)
-        if mgr is None:
-            _gv.sleep(0.5)
-            continue
-
-        # Re-register if StreamGenerator._cleanup() removed the slot last iteration.
-        mgr.add_client(cid, "127.0.0.1", "multiview-keepalive", None, "mpegts", None)
-
-        try:
-            gen = _SG(
-                channel_id=channel_id,
-                client_id=cid,
-                client_ip="127.0.0.1",
-                client_user_agent="multiview-keepalive",
-                channel_initializing=False,
-                buffer=buf,
-            )
-            for _chunk in gen.generate():
-                _gv.sleep(0)
-                entry = _mv_keepalives.get(channel_id)
-                if entry is None or entry[0] != cid:
-                    return
-                if entry[2] > 0:
-                    # Streaming client reconnected; stop draining.
-                    break
-        except Exception:
-            _gv.sleep(0.1)
-
-
-def _mv_keepalive_release(channel_id: str) -> None:
-    """Decrement ref-count; TTL starts counting when it reaches zero."""
-    import time as _t
-    if channel_id in _mv_keepalives:
-        cid, _, refs, drainer = _mv_keepalives[channel_id]
-        _mv_keepalives[channel_id] = (cid, _t.time(), max(0, refs - 1), drainer)
-
-
-def _mv_keepalive_cleanup(proxy_server, ttl: float = 30.0) -> None:
-    """Remove keepalive clients idle (ref_count==0) longer than ttl seconds.
-    Kills drainer greenlet and removes Dispatcharr client slot."""
-    import time as _t
-    now = _t.time()
-    stale = [
-        u for u, (_, last, refs, _drainer) in list(_mv_keepalives.items())
-        if refs == 0 and now - last > ttl
-    ]
-    for uid in stale:
-        entry = _mv_keepalives.pop(uid, None)
-        if entry:
-            cid, _, _, drainer = entry
-            try:
-                if drainer is not None:
-                    drainer.kill(block=False)
-            except Exception:
-                pass
-            try:
-                mgr = proxy_server.client_managers.get(uid)
-                if mgr:
-                    mgr.remove_client(cid)
-                    logger.info(f"Keepalive expired and removed for {uid}")
-            except Exception:
-                pass
-
-
-def _mv_keepalive_shutdown(proxy_server) -> None:
-    """Kill all drainer greenlets and remove all keepalive clients immediately.
-    Called when the multiview composition stops to avoid channels lingering."""
-    entries = list(_mv_keepalives.items())
-    _mv_keepalives.clear()
-    for uid, (cid, _, _, drainer) in entries:
-        try:
-            if drainer is not None:
-                drainer.kill(block=False)
-        except Exception:
-            pass
-        try:
-            mgr = proxy_server.client_managers.get(uid)
-            if mgr:
-                mgr.remove_client(cid)
-                logger.info(f"Keepalive shutdown: removed {uid}")
-        except Exception:
-            pass
-
-
-def get_server() -> "MultiviewServer | None":
+def get_server():
     return _server_instance
 
 
@@ -212,7 +39,15 @@ def set_server(s):
     _server_instance = s
 
 
-def _log_stderr(proc, label):
+def _kill_proc(proc) -> None:
+    try:
+        proc.kill()
+        proc.wait()
+    except Exception:
+        pass
+
+
+def _log_stderr(proc, label: str) -> None:
     try:
         for raw in proc.stderr:
             line = raw.decode("utf-8", errors="replace").rstrip()
@@ -222,19 +57,7 @@ def _log_stderr(proc, label):
         pass
 
 
-def _usable_logo(url: str | None) -> str | None:
-    """Return url only if it's a local file path that exists on disk."""
-    if url and url.startswith("/"):
-        try:
-            if os.path.isfile(url):
-                return url
-        except Exception:
-            pass
-    return None
-
-
 def _lang_code(name: str) -> str:
-    """Derive a 3-char lowercase language tag from a channel name for MPEG-TS PMT."""
     name = re.sub(r'^[A-Z0-9]{2,5}\s*[|–—-]\s*', '', name)
     clean = "".join(c for c in name if c.isalnum() or c == " ").strip()
     words = clean.split()
@@ -248,10 +71,6 @@ def _lang_code(name: str) -> str:
 
 
 def _deduplicate_lang_codes(names: list[str]) -> list[str]:
-    """Return lang codes for names, replacing the 3rd char with a 1-based index for duplicates.
-
-    e.g. ['TSN 1', 'TSN 2', 'TSN 3'] -> ['ts1', 'ts2', 'ts3']
-    """
     raw = [_lang_code(n) for n in names]
     counts: dict[str, int] = {}
     for c in raw:
@@ -275,33 +94,18 @@ def _parse_resolution(settings: dict) -> tuple[int, int]:
         return 1920, 1080
 
 
-def _kill_proc(proc) -> None:
-    try:
-        proc.kill()
-        proc.wait()
-    except Exception:
-        pass
-
-
-def _gevent_sleep():
-    try:
-        import gevent
-        return gevent.sleep
-    except ImportError:
-        import time
-        return time.sleep
-
-
-def _gevent_popen():
-    try:
-        import gevent.subprocess as _gsp
-        return _gsp.Popen
-    except ImportError:
-        return subprocess.Popen
+def _usable_logo(url) -> "str | None":
+    """Return url only if it's a local file path that exists on disk."""
+    if url and isinstance(url, str) and url.startswith("/"):
+        try:
+            if os.path.isfile(url):
+                return url
+        except Exception:
+            pass
+    return None
 
 
 def _audio_metadata_args(audio_source: str, channel_names: list[str], n: int) -> list:
-    """Return -metadata:s:a:i args for audio track title and language."""
     args = []
     if audio_source == "all":
         lang_codes = _deduplicate_lang_codes(channel_names or [])
@@ -318,267 +122,6 @@ def _audio_metadata_args(audio_source: str, channel_names: list[str], n: int) ->
     return args
 
 
-def _single_channel_placeholder_gen(channel_id, channel_name: str, logo_url, proxy_server, stop_event=None, max_duration=None):
-    """Yield MPEG-TS logo placeholder until channel_id's buffer is available again.
-
-    If stop_event is provided, exits when that event is set rather than polling the buffer.
-    If max_duration (seconds) is provided, exits after that time regardless of buffer state.
-    """
-    import time as _t_ph
-    _Popen = _gevent_popen()
-    _deadline = (_t_ph.monotonic() + max_duration) if max_duration is not None else None
-
-    usable = _usable_logo(logo_url)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-           "-re",
-           "-f", "lavfi", "-i", "color=c=black:size=320x180:r=30000/1001",
-           "-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
-    if usable:
-        cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", usable]
-        filter_complex = (
-            "[2:v]scale=60:60:force_original_aspect_ratio=decrease,setsar=1[logo];"
-            "[0:v][logo]overlay=x=(W-w)/2:y=(H-h)/2[v]"
-        )
-        cmd += ["-filter_complex", filter_complex, "-map", "[v]"]
-    else:
-        cmd += ["-map", "0:v"]
-    cmd += [
-        "-map", "1:a",
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-c:a", "ac3",
-        "-metadata:s:a:0", f"title={channel_name}",
-        "-metadata:s:a:0", f"language={_lang_code(channel_name)}",
-        "-f", "mpegts", "pipe:1",
-    ]
-
-    proc = _Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try:
-        while True:
-            chunk = proc.stdout.read(32768)
-            if not chunk:
-                break
-            yield chunk
-            if _deadline is not None and _t_ph.monotonic() >= _deadline:
-                break
-            if stop_event is not None:
-                if stop_event.is_set():
-                    break
-            elif proxy_server.get_buffer(channel_id) is not None:
-                break
-    finally:
-        _kill_proc(proc)
-
-
-def _build_placeholder_cmd(
-    channel_names: list[str],
-    logo_urls: list[str | None],
-    layout: str,
-    out_w: int,
-    out_h: int,
-    audio_source: str = "0",
-) -> list[str]:
-    n = len(channel_names)
-
-    if layout == "featured":
-        main_w, main_h, side_w, side_h, positions = _layouts._featured_layout(n, out_w, out_h)
-        tile_sizes = [(main_w, main_h)] + [(side_w, side_h)] * (n - 1)
-    elif layout == "top_featured":
-        main_w, main_h, tile_w, bottom_h, positions = _layouts._top_featured_layout(n, out_w, out_h)
-        tile_sizes = [(main_w, main_h)] + [(tile_w, bottom_h)] * (n - 1)
-    else:
-        cols = math.ceil(math.sqrt(n))
-        rows = math.ceil(n / cols)
-        tile_w = out_w // cols
-        tile_h = out_h // rows
-        tile_sizes = [(tile_w, tile_h)] * n
-        positions = _layouts._centered_grid_positions(n, cols, rows, tile_w, tile_h)
-
-    # Determine which tiles have usable local logos
-    usable = [_usable_logo(u) for u in logo_urls]
-
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-    for tw, th in tile_sizes:
-        cmd += ["-f", "lavfi", "-i", f"color=c=black:size={tw}x{th}:r=30000/1001"]
-    audio_count = n if audio_source == "all" else 1
-    for _ in range(audio_count):
-        cmd += ["-f", "lavfi", "-i", "aevalsrc=0:sample_rate=48000:channel_layout=stereo"]
-
-    # Add logo file inputs and track their indices.
-    # -loop 1 makes ffmpeg loop the still image for the full -t duration;
-    # without it the image is a single-frame stream and the overlay pipeline
-    # terminates after ~1 frame.
-    logo_input_idx: dict[int, int] = {}
-    next_idx = n + audio_count
-    for i, logo_path in enumerate(usable):
-        if logo_path:
-            cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
-            logo_input_idx[i] = next_idx
-            next_idx += 1
-
-    filter_parts = []
-    for i, (tw, th) in enumerate(tile_sizes):
-        logo_idx = logo_input_idx.get(i)
-        if logo_idx is not None:
-            logo_size = min(tw, th) // 3
-            filter_parts.append(
-                f"[{logo_idx}:v]scale={logo_size}:{logo_size}"
-                f":force_original_aspect_ratio=decrease,setsar=1[ls{i}];"
-                f"[{i}:v][ls{i}]overlay=x=(W-w)/2:y=(H-h)/2[t{i}]"
-            )
-        else:
-            filter_parts.append(f"[{i}:v]copy[t{i}]")
-
-    inputs_str = "".join(f"[t{i}]" for i in range(n))
-    xstack = f"{inputs_str}xstack=inputs={n}:layout={'|'.join(positions)}:fill=black[v]"
-    font_size = max(24, out_h // 30)
-    filter_complex = (
-        "; ".join(filter_parts) + "; " + xstack
-        + f"; [v]drawtext=text='Starting up...':fontcolor=white:fontsize={font_size}"
-          f":x=(w-text_w)/2:y=h-th-20:box=1:boxcolor=black@0.7:boxborderw=8[vo]"
-    )
-
-    cmd += [
-        "-filter_complex", filter_complex,
-        "-map", "[vo]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-    ]
-
-    if audio_source == "all":
-        for i in range(n):
-            cmd += ["-map", f"{n + i}:a"]
-        cmd += ["-c:a", "ac3"]
-    else:
-        audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
-        audio_idx = max(0, min(audio_idx, n - 1))
-        cmd += ["-map", f"{n}:a", "-c:a", "ac3"]
-    cmd += _audio_metadata_args(audio_source, channel_names, n)
-
-    cmd += [
-        "-t", str(max(5, n * 4)),
-        "-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity",
-        "-f", "mpegts", "pipe:1",
-    ]
-    return cmd
-
-
-def _build_ffmpeg_cmd(
-    input_urls: list[str],
-    layout: str,
-    settings: dict,
-    audio_source: str = "0",
-    channel_names: list[str] | None = None,
-) -> list[str]:
-    n = len(input_urls)
-
-    out_w, out_h = _parse_resolution(settings)
-    bitrate      = int(settings.get("output_bitrate") or 8000)
-    crf          = int(settings.get("output_crf") or 23)
-    preset       = settings.get("encoder_preset") or "ultrafast"
-    encoder      = settings.get("video_encoder") or "libx264"
-    vaapi_device = settings.get("vaapi_device") or "/dev/dri/renderD128"
-
-    if encoder == "h264_vaapi":
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-               "-vaapi_device", vaapi_device]
-    else:
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-
-    for url in input_urls:
-        cmd += [
-            "-f", "mpegts",
-            "-use_wallclock_as_timestamps", "1",
-            "-fflags", "+discardcorrupt+genpts+nobuffer",
-            "-analyzeduration", "100000",
-            "-probesize", "32768",
-            "-thread_queue_size", "1024",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-i", url,
-        ]
-
-    if layout == "featured":
-        filter_complex, map_args = _layouts._featured_filter(n, out_w, out_h)
-    elif layout == "top_featured":
-        filter_complex, map_args = _layouts._top_featured_filter(n, out_w, out_h)
-    else:
-        filter_complex, map_args = _layouts._auto_grid_filter(n, out_w, out_h)
-
-    if encoder == "h264_vaapi":
-        filter_complex = filter_complex.replace("[v]", "[vraw]", 1)
-        filter_complex += "; [vraw]hwupload,format=vaapi[v]"
-
-    cmd += ["-filter_complex", filter_complex]
-    cmd += map_args
-
-    _NVENC_VALID_PRESETS = {"p1", "p2", "p3", "p4", "p5", "p6", "p7"}
-    if encoder == "h264_nvenc":
-        nvenc_preset = preset if preset in _NVENC_VALID_PRESETS else "p1"
-        cmd += [
-            "-c:v", "h264_nvenc",
-            "-preset", nvenc_preset,
-            "-tune", "ll",
-            "-rc", "vbr",
-            "-cq", str(crf),
-            "-maxrate", f"{bitrate}k",
-            "-bufsize", f"{bitrate * 2}k",
-            "-g", "60", "-keyint_min", "60",
-        ]
-    elif encoder == "h264_qsv":
-        _qsv_valid = {"veryfast", "faster", "fast", "medium", "slow"}
-        qsv_preset = preset if preset in _qsv_valid else "veryfast"
-        cmd += [
-            "-c:v", "h264_qsv",
-            "-preset", qsv_preset,
-            "-global_quality", str(crf),
-            "-b:v", f"{bitrate}k",
-            "-maxrate", f"{bitrate}k",
-            "-bufsize", f"{bitrate * 2}k",
-            "-g", "60", "-low_power", "1",
-        ]
-    elif encoder == "h264_vaapi":
-        cmd += [
-            "-c:v", "h264_vaapi",
-            "-b:v", f"{bitrate}k",
-            "-maxrate", f"{bitrate}k",
-            "-bufsize", f"{bitrate * 2}k",
-            "-g", "60",
-        ]
-    else:  # libx264
-        _x264_valid = {"ultrafast", "superfast", "veryfast", "faster", "fast",
-                       "medium", "slow", "slower", "veryslow", "placebo"}
-        x264_preset = preset if preset in _x264_valid else "ultrafast"
-        cmd += [
-            "-c:v", "libx264",
-            "-preset", x264_preset,
-            "-tune", "zerolatency",
-            "-level:v", "5.1",
-            "-crf", str(crf),
-            "-maxrate", f"{bitrate}k",
-            "-bufsize", f"{bitrate * 2}k",
-            "-g", "60", "-keyint_min", "60",
-            "-sc_threshold", "0",
-            "-force_key_frames", "expr:gte(t,n_forced*2)",
-        ]
-
-    if audio_source == "all":
-        for i in range(n):
-            cmd += ["-map", f"{i}:a?"]
-        cmd += ["-c:a", "ac3", "-af", "aresample=async=1000"]
-    else:
-        audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
-        audio_idx = max(0, min(audio_idx, n - 1))
-        cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3", "-af", "aresample=async=1000"]
-    cmd += _audio_metadata_args(audio_source, channel_names or [], n)
-
-    cmd += ["-max_muxing_queue_size", "1024"]
-    cmd += ["-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity"]
-    cmd += ["-f", "mpegts", "pipe:1"]
-    return cmd
-
-
-# Server
-
 class MultiviewServer:
     def __init__(self, host: str, port: int):
         self.host = host
@@ -586,8 +129,6 @@ class MultiviewServer:
         self._server = None
         self._greenlet = None
         self.running = False
-
-    # WSGI
 
     def wsgi_app(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
@@ -606,15 +147,13 @@ class MultiviewServer:
 
         if path.startswith("/internal/ch/"):
             channel_id = path[len("/internal/ch/"):]
-            return self._serve_channel_internal(channel_id, start_response)
+            return self._serve_channel(channel_id, start_response)
 
         start_response("404 Not Found", [("Content-Type", "text/plain")])
         return [b"Not Found\n"]
 
     def _serve_stream(self, n: int, start_response):
-        # BRICK 2: real composition ffmpeg with per-channel HTTP inputs.
-        # No pre-warm yet — channels start via per-channel endpoint on demand.
-        logger.info(f"Stream request: layout {n} (brick-2 composition)")
+        logger.info(f"Stream request: layout {n}")
 
         try:
             input_urls, layout, channel_names, logo_urls, audio_source = self._resolve_layout(n)
@@ -628,389 +167,104 @@ class MultiviewServer:
 
         try:
             from apps.plugins.models import PluginConfig
-            enc_settings = PluginConfig.objects.get(key="multiview").settings
+            settings = PluginConfig.objects.get(key="multiview").settings
         except Exception:
-            enc_settings = {}
+            settings = {}
 
-        try:
-            import gevent as _gevent
-            import gevent.subprocess as _gsp
-            import gevent.event as _gevent_event
-            _Popen = _gsp.Popen
-        except ImportError:
-            _Popen = subprocess.Popen
-            _gevent = None
-            _gevent_event = None
+        cmd = self._build_composition_cmd(input_urls, layout, settings, audio_source, channel_names)
+        logger.info(f"Starting composition ffmpeg: {len(input_urls)} inputs, layout={layout}")
 
-        # Sequential channel init: start each child channel one at a time
-        # (0.5 s stagger) so we don't thundering-herd Dispatcharr at startup
-        # or on retry.  Runs in the background so composition ffmpeg can begin
-        # serving placeholder TS immediately — channels join the grid as they
-        # become ready.
-        try:
-            from apps.proxy.live_proxy.server import ProxyServer as _PSInit
-            _ps_init = _PSInit.get_instance()
-        except Exception:
-            _ps_init = None
-
-        _cleanup_greenlet = None
-        if _gevent:
-            import threading as _threading_init
-            def _init_channels_sequential():
-                for _url in input_urls:
-                    _uid = _url.rsplit("/", 1)[-1]
-                    try:
-                        # Native thread: blocking Django/socket calls inside
-                        # _ensure_channel_initialized won't freeze the gevent
-                        # event loop (which would starve stream_gen placeholders).
-                        t = _threading_init.Thread(
-                            target=self._ensure_channel_initialized,
-                            args=(_uid,),
-                            daemon=True,
-                        )
-                        t.start()
-                    except Exception as _e:
-                        logger.warning(f"Sequential init error {_uid}: {_e}")
-                    _gevent.sleep(0.5)
-
-            _gevent.spawn(_init_channels_sequential)
-
-            if _ps_init is not None:
-                def _cleanup_loop():
-                    while True:
-                        _gevent.sleep(5)
-                        try:
-                            _mv_keepalive_cleanup(_ps_init)
-                        except Exception:
-                            pass
-
-                _cleanup_greenlet = _gevent.spawn(_cleanup_loop)
-
-        cmd = _build_ffmpeg_cmd(input_urls, layout, enc_settings, audio_source, channel_names)
-        logger.info(f"multiview composition cmd: {' '.join(cmd)}")
-
-        proc = _Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        if _gevent:
-            _gevent.spawn(_log_stderr, proc, f"layout={n}")
-        else:
-            threading.Thread(target=_log_stderr, args=(proc, f"layout={n}"),
-                             daemon=True).start()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        threading.Thread(target=_log_stderr, args=(proc, f"composition-{n}"), daemon=True).start()
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
-            ("Transfer-Encoding", "chunked"),
+            ("X-Accel-Buffering", "no"),
         ])
 
         def stream_gen():
-            bytes_sent = 0
-            logger.info(f"multiview stream_gen started for layout={n}")
             try:
                 while True:
-                    chunk = proc.stdout.read(65536)
+                    chunk = proc.stdout.read(CHUNK_SIZE)
                     if not chunk:
-                        logger.warning(f"multiview ffmpeg exited after {bytes_sent:,} bytes")
                         break
-                    if bytes_sent == 0:
-                        logger.info(f"multiview first chunk: {len(chunk)} bytes")
-                    bytes_sent += len(chunk)
                     yield chunk
             except GeneratorExit:
                 pass
             finally:
                 _kill_proc(proc)
-                if _cleanup_greenlet is not None:
-                    try:
-                        _cleanup_greenlet.kill(block=False)
-                    except Exception:
-                        pass
-                if _ps_init is not None:
-                    try:
-                        _mv_keepalive_shutdown(_ps_init)
-                    except Exception:
-                        pass
-                logger.info(f"multiview terminated after {bytes_sent:,} bytes")
+                logger.info(f"Composition stream {n} ended, ffmpeg killed")
 
         return stream_gen()
 
-    def _ensure_channel_initialized(self, channel_id: str) -> bool:
-        """Initialize a channel via ProxyServer and wait for its buffer. Returns True if started fresh."""
-        try:
-            from django.db import close_old_connections
-            close_old_connections()
-        except Exception:
-            pass
-
-        try:
-            from apps.proxy.live_proxy.server import ProxyServer
-            from apps.proxy.live_proxy.services.channel_service import ChannelService
-            from apps.proxy.live_proxy.url_utils import generate_stream_url
-            from apps.channels.models import Channel
-        except ImportError as e:
-            logger.error(f"Import error in _ensure_channel_initialized: {e}")
-            return False
-
-        try:
-            proxy_server = ProxyServer.get_instance()
-        except Exception as e:
-            logger.error(f"Could not get ProxyServer instance: {e}")
-            return False
-
-        if not proxy_server.check_if_channel_exists(channel_id):
-            stream_url, stream_ua, transcode, profile_value, _slot_reserved, _err = generate_stream_url(channel_id)
-            if not stream_url:
-                logger.warning(f"No stream available for channel {channel_id}: {_err}")
-                return False
-
-            stream_id = m3u_profile_id = None
-            if proxy_server.redis_client:
-                try:
-                    ch = Channel.objects.get(uuid=channel_id)
-                    raw = proxy_server.redis_client.get(f"channel_stream:{ch.id}")
-                    if raw:
-                        stream_id = int(raw)
-                        raw2 = proxy_server.redis_client.get(f"stream_profile:{stream_id}")
-                        if raw2:
-                            m3u_profile_id = int(raw2)
-                except Exception as e:
-                    logger.warning(f"Could not read stream assignment from Redis: {e}")
-
-            success = ChannelService.initialize_channel(
-                channel_id, stream_url, stream_ua, transcode,
-                profile_value, stream_id, m3u_profile_id,
-            )
-            if not success:
-                logger.error(f"Failed to initialize channel {channel_id}")
-                return False
-
-            return True
-        else:
-            logger.info(f"Channel {channel_id} already running, attaching directly")
-            return False
-
-    def _serve_channel_internal(self, channel_id: str, start_response):
-        """Internal endpoint consumed by ffmpeg. Opens the channel through ProxyServer."""
+    def _serve_channel(self, channel_id: str, start_response):
         try:
             _uuid_module.UUID(channel_id)
         except ValueError:
             start_response("400 Bad Request", [("Content-Type", "text/plain")])
-            return [b"Invalid channel UUID\n"]
+            return [b"Invalid channel ID\n"]
 
-        logger.info(f"Internal channel request: {channel_id}")
-
-        try:
-            from apps.proxy.live_proxy.server import ProxyServer
-            from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
-        except ImportError as e:
-            logger.error(f"Import error in _serve_channel_internal: {e}")
-            start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
-            return [b"Server error\n"]
-
-        try:
-            proxy_server = ProxyServer.get_instance()
-        except Exception as e:
-            logger.error(f"Could not get ProxyServer instance: {e}")
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Proxy server unavailable\n"]
-
-        # Look up channel metadata for placeholder
-        channel_name = channel_id
-        logo_url = None
+        logo_path = None
         try:
             from apps.channels.models import Channel
-            ch_obj = Channel.objects.select_related("logo").get(uuid=channel_id)
-            channel_name = ch_obj.name
-            logo_url = ch_obj.logo.url if ch_obj.logo_id is not None else None
+            ch = Channel.objects.select_related("logo").get(uuid=channel_id)
+            if ch.logo_id is not None:
+                logo_path = _usable_logo(ch.logo.url)
         except Exception:
             pass
 
-        # Respond immediately so ffmpeg can start probing this input right away.
-        # Channel initialization runs in the background; stream_gen() serves
-        # the per-channel logo placeholder until the buffer becomes available.
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-f", "lavfi", "-i", "color=c=black:size=640x360:rate=30000/1001",
+            "-f", "lavfi", "-i", "aevalsrc=0:channel_layout=stereo:sample_rate=48000",
+        ]
+
+        if logo_path:
+            cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
+            logo_size = 120
+            cmd += [
+                "-filter_complex",
+                f"[2:v]scale={logo_size}:{logo_size}:force_original_aspect_ratio=decrease,setsar=1[logo];"
+                "[0:v][logo]overlay=x=(W-w)/2:y=(H-h)/2[v]",
+                "-map", "[v]",
+            ]
+        else:
+            cmd += [
+                "-vf", "drawtext=text=Loading...:fontcolor=white:fontsize=28:x=(w-tw)/2:y=(h-th)/2",
+                "-map", "0:v",
+            ]
+
+        cmd += [
+            "-map", "1:a",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-c:a", "ac3", "-b:a", "192k",
+            "-f", "mpegts", "pipe:1",
+        ]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
-            ("Transfer-Encoding", "chunked"),
+            ("X-Accel-Buffering", "no"),
         ])
 
-        try:
-            import threading as _threading_ch
-            _threading_ch.Thread(
-                target=self._ensure_channel_initialized,
-                args=(channel_id,),
-                daemon=True,
-            ).start()
-        except Exception as e:
-            logger.warning(f"Channel init thread error {channel_id}: {e}")
-
-        _sleep = _gevent_sleep()
-
         def stream_gen():
-            _active_client = False
-            _current_client_id = None
-            _keepalive_acquired = False  # ensure/release called at most once per connection
-            _stale_count = 0            # consecutive stale retries for backoff
             try:
                 while True:
-                    buf = proxy_server.get_buffer(channel_id)
-
-                    if buf is None:
-                        if _active_client:
-                            try:
-                                mgr = proxy_server.client_managers.get(channel_id)
-                                if mgr and _current_client_id:
-                                    mgr.remove_client(_current_client_id)
-                            except Exception:
-                                pass
-                            _active_client = False
-                            _current_client_id = None
-                        logger.info(f"Channel {channel_id} buffer gone, serving placeholder")
-                        yield from _single_channel_placeholder_gen(
-                            channel_id, channel_name, logo_url, proxy_server
-                        )
-                        logger.info(f"Channel {channel_id} buffer returned, resuming")
-                        _stale_count = 0
-                        continue
-
-                    if not _active_client:
-                        mgr = proxy_server.client_managers.get(channel_id)
-                        if mgr is None:
-                            # Buffer exists but client manager not ready yet (init still running).
-                            # Keep xstack fed with placeholder while we wait; do not check
-                            # buffer-availability exit path (stop_event != None disables it).
-                            class _NeverSet:
-                                def is_set(self): return False
-                            logger.info(f"Channel {channel_id} client manager not ready yet, serving placeholder")
-                            yield from _single_channel_placeholder_gen(
-                                channel_id, channel_name, logo_url, proxy_server,
-                                stop_event=_NeverSet(), max_duration=2.0,
-                            )
-                            continue
-                        _current_client_id = str(_uuid_module.uuid4())
-                        try:
-                            added = mgr.add_client(
-                                _current_client_id, "127.0.0.1", "multiview-plugin", None, "mpegts", None,
-                            )
-                            if not added:
-                                logger.warning(f"add_client returned False for {channel_id}, retrying")
-                                _sleep(0.5)
-                                continue
-                            _active_client = True
-                            logger.info(f"Registered client {_current_client_id} for {channel_id}")
-                            # Register keepalive exactly once per HTTP connection.
-                            # Subsequent stale retries re-use the same keepalive slot.
-                            if not _keepalive_acquired:
-                                _mv_keepalive_ensure(channel_id, proxy_server)
-                                _keepalive_acquired = True
-                        except Exception as e:
-                            logger.warning(f"add_client failed for {channel_id}: {e}")
-                            _sleep(0.5)
-                            continue
-
-                    gen = StreamGenerator(
-                        channel_id=channel_id,
-                        client_id=_current_client_id,
-                        client_ip="127.0.0.1",
-                        client_user_agent="multiview-plugin",
-                        channel_initializing=False,
-                        buffer=buf,
-                    )
-                    _gen_iter = gen.generate()
-                    _stale = False
-
-                    # Serve placeholder TS while waiting for the first real
-                    # chunk from StreamGenerator. A freshly initialized channel
-                    # needs 3-8 s to connect and fill its buffer; simply
-                    # blocking here would stall the HTTP response to ffmpeg.
-                    # We spawn a greenlet to fetch the first chunk and keep
-                    # yielding placeholder until it arrives (or 20 s expires).
-                    try:
-                        import gevent as _gv
-                        import gevent.event as _gv_event
-
-                        _stop_ph = _gv_event.Event()
-                        _first_box = [None]
-                        _first_ok = [False]
-
-                        def _get_first():
-                            try:
-                                _t2 = _gv.Timeout(20.0)
-                                _t2.start()
-                                try:
-                                    _first_box[0] = next(_gen_iter)
-                                    _first_ok[0] = True
-                                except _gv.Timeout:
-                                    logger.info(f"Channel {channel_id} timed out waiting for first chunk")
-                                except StopIteration:
-                                    pass
-                                finally:
-                                    _t2.cancel()
-                            except Exception as e:
-                                logger.warning(f"Channel {channel_id} first-chunk error: {e}")
-                            finally:
-                                _stop_ph.set()
-
-                        _fetcher = _gv.spawn(_get_first)
-                        try:
-                            yield from _single_channel_placeholder_gen(
-                                channel_id, channel_name, logo_url, proxy_server, _stop_ph
-                            )
-                        finally:
-                            _fetcher.kill(block=False)
-
-                        if _first_ok[0]:
-                            yield _first_box[0]
-                            try:
-                                yield from _gen_iter
-                            except GeneratorExit:
-                                return
-                            except Exception as e:
-                                logger.warning(f"StreamGenerator error for {channel_id}: {e}")
-                        else:
-                            _stale = True
-
-                    except ImportError:
-                        try:
-                            yield next(_gen_iter)
-                        except StopIteration:
-                            _stale = True
-
-                    # StreamGenerator._cleanup() removed our client
-                    _active_client = False
-                    _current_client_id = None
-                    if _stale:
-                        _stale_count += 1
-                        # Exponential backoff: 0.5s, 1s, 2s, 4s, capped at 8s.
-                        # Prevents hammering add_client (which triggers plugin discovery)
-                        # when the upstream source is dead or slow to reconnect.
-                        _backoff = min(0.5 * (2 ** (_stale_count - 1)), 8.0)
-                        logger.info(f"StreamGenerator stale for {channel_id} (retry {_stale_count}, backoff {_backoff:.1f}s)")
-                        yield from _single_channel_placeholder_gen(
-                            channel_id, channel_name, logo_url, proxy_server,
-                            max_duration=_backoff,
-                        )
-                    else:
-                        _stale_count = 0
-                        logger.info(f"StreamGenerator restarting for {channel_id}")
-                        _sleep(0.05)
+                    chunk = proc.stdout.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    yield chunk
+            except GeneratorExit:
+                pass
             finally:
-                if _active_client and _current_client_id:
-                    try:
-                        mgr = proxy_server.client_managers.get(channel_id)
-                        if mgr is not None:
-                            mgr.remove_client(_current_client_id)
-                            logger.info(f"Removed streaming client {_current_client_id} from {channel_id}")
-                    except Exception:
-                        pass
-                # Decrement ref-count exactly once per HTTP connection.
-                if _keepalive_acquired:
-                    _mv_keepalive_release(channel_id)
+                _kill_proc(proc)
 
         return stream_gen()
 
-    def _resolve_layout(self, n: int) -> tuple[list[str], str, list[str], list[str | None], str]:
-        """Return ([internal_channel_urls], layout_name, [channel_names], [logo_urls]) for layout n."""
+    def _resolve_layout(self, n: int):
         from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
 
@@ -1024,10 +278,9 @@ class MultiviewServer:
         layout = settings.get(f"multiview_{n}_layout", "auto")
         selector_type = settings.get(f"multiview_{n}_selector_type", "classic")
 
-        logger.info(f"Resolving layout {n}: ch_count={ch_count} style={layout} selector={selector_type}")
-        input_urls = []
-        channel_names = []
-        logo_urls = []
+        input_urls: list[str] = []
+        channel_names: list[str] = []
+        logo_urls: list = []
 
         if selector_type == "regex":
             pattern = settings.get(f"multiview_{n}_regex_pattern", "").strip()
@@ -1039,31 +292,26 @@ class MultiviewServer:
                 .order_by("channel_number")[:ch_count]
             )
             for ch in matched:
-                url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
-                logger.info(f"  regex match: name={ch.name!r} url={url}")
-                input_urls.append(url)
+                input_urls.append(f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}")
                 channel_names.append(ch.name)
                 try:
                     logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
                 except Exception:
                     logo_urls.append(None)
-            audio_source = settings.get(f"multiview_{n}_audio_source", "regex_first")
+            audio_source = settings.get(f"multiview_{n}_audio_source", "0")
             if audio_source in ("regex_first", "regex_lowest"):
-                audio_source = "0"  # both map to index 0 of the channel_number-sorted list
+                audio_source = "0"
         else:
             for m in range(1, ch_count + 1):
                 ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
                 if not ch_id_str or ch_id_str == "_none":
-                    logger.info(f"  channel {m}: skipped (not configured)")
                     continue
                 try:
                     ch = Channel.objects.select_related("logo").get(id=int(ch_id_str))
                 except Channel.DoesNotExist:
-                    logger.warning(f"  channel {m}: id={ch_id_str} not found, skipping")
+                    logger.warning(f"Layout {n} channel slot {m}: id={ch_id_str} not found, skipping")
                     continue
-                url = f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}"
-                logger.info(f"  channel {m}: id={ch_id_str} name={ch.name!r} url={url}")
-                input_urls.append(url)
+                input_urls.append(f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}")
                 channel_names.append(ch.name)
                 try:
                     logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
@@ -1076,9 +324,103 @@ class MultiviewServer:
                 f"Layout {n} needs at least 2 configured channels (found {len(input_urls)})"
             )
 
+        logger.info(f"Layout {n}: {len(input_urls)} channels, layout={layout}, audio={audio_source}")
         return input_urls, layout, channel_names, logo_urls, audio_source
 
-    # Lifecycle
+    def _build_composition_cmd(
+        self,
+        input_urls: list[str],
+        layout: str,
+        settings: dict,
+        audio_source: str,
+        channel_names: list[str],
+    ) -> list[str]:
+        n = len(input_urls)
+        out_w, out_h = _parse_resolution(settings)
+        bitrate = int(settings.get("output_bitrate") or 8000)
+        crf = int(settings.get("output_crf") or 23)
+        preset = settings.get("encoder_preset") or "ultrafast"
+        encoder = settings.get("video_encoder") or "libx264"
+        vaapi_device = settings.get("vaapi_device") or "/dev/dri/renderD128"
+
+        if encoder == "h264_vaapi":
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+                   "-vaapi_device", vaapi_device]
+        else:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+
+        for url in input_urls:
+            cmd += [
+                "-f", "mpegts",
+                "-use_wallclock_as_timestamps", "1",
+                "-fflags", "+discardcorrupt+genpts+nobuffer",
+                "-analyzeduration", "100000",
+                "-probesize", "32768",
+                "-thread_queue_size", "1024",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-i", url,
+            ]
+
+        if layout == "featured":
+            filter_complex, map_args = _layouts._featured_filter(n, out_w, out_h)
+        elif layout == "top_featured":
+            filter_complex, map_args = _layouts._top_featured_filter(n, out_w, out_h)
+        else:
+            filter_complex, map_args = _layouts._auto_grid_filter(n, out_w, out_h)
+
+        if encoder == "h264_vaapi":
+            filter_complex = filter_complex.replace("[v]", "[vraw]", 1)
+            filter_complex += "; [vraw]hwupload,format=vaapi[v]"
+
+        cmd += ["-filter_complex", filter_complex]
+        cmd += map_args
+
+        _NVENC_VALID = {"p1", "p2", "p3", "p4", "p5", "p6", "p7"}
+        _QSV_VALID = {"veryfast", "faster", "fast", "medium", "slow"}
+        _X264_VALID = {"ultrafast", "superfast", "veryfast", "faster", "fast",
+                       "medium", "slow", "slower", "veryslow", "placebo"}
+
+        if encoder == "h264_nvenc":
+            p = preset if preset in _NVENC_VALID else "p1"
+            cmd += ["-c:v", "h264_nvenc", "-preset", p, "-tune", "ll",
+                    "-rc", "vbr", "-cq", str(crf),
+                    "-maxrate", f"{bitrate}k", "-bufsize", f"{bitrate * 2}k",
+                    "-g", "60", "-keyint_min", "60"]
+        elif encoder == "h264_qsv":
+            p = preset if preset in _QSV_VALID else "veryfast"
+            cmd += ["-c:v", "h264_qsv", "-preset", p, "-global_quality", str(crf),
+                    "-b:v", f"{bitrate}k", "-maxrate", f"{bitrate}k",
+                    "-bufsize", f"{bitrate * 2}k", "-g", "60", "-low_power", "1"]
+        elif encoder == "h264_vaapi":
+            cmd += ["-c:v", "h264_vaapi",
+                    "-b:v", f"{bitrate}k", "-maxrate", f"{bitrate}k",
+                    "-bufsize", f"{bitrate * 2}k", "-g", "60"]
+        else:  # libx264
+            p = preset if preset in _X264_VALID else "ultrafast"
+            cmd += ["-c:v", "libx264", "-preset", p, "-tune", "zerolatency",
+                    "-level:v", "5.1", "-crf", str(crf),
+                    "-maxrate", f"{bitrate}k", "-bufsize", f"{bitrate * 2}k",
+                    "-g", "60", "-keyint_min", "60",
+                    "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)"]
+
+        if audio_source == "all":
+            for i in range(n):
+                cmd += ["-map", f"{i}:a?"]
+            cmd += ["-c:a", "ac3", "-af", "aresample=async=1000"]
+        else:
+            audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
+            audio_idx = max(0, min(audio_idx, n - 1))
+            cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3", "-af", "aresample=async=1000"]
+        cmd += _audio_metadata_args(audio_source, channel_names, n)
+
+        cmd += [
+            "-max_muxing_queue_size", "1024",
+            "-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity",
+            "-f", "mpegts", "pipe:1",
+        ]
+        return cmd
 
     def start(self) -> bool:
         if self.running:
