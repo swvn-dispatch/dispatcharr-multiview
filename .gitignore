@@ -2,6 +2,12 @@
 !.github
 !.gitignore
 
+# beads: track only the jsonl exports, everything else under .beads is local tooling
+!.beads
+.beads/*
+!.beads/*.jsonl
+# .agents/ and .codex/ are local agent tooling, kept ignored by the .* rule above
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -137,3 +143,9 @@ dmypy.json
 # Project specific
 *.zip
 README_OLD.md
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
