@@ -8,6 +8,10 @@
 !.beads/*.jsonl
 # .agents/ and .codex/ are local agent tooling, kept ignored by the .* rule above
 
+# agent instruction files stay local and untracked
+AGENTS.md
+CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

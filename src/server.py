@@ -1,27 +1,33 @@
-"""Multiview streaming server — Phase 1.
+"""Multiview streaming server.
 
-Phase 1: main composite stream with a lavfi placeholder per channel slot.
-         The composition ffmpeg starts and streams immediately; channels show
-         a "Loading..." tile until Phase 2 replaces them with real streams.
+Routes (gevent pywsgi on the plugin port):
 
-Phase 2 (future): per-channel endpoint switches from lavfi placeholder to a
-                  real Dispatcharr channel stream.
+  GET /health                      Health check
+  GET /stream/{n}                  Final multiview output for layout n (1-based).
+                                   Spawns the composition ffmpeg, which reads N
+                                   tile inputs below.
+  GET /internal/tile/{channel_id}  One always-on normalized tile: logo placeholder
+                                   spliced seamlessly to the live channel (see
+                                   pipeline.TilePipeline).
+  GET /internal/realsrc/{channel_id}
+                                   Raw live channel TS from Dispatcharr's proxy
+                                   (see dispatcharr.live_stream); read by the
+                                   tile's live encoder.
 
-Routes:
-  GET /health              Health check
-  GET /stream/{n}          MPEG-TS multiview stream for layout n (1-based)
-  GET /internal/ch/{uuid}  Single-channel lavfi placeholder (Phase 1)
+Design notes live in CLAUDE.md and ~/.claude/plans/indexed-mixing-moth.md. The
+multiview output is itself a Dispatcharr channel, so Dispatcharr's live proxy is
+the single client of /stream/{n} and fans out downstream; no client-sharing
+logic is needed here.
 """
 
 import logging
-import os
 import re
 import socket
-import subprocess
-import threading
-import uuid as _uuid_module
 
-from . import layouts as _layouts
+from . import dispatcharr as _dispatcharr
+from . import ffmpeg as _ffmpeg
+from .ffmpeg import _parse_resolution
+from .pipeline import TilePipeline, _kill_proc
 
 logger = logging.getLogger(__name__)
 
@@ -39,23 +45,15 @@ def set_server(s):
     _server_instance = s
 
 
-def _kill_proc(proc) -> None:
+def _settings() -> dict:
     try:
-        proc.kill()
-        proc.wait()
+        from apps.plugins.models import PluginConfig
+        return PluginConfig.objects.get(key="multiview").settings
     except Exception:
-        pass
+        return {}
 
 
-def _log_stderr(proc, label: str) -> None:
-    try:
-        for raw in proc.stderr:
-            line = raw.decode("utf-8", errors="replace").rstrip()
-            if line:
-                logger.warning(f"ffmpeg {label}: {line}")
-    except Exception:
-        pass
-
+# --- audio track labeling (unchanged; see lessons OLD notes) ------------------
 
 def _lang_code(name: str) -> str:
     name = re.sub(r'^[A-Z0-9]{2,5}\s*[|–—-]\s*', '', name)
@@ -70,12 +68,12 @@ def _lang_code(name: str) -> str:
     return (initials + "   ")[:3].lower()
 
 
-def _deduplicate_lang_codes(names: list[str]) -> list[str]:
+def _deduplicate_lang_codes(names: list) -> list:
     raw = [_lang_code(n) for n in names]
-    counts: dict[str, int] = {}
+    counts: dict = {}
     for c in raw:
         counts[c] = counts.get(c, 0) + 1
-    seen: dict[str, int] = {}
+    seen: dict = {}
     result = []
     for code in raw:
         if counts[code] > 1:
@@ -86,26 +84,7 @@ def _deduplicate_lang_codes(names: list[str]) -> list[str]:
     return result
 
 
-def _parse_resolution(settings: dict) -> tuple[int, int]:
-    try:
-        w, h = (int(x) for x in (settings.get("output_resolution") or "1920x1080").split("x"))
-        return w, h
-    except Exception:
-        return 1920, 1080
-
-
-def _usable_logo(url) -> "str | None":
-    """Return url only if it's a local file path that exists on disk."""
-    if url and isinstance(url, str) and url.startswith("/"):
-        try:
-            if os.path.isfile(url):
-                return url
-        except Exception:
-            pass
-    return None
-
-
-def _audio_metadata_args(audio_source: str, channel_names: list[str], n: int) -> list:
+def _audio_metadata_args(audio_source: str, channel_names: list, n: int) -> list:
     args = []
     if audio_source == "all":
         lang_codes = _deduplicate_lang_codes(channel_names or [])
@@ -122,6 +101,18 @@ def _audio_metadata_args(audio_source: str, channel_names: list[str], n: int) ->
     return args
 
 
+def _usable_logo(url) -> "str | None":
+    """Return url only if it's a local file path that exists on disk."""
+    import os
+    if url and isinstance(url, str) and url.startswith("/"):
+        try:
+            if os.path.isfile(url):
+                return url
+        except Exception:
+            pass
+    return None
+
+
 class MultiviewServer:
     def __init__(self, host: str, port: int):
         self.host = host
@@ -129,6 +120,8 @@ class MultiviewServer:
         self._server = None
         self._greenlet = None
         self.running = False
+
+    # ------------------------------------------------------------------ WSGI
 
     def wsgi_app(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
@@ -145,132 +138,131 @@ class MultiviewServer:
                 return [b"Invalid stream index\n"]
             return self._serve_stream(n, start_response)
 
-        if path.startswith("/internal/ch/"):
-            channel_id = path[len("/internal/ch/"):]
-            return self._serve_channel(channel_id, start_response)
+        if path.startswith("/internal/tile/"):
+            return self._serve_tile(path[len("/internal/tile/"):], start_response)
+
+        if path.startswith("/internal/realsrc/"):
+            return self._serve_realsrc(path[len("/internal/realsrc/"):], start_response)
 
         start_response("404 Not Found", [("Content-Type", "text/plain")])
         return [b"Not Found\n"]
 
+    # --------------------------------------------------------------- handlers
+
     def _serve_stream(self, n: int, start_response):
         logger.info(f"Stream request: layout {n}")
-
         try:
-            input_urls, layout, channel_names, logo_urls, audio_source = self._resolve_layout(n)
+            tiles, layout, audio_source = self._resolve_layout(n)
         except LookupError as e:
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [str(e).encode()]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Layout {n} error: {e}", exc_info=True)
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
             return [b"error\n"]
 
-        try:
-            from apps.plugins.models import PluginConfig
-            settings = PluginConfig.objects.get(key="multiview").settings
-        except Exception:
-            settings = {}
+        settings = _settings()
+        names = [t["name"] for t in tiles]
+        tile_urls = [f"http://127.0.0.1:{self.port}/internal/tile/{t['id']}" for t in tiles]
+        meta = _audio_metadata_args(audio_source, names, len(tiles))
+        cmd = _ffmpeg.build_composition_cmd(tile_urls, layout, settings,
+                                            audio_source, names, meta)
+        logger.info(f"Starting composition ffmpeg: {len(tile_urls)} tiles, layout={layout}")
 
-        cmd = self._build_composition_cmd(input_urls, layout, settings, audio_source, channel_names)
-        logger.info(f"Starting composition ffmpeg: {len(input_urls)} inputs, layout={layout}")
-
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        threading.Thread(target=_log_stderr, args=(proc, f"composition-{n}"), daemon=True).start()
+        import gevent
+        import gevent.subprocess as gsub
+        proc = gsub.Popen(cmd, stdout=gsub.PIPE, stderr=gsub.PIPE)
+        gevent.spawn(self._drain_stderr, proc, f"composition-{n}")
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
             ("X-Accel-Buffering", "no"),
         ])
+        return self._pump_stdout(proc, f"composition {n}")
 
-        def stream_gen():
-            try:
-                while True:
-                    chunk = proc.stdout.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    yield chunk
-            except GeneratorExit:
-                pass
-            finally:
-                _kill_proc(proc)
-                logger.info(f"Composition stream {n} ended, ffmpeg killed")
-
-        return stream_gen()
-
-    def _serve_channel(self, channel_id: str, start_response):
+    def _serve_tile(self, raw_id: str, start_response):
         try:
-            _uuid_module.UUID(channel_id)
+            channel_id = int(raw_id)
         except ValueError:
             start_response("400 Bad Request", [("Content-Type", "text/plain")])
-            return [b"Invalid channel ID\n"]
+            return [b"Invalid channel id\n"]
 
+        name = str(channel_id)
         logo_path = None
         try:
             from apps.channels.models import Channel
-            ch = Channel.objects.select_related("logo").get(uuid=channel_id)
+            ch = Channel.objects.select_related("logo").get(id=channel_id)
+            name = ch.name
             if ch.logo_id is not None:
                 logo_path = _usable_logo(ch.logo.url)
         except Exception:
             pass
 
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-f", "lavfi", "-i", "color=c=black:size=640x360:rate=30000/1001",
-            "-f", "lavfi", "-i", "aevalsrc=0:channel_layout=stereo:sample_rate=48000",
-        ]
-
-        if logo_path:
-            cmd += ["-loop", "1", "-framerate", "30000/1001", "-i", logo_path]
-            logo_size = 120
-            cmd += [
-                "-filter_complex",
-                f"[2:v]scale={logo_size}:{logo_size}:force_original_aspect_ratio=decrease,setsar=1[logo];"
-                "[0:v][logo]overlay=x=(W-w)/2:y=(H-h)/2[v]",
-                "-map", "[v]",
-            ]
-        else:
-            cmd += [
-                "-vf", "drawtext=text=Loading...:fontcolor=white:fontsize=28:x=(w-tw)/2:y=(h-th)/2",
-                "-map", "0:v",
-            ]
-
-        cmd += [
-            "-map", "1:a",
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-c:a", "ac3", "-b:a", "192k",
-            "-f", "mpegts", "pipe:1",
-        ]
-
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        realsrc_url = f"http://127.0.0.1:{self.port}/internal/realsrc/{channel_id}"
+        pipeline = TilePipeline(_settings(), channel_id, realsrc_url, logo_path, name)
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
             ("X-Accel-Buffering", "no"),
         ])
+        return pipeline.stream()
 
-        def stream_gen():
-            try:
-                while True:
-                    chunk = proc.stdout.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    yield chunk
-            except GeneratorExit:
-                pass
-            finally:
-                _kill_proc(proc)
+    def _serve_realsrc(self, raw_id: str, start_response):
+        channel_id = _dispatcharr.resolve_channel_id(raw_id)
+        if channel_id is None:
+            start_response("404 Not Found", [("Content-Type", "text/plain")])
+            return [b"Unknown channel\n"]
 
-        return stream_gen()
+        start_response("200 OK", [
+            ("Content-Type", "video/mp2t"),
+            ("Cache-Control", "no-cache"),
+            ("X-Accel-Buffering", "no"),
+        ])
+        return _dispatcharr.live_stream(channel_id)
+
+    # --------------------------------------------------------------- helpers
+
+    def _pump_stdout(self, proc, label: str):
+        """Cooperative read of an ffmpeg stdout pipe -> response bytes.
+
+        Runs in the pywsgi handler greenlet; reads are cooperative under gevent's
+        monkey-patched subprocess, so this does not block the event loop. Killing
+        proc on exit cascades teardown to the tile pipelines (their HTTP
+        connections close) and on to the realsrc Dispatcharr clients.
+        """
+        try:
+            while True:
+                chunk = proc.stdout.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+        except GeneratorExit:
+            pass
+        finally:
+            _kill_proc(proc)
+            logger.info(f"{label} ended, ffmpeg killed")
+
+    def _drain_stderr(self, proc, label: str):
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    logger.warning(f"ffmpeg {label}: {line}")
+        except Exception:
+            pass
 
     def _resolve_layout(self, n: int):
+        """Return (tiles, layout, audio_source).
+
+        tiles: list of {"id": channel_id, "name": str}. At least 2 required.
+        """
         from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
 
         try:
-            cfg = PluginConfig.objects.get(key="multiview")
-            settings = cfg.settings
+            settings = PluginConfig.objects.get(key="multiview").settings
         except Exception:
             settings = {}
 
@@ -278,26 +270,17 @@ class MultiviewServer:
         layout = settings.get(f"multiview_{n}_layout", "auto")
         selector_type = settings.get(f"multiview_{n}_selector_type", "classic")
 
-        input_urls: list[str] = []
-        channel_names: list[str] = []
-        logo_urls: list = []
-
+        tiles = []
         if selector_type == "regex":
             pattern = settings.get(f"multiview_{n}_regex_pattern", "").strip()
             if not pattern:
                 raise LookupError(f"Layout {n} is in regex mode but has no pattern configured")
             matched = list(
-                Channel.objects.select_related("logo")
-                .filter(name__iregex=pattern)
+                Channel.objects.filter(name__iregex=pattern)
                 .order_by("channel_number")[:ch_count]
             )
             for ch in matched:
-                input_urls.append(f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}")
-                channel_names.append(ch.name)
-                try:
-                    logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
-                except Exception:
-                    logo_urls.append(None)
+                tiles.append({"id": ch.id, "name": ch.name})
             audio_source = settings.get(f"multiview_{n}_audio_source", "0")
             if audio_source in ("regex_first", "regex_lowest"):
                 audio_source = "0"
@@ -307,120 +290,22 @@ class MultiviewServer:
                 if not ch_id_str or ch_id_str == "_none":
                     continue
                 try:
-                    ch = Channel.objects.select_related("logo").get(id=int(ch_id_str))
+                    ch = Channel.objects.get(id=int(ch_id_str))
                 except Channel.DoesNotExist:
-                    logger.warning(f"Layout {n} channel slot {m}: id={ch_id_str} not found, skipping")
+                    logger.warning(f"Layout {n} slot {m}: id={ch_id_str} not found, skipping")
                     continue
-                input_urls.append(f"http://127.0.0.1:{self.port}/internal/ch/{ch.uuid}")
-                channel_names.append(ch.name)
-                try:
-                    logo_urls.append(ch.logo.url if ch.logo_id is not None else None)
-                except Exception:
-                    logo_urls.append(None)
+                tiles.append({"id": ch.id, "name": ch.name})
             audio_source = settings.get(f"multiview_{n}_audio_source", "0")
 
-        if len(input_urls) < 2:
+        if len(tiles) < 2:
             raise LookupError(
-                f"Layout {n} needs at least 2 configured channels (found {len(input_urls)})"
+                f"Layout {n} needs at least 2 configured channels (found {len(tiles)})"
             )
 
-        logger.info(f"Layout {n}: {len(input_urls)} channels, layout={layout}, audio={audio_source}")
-        return input_urls, layout, channel_names, logo_urls, audio_source
+        logger.info(f"Layout {n}: {len(tiles)} channels, layout={layout}, audio={audio_source}")
+        return tiles, layout, audio_source
 
-    def _build_composition_cmd(
-        self,
-        input_urls: list[str],
-        layout: str,
-        settings: dict,
-        audio_source: str,
-        channel_names: list[str],
-    ) -> list[str]:
-        n = len(input_urls)
-        out_w, out_h = _parse_resolution(settings)
-        bitrate = int(settings.get("output_bitrate") or 8000)
-        crf = int(settings.get("output_crf") or 23)
-        preset = settings.get("encoder_preset") or "ultrafast"
-        encoder = settings.get("video_encoder") or "libx264"
-        vaapi_device = settings.get("vaapi_device") or "/dev/dri/renderD128"
-
-        if encoder == "h264_vaapi":
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-                   "-vaapi_device", vaapi_device]
-        else:
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-
-        for url in input_urls:
-            cmd += [
-                "-f", "mpegts",
-                "-use_wallclock_as_timestamps", "1",
-                "-fflags", "+discardcorrupt+genpts+nobuffer",
-                "-analyzeduration", "100000",
-                "-probesize", "32768",
-                "-thread_queue_size", "1024",
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-                "-i", url,
-            ]
-
-        if layout == "featured":
-            filter_complex, map_args = _layouts._featured_filter(n, out_w, out_h)
-        elif layout == "top_featured":
-            filter_complex, map_args = _layouts._top_featured_filter(n, out_w, out_h)
-        else:
-            filter_complex, map_args = _layouts._auto_grid_filter(n, out_w, out_h)
-
-        if encoder == "h264_vaapi":
-            filter_complex = filter_complex.replace("[v]", "[vraw]", 1)
-            filter_complex += "; [vraw]hwupload,format=vaapi[v]"
-
-        cmd += ["-filter_complex", filter_complex]
-        cmd += map_args
-
-        _NVENC_VALID = {"p1", "p2", "p3", "p4", "p5", "p6", "p7"}
-        _QSV_VALID = {"veryfast", "faster", "fast", "medium", "slow"}
-        _X264_VALID = {"ultrafast", "superfast", "veryfast", "faster", "fast",
-                       "medium", "slow", "slower", "veryslow", "placebo"}
-
-        if encoder == "h264_nvenc":
-            p = preset if preset in _NVENC_VALID else "p1"
-            cmd += ["-c:v", "h264_nvenc", "-preset", p, "-tune", "ll",
-                    "-rc", "vbr", "-cq", str(crf),
-                    "-maxrate", f"{bitrate}k", "-bufsize", f"{bitrate * 2}k",
-                    "-g", "60", "-keyint_min", "60"]
-        elif encoder == "h264_qsv":
-            p = preset if preset in _QSV_VALID else "veryfast"
-            cmd += ["-c:v", "h264_qsv", "-preset", p, "-global_quality", str(crf),
-                    "-b:v", f"{bitrate}k", "-maxrate", f"{bitrate}k",
-                    "-bufsize", f"{bitrate * 2}k", "-g", "60", "-low_power", "1"]
-        elif encoder == "h264_vaapi":
-            cmd += ["-c:v", "h264_vaapi",
-                    "-b:v", f"{bitrate}k", "-maxrate", f"{bitrate}k",
-                    "-bufsize", f"{bitrate * 2}k", "-g", "60"]
-        else:  # libx264
-            p = preset if preset in _X264_VALID else "ultrafast"
-            cmd += ["-c:v", "libx264", "-preset", p, "-tune", "zerolatency",
-                    "-level:v", "5.1", "-crf", str(crf),
-                    "-maxrate", f"{bitrate}k", "-bufsize", f"{bitrate * 2}k",
-                    "-g", "60", "-keyint_min", "60",
-                    "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)"]
-
-        if audio_source == "all":
-            for i in range(n):
-                cmd += ["-map", f"{i}:a?"]
-            cmd += ["-c:a", "ac3", "-af", "aresample=async=1000"]
-        else:
-            audio_idx = int(audio_source) if str(audio_source).isdigit() else 0
-            audio_idx = max(0, min(audio_idx, n - 1))
-            cmd += ["-map", f"{audio_idx}:a", "-c:a", "ac3", "-af", "aresample=async=1000"]
-        cmd += _audio_metadata_args(audio_source, channel_names, n)
-
-        cmd += [
-            "-max_muxing_queue_size", "1024",
-            "-mpegts_flags", "+pat_pmt_at_frames+resend_headers+initial_discontinuity",
-            "-f", "mpegts", "pipe:1",
-        ]
-        return cmd
+    # ------------------------------------------------------------- lifecycle
 
     def start(self) -> bool:
         if self.running:
@@ -438,26 +323,23 @@ class MultiviewServer:
 
         try:
             from gevent import pywsgi
+            import gevent as _gevent
 
             def _run():
                 try:
                     self._server = pywsgi.WSGIServer(
-                        (self.host, self.port),
-                        self.wsgi_app,
-                        log=None,
+                        (self.host, self.port), self.wsgi_app, log=None,
                     )
                     self.running = True
                     set_server(self)
                     self._server.serve_forever()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.error(f"Multiview server crashed: {e}", exc_info=True)
                 finally:
                     self.running = False
 
-            import gevent as _gevent
             self._greenlet = _gevent.spawn(_run)
             return True
-
         except ImportError:
             logger.error("gevent is not installed; cannot start multiview server")
             return False
