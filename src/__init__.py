@@ -179,8 +179,9 @@ class Plugin:
         except OSError as e:
             return {"status": "error", "message": f"Failed to write M3U file: {e}"}
 
+        source_id = None
         try:
-            _epg().generate_epg(settings, _PLUGIN_DIR)
+            source_id = _epg().generate_epg(settings, _PLUGIN_DIR)
         except Exception as e:
             logger.warning(f"EPG generation failed: {e}")
 
@@ -196,11 +197,7 @@ class Plugin:
                 },
             )
             verb = "created" if created else "updated"
-            try:
-                from apps.m3u.tasks import refresh_single_m3u_account
-                refresh_single_m3u_account.delay(account.id)
-            except Exception as e:
-                logger.warning(f"Could not trigger M3U refresh: {e}")
+            self._refresh_m3u_then_epg(account.id, source_id)
             return {
                 "status": "success",
                 "message": f"M3U written to {m3u_path} | M3U account {verb} in Dispatcharr",
@@ -211,6 +208,31 @@ class Plugin:
                 "status": "success",
                 "message": f"M3U written to {m3u_path} (could not create M3U account: {e})",
             }
+
+    def _refresh_m3u_then_epg(self, account_id, source_id) -> None:
+        """Refresh the M3U account, then the EPG source, in sequence.
+
+        Firing both refreshes at once collides on Dispatcharr's shared celery DB
+        connection ("the last operation didn't produce records (command status:
+        INSERT 0 N)"). A celery chain serializes them; M3U first so the multiview
+        channels exist before the EPG maps programs onto them.
+        """
+        try:
+            from celery import chain
+            from apps.m3u.tasks import refresh_single_m3u_account
+            if source_id is not None:
+                from apps.epg.tasks import refresh_epg_data
+                chain(refresh_single_m3u_account.si(account_id),
+                      refresh_epg_data.si(source_id)).delay()
+            else:
+                refresh_single_m3u_account.delay(account_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not trigger M3U/EPG refresh chain: {e}")
+            try:  # best-effort fallback: at least refresh the M3U
+                from apps.m3u.tasks import refresh_single_m3u_account
+                refresh_single_m3u_account.delay(account_id)
+            except Exception:
+                pass
 
     # start_server
 
