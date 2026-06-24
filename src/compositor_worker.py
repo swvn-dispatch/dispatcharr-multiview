@@ -40,11 +40,12 @@ if _ARCH_DIR and os.path.isdir(os.path.join(_VENDOR, _ARCH_DIR)):
 
 import numpy as np  # noqa: E402
 try:
-    import av  # noqa: E402  (vendored)
+    import av  # noqa: E402  (vendored, installed on demand)
 except ImportError:
     sys.stderr.write(
-        f"[mvworker] FATAL: vendored PyAV not found for arch '{platform.machine()}' "
-        f"(expected {_VENDOR}/{_ARCH_DIR}). Re-vendor with package.sh.\n")
+        f"[mvworker] FATAL: PyAV not installed for arch '{platform.machine()}' "
+        f"(expected {_VENDOR}/{_ARCH_DIR}). Open the Multiview plugin settings and "
+        f"run the 'Install PyAV' action.\n")
     raise
 
 TILE_STALE_SECS = 1.5

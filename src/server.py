@@ -185,6 +185,15 @@ class MultiviewServer:
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
             return [b"error\n"]
 
+        from . import deps as _deps
+        arch = _deps.detect_arch()
+        if not arch or not _deps.pyav_status(arch):
+            logger.warning(f"Stream {n}: PyAV not installed for {arch or 'this arch'}")
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [(f"PyAV media engine not installed for {arch or 'this CPU arch'}. "
+                     f"Open the Multiview plugin settings and run the 'Install PyAV' "
+                     f"action, then retry.\n").encode()]
+
         settings = _settings()
         cfg = self._worker_config(tiles, layout, audio_source, settings)
         cmd = [_python_exe(), _WORKER, json.dumps(cfg)]

@@ -54,6 +54,22 @@ class Plugin:
             "button_variant": "filled",
             "button_color": "green",
         },
+        {
+            "id": "install_pyav_amd64",
+            "label": "Install / Update PyAV (amd64 / x86_64)",
+            "description": "Download and install the PyAV media dependency for x86_64 hosts. Required before streaming. Needs internet access.",
+            "button_label": "Install PyAV (amd64)",
+            "button_variant": "filled",
+            "button_color": "blue",
+        },
+        {
+            "id": "install_pyav_arm64",
+            "label": "Install / Update PyAV (arm64 / aarch64)",
+            "description": "Download and install the PyAV media dependency for aarch64 hosts. Required before streaming. Needs internet access.",
+            "button_label": "Install PyAV (arm64)",
+            "button_variant": "filled",
+            "button_color": "blue",
+        },
     ]
 
     # Lifecycle (init)
@@ -97,15 +113,44 @@ class Plugin:
             settings = cfg.settings
         except Exception:
             settings = {}
-        return _config().build_plugin_fields(settings)
+        fields = _config().build_plugin_fields(settings)
+        return [self._pyav_status_field()] + fields
+
+    def _pyav_status_field(self) -> dict:
+        """Info field showing whether the PyAV media engine is installed."""
+        try:
+            deps = self._deps()
+            arch = deps.detect_arch()
+            if not arch:
+                import platform
+                desc = (f"⚠ Unsupported CPU architecture ({platform.machine()}); "
+                        f"PyAV is unavailable, streaming will not work.")
+            elif deps.pyav_status(arch):
+                desc = f"✓ PyAV {deps.pyav_status(arch)} installed for {arch}."
+            else:
+                desc = (f"⚠ PyAV is NOT installed for {arch}. Run the "
+                        f"'Install PyAV' action below before streaming.")
+        except Exception as e:  # noqa: BLE001
+            desc = f"PyAV status unknown: {e}"
+        return {"id": "_pyav_status", "label": "Media Engine (PyAV)",
+                "type": "info", "description": desc}
 
     # Action dispatcher
 
     def run(self, action: str, params: dict, context: dict):
         if action == "generate_m3u":
             return self._generate_m3u()
+        if action == "install_pyav_amd64":
+            return self._deps().install_pyav("linux-x86_64")
+        if action == "install_pyav_arm64":
+            return self._deps().install_pyav("linux-aarch64")
 
         return {"status": "error", "message": f"Unknown action: {action}"}
+
+    @staticmethod
+    def _deps():
+        import importlib
+        return importlib.import_module(".deps", package=__package__)
 
     # generate_m3u
 

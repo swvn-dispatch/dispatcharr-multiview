@@ -42,8 +42,8 @@ done
 # they are downloaded here. Pass --revendor to force a refresh.
 PYAV_VERSION="14.2.0"
 PYAV_PYTAG="3.13"            # cp313
-declare -A VENDOR_ARCHES=( ["linux-x86_64"]="manylinux2014_x86_64"
-                           ["linux-aarch64"]="manylinux2014_aarch64" )
+# "vendor-subdir:manylinux-platform" pairs (no associative array; bash 3.2 safe)
+VENDOR_ARCHES="linux-x86_64:manylinux2014_x86_64 linux-aarch64:manylinux2014_aarch64"
 
 vendor_one() {
     local dir="$SRC_DIR/vendor/$1" plat="$2"
@@ -62,9 +62,9 @@ vendor_one() {
 }
 
 ensure_vendor() {
-    echo "=== Vendoring PyAV ==="
-    for arch in "${!VENDOR_ARCHES[@]}"; do
-        vendor_one "$arch" "${VENDOR_ARCHES[$arch]}"
+    echo "=== Vendoring PyAV (local dev only) ==="
+    for pair in $VENDOR_ARCHES; do
+        vendor_one "${pair%%:*}" "${pair##*:}"
     done
 }
 
@@ -116,8 +116,10 @@ fi
 [ -f "$OUTPUT_FILE" ] && rm "$OUTPUT_FILE"
 rm -f "${OUTPUT_BASE}"-*.zip 2>/dev/null || true
 
-# Ensure vendored deps are present (downloads PyAV wheels for all arches)
-ensure_vendor
+# PyAV is NOT bundled in the zip (it would blow Dispatcharr's 200MB import limit);
+# it is installed on demand by the plugin's "Install PyAV" action. --revendor only
+# populates src/vendor locally for dev (synced to the dev box via dev-deploy.sh).
+[ -n "$REVENDOR" ] && ensure_vendor
 
 # Copy source to temp dir with plugin name
 cp -r "$SRC_DIR" "$TEMP_DIR/$PLUGIN_NAME"
@@ -125,7 +127,7 @@ cp -r "$SRC_DIR" "$TEMP_DIR/$PLUGIN_NAME"
 # Create package
 echo "Creating package..."
 cd "$TEMP_DIR"
-zip -q -r "$OLDPWD/$OUTPUT_FILE" "$PLUGIN_NAME" -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store"
+zip -q -r "$OLDPWD/$OUTPUT_FILE" "$PLUGIN_NAME" -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store" -x "*/vendor/*"
 cd "$OLDPWD"
 
 # Clean up temp directory
