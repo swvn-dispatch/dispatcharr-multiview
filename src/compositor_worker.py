@@ -323,12 +323,25 @@ def _write_all(fd, data):
     return True
 
 
+def _nvenc_available() -> bool:
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "h264_nvenc" in r.stdout
+    except Exception:
+        return False
+
+
 def build_encoder_cmd(cfg, out_w, out_h, audio_read):
     bitrate = int(cfg.get("bitrate", 8000))
     gop = max(2, round(float(fps_fraction(cfg["fps"])) * 2))
+    encoder = cfg.get("video_encoder", "libx264")
+    preset = cfg.get("preset") or ("p4" if encoder == "h264_nvenc" else "ultrafast")
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
-           # Cap encode threads so it doesn't grab every core and starve the
-           # PyAV decoders (3x 1080p60 decode already loads the box).
+           # Cap muxer/filter threads so it doesn't grab every core and starve
+           # the PyAV decoders (3x 1080p60 decode already loads the box).
            "-threads", str(cfg.get("enc_threads", 4)),
            "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{out_w}x{out_h}",
            "-r", cfg["fps"], "-thread_queue_size", "512", "-i", "pipe:0"]
@@ -338,22 +351,32 @@ def build_encoder_cmd(cfg, out_w, out_h, audio_read):
     cmd += ["-map", "0:v:0"]
     for i in range(len(audio_read)):
         cmd += ["-map", f"{i + 1}:a:0"]
-    # VBV CBR: -b:v == -minrate == -maxrate forces constant bitrate regardless of
-    # content complexity. CRF (VBR) produces near-zero bitrate for static/logo
-    # content; IPTV players drain their receive buffer faster than realtime when
-    # data rate is very low, causing fast-forward on faster hardware. CBR pads
-    # with H.264 filler NAL units to maintain constant rate.
-    # bufsize = 0.5x target keeps encode latency low.
-    # -muxrate is NOT used: with CBR the encoder already guarantees constant
-    # output rate; adding -muxrate on top creates MPEG-TS null packets that
-    # shift the PCR clock away from the video PTS, causing player sync issues.
-    cmd += ["-c:v", "libx264", "-preset", cfg.get("preset") or "ultrafast",
-            "-pix_fmt", "yuv420p",
-            "-b:v", f"{bitrate}k",
-            "-minrate", f"{bitrate}k",
-            "-maxrate", f"{bitrate}k",
-            "-bufsize", f"{bitrate // 2}k",
-            "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0"]
+    # VBV CBR: constant bitrate regardless of content complexity. CRF (VBR)
+    # produces near-zero bitrate for static/logo content; IPTV players drain
+    # their receive buffer faster than realtime when the rate is very low,
+    # causing fast-forward. CBR pads with filler NAL units to hold constant
+    # rate. bufsize = 0.5x target keeps encode latency low.
+    # -muxrate is NOT used: CBR already guarantees constant output rate;
+    # -muxrate adds MPEG-TS null packets that shift the PCR clock away from
+    # video PTS, causing player sync issues.
+    if encoder == "h264_nvenc":
+        # NVENC CBR via -rc cbr (pads with filler NAL units, same guarantee as
+        # x264 CBR). -minrate, -keyint_min, -sc_threshold are x264-only.
+        cmd += ["-c:v", "h264_nvenc", "-preset", preset,
+                "-rc", "cbr",
+                "-pix_fmt", "yuv420p",
+                "-b:v", f"{bitrate}k",
+                "-maxrate", f"{bitrate}k",
+                "-bufsize", f"{bitrate // 2}k",
+                "-g", str(gop)]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", preset,
+                "-pix_fmt", "yuv420p",
+                "-b:v", f"{bitrate}k",
+                "-minrate", f"{bitrate}k",
+                "-maxrate", f"{bitrate}k",
+                "-bufsize", f"{bitrate // 2}k",
+                "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0"]
     if audio_read:
         cmd += ["-c:a", "ac3", "-b:a", "192k"]
     cmd += ["-max_muxing_queue_size", "1024",
@@ -412,6 +435,9 @@ def main():
     audio_pipes = [os.pipe() for _ in audio_chs]
     audio_read = [r for (r, _w) in audio_pipes]
     enc_out_r, enc_out_w = os.pipe()
+    if cfg.get("video_encoder") == "h264_nvenc" and not _nvenc_available():
+        sys.exit("h264_nvenc selected but ffmpeg reports no NVENC encoder -- "
+                 "check NVIDIA driver and ffmpeg build")
     cmd = build_encoder_cmd(cfg, out_w, out_h, audio_read)
     for i, a in enumerate(audio_chs):
         cmd[-1:-1] = [f"-metadata:s:a:{i}", f"title={a.name}",
