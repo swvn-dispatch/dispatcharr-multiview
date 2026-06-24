@@ -49,7 +49,9 @@ except ImportError:
     raise
 
 TILE_STALE_SECS = 1.5
-RECONNECT_BACKOFF = 2.0
+RECONNECT_BASE    = 2.0   # first retry delay (seconds)
+RECONNECT_MAX     = 60.0  # cap on per-retry delay
+RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
 AUDIO_RATE = 48000
 AUDIO_LAYOUT = "stereo"
 
@@ -200,7 +202,11 @@ class Channel:
             self.latest = fb
 
     def run(self):
+        failures = 0
         while self.running:
+            if failures >= RECONNECT_RETRIES:
+                log(f"channel {self.name}: giving up after {RECONNECT_RETRIES} failed retries")
+                break
             cont = None
             # Flush stale audio and reset the PTS clock before each new
             # connection so old samples never bleed into the new stream.
@@ -209,6 +215,7 @@ class Channel:
                 self.abuffered = 0
             self.clk_pts = None
             self.clk_wall = None
+            vcount_before = self.vcount
             try:
                 cont = av.open(self.url, options=DECODE_OPTS)
                 vs = cont.streams.video[0]
@@ -279,8 +286,14 @@ class Channel:
                         cont.close()
                     except Exception:
                         pass
-            if self.running:
-                time.sleep(RECONNECT_BACKOFF)
+            if self.vcount > vcount_before:
+                failures = 0
+            else:
+                failures += 1
+            if self.running and failures < RECONNECT_RETRIES:
+                delay = min(RECONNECT_BASE * (2 ** (failures - 1)), RECONNECT_MAX)
+                log(f"channel {self.name}: retry {failures}/{RECONNECT_RETRIES} in {delay:.0f}s")
+                time.sleep(delay)
 
     def current(self):
         if time.monotonic() < self.fresh_until:
