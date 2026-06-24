@@ -148,6 +148,13 @@ dmypy.json
 *.zip
 README_OLD.md
 
+# Vendored PyAV wheels: downloaded by package.sh per-arch, never committed.
+/src/vendor/*
+!/src/vendor/README.md
+
+# Local dev helper (hardcoded ssh host/container) - stays local
+/dev-deploy.sh
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

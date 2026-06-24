@@ -20,17 +20,25 @@ USER_AGENT = "multiview-plugin"
 CLIENT_IP = "127.0.0.1"
 
 
-def resolve_channel_id(value) -> "int | None":
-    """Accept a Dispatcharr channel id (int/str) or a channel uuid, return id."""
+def resolve_channel_uuid(value) -> "str | None":
+    """Accept a Dispatcharr channel id (int/str pk) or a channel uuid, return the
+    canonical channel uuid string.
+
+    Dispatcharr's live proxy keys channels by uuid throughout (see
+    url_utils.get_stream_info_for_switch -> get_object_or_404(Channel, uuid=...)),
+    so the uuid is the identifier we must pass to live_stream, not the integer pk.
+    """
+    # Already a uuid?
     try:
-        return int(value)
+        return str(_uuid.UUID(str(value)))
     except (TypeError, ValueError):
         pass
+    # Otherwise treat it as an integer pk and look up the uuid.
     try:
         from apps.channels.models import Channel
-        return Channel.objects.values_list("id", flat=True).get(uuid=str(value))
+        return str(Channel.objects.values_list("uuid", flat=True).get(id=int(value)))
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"multiview: cannot resolve channel id for {value!r}: {e}")
+        logger.warning(f"multiview: cannot resolve channel uuid for {value!r}: {e}")
         return None
 
 
