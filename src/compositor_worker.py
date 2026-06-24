@@ -246,38 +246,45 @@ class Channel:
                     aus = cont.streams.audio[0]
                     streams.append(aus)
                     res = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
-                for packet in cont.demux(*streams):
-                    if not self.running:
-                        break
-                    if packet.dts is None:
-                        continue
-                    if packet.stream.type == "video":
-                        for frame in packet.decode():
-                            if frame.pts is not None:
-                                pts_s = float(frame.pts * vs.time_base)
-                                now = time.monotonic()
-                                if self.clk_pts is None:
-                                    self.clk_pts, self.clk_wall = pts_s, now
-                                else:
-                                    gap = (self.clk_wall + pts_s - self.clk_pts) - now
-                                    if 0 < gap < 2.0:
-                                        time.sleep(gap)
-                                    elif gap <= -2.0:
-                                        self.clk_pts, self.clk_wall = pts_s, time.monotonic()
-                            self.latest = fit_into_tile(frame, self.w, self.h)
-                            self.fresh_until = time.monotonic() + TILE_STALE_SECS
-                            self.vcount += 1
-                    elif res is not None and packet.stream.type == "audio":
-                        for frame in packet.decode():
-                            pts_s = (float(frame.pts * aus.time_base)
-                                     if frame.pts is not None else None)
-                            for rf in res.resample(frame):
-                                a = rf.to_ndarray()
-                                a = a.reshape(-1, 2) if a.shape[0] == 1 else a.T
-                                with self.alock:
-                                    self.aframes.append((pts_s, a.astype(np.int16)))
-                                    self.abuffered += a.shape[0]
-                                    self._trim()
+                try:
+                    for packet in cont.demux(*streams):
+                        if not self.running:
+                            break
+                        if packet.dts is None:
+                            continue
+                        if packet.stream.type == "video":
+                            for frame in packet.decode():
+                                if frame.pts is not None:
+                                    pts_s = float(frame.pts * vs.time_base)
+                                    now = time.monotonic()
+                                    if self.clk_pts is None:
+                                        self.clk_pts, self.clk_wall = pts_s, now
+                                    else:
+                                        gap = (self.clk_wall + pts_s - self.clk_pts) - now
+                                        if 0 < gap < 2.0:
+                                            time.sleep(gap)
+                                        elif gap <= -2.0:
+                                            self.clk_pts, self.clk_wall = pts_s, time.monotonic()
+                                self.latest = fit_into_tile(frame, self.w, self.h)
+                                self.fresh_until = time.monotonic() + TILE_STALE_SECS
+                                self.vcount += 1
+                        elif res is not None and packet.stream.type == "audio":
+                            for frame in packet.decode():
+                                pts_s = (float(frame.pts * aus.time_base)
+                                         if frame.pts is not None else None)
+                                for rf in res.resample(frame):
+                                    a = rf.to_ndarray()
+                                    a = a.reshape(-1, 2) if a.shape[0] == 1 else a.T
+                                    with self.alock:
+                                        self.aframes.append((pts_s, a.astype(np.int16)))
+                                        self.abuffered += a.shape[0]
+                                        self._trim()
+                finally:
+                    if res is not None:
+                        try:
+                            res.close()
+                        except Exception:
+                            pass
             except Exception as e:  # noqa: BLE001
                 log(f"channel {self.name} ended: {e}")
             finally:
@@ -535,7 +542,9 @@ def main():
                 dt = now - prev_t
                 rates = " ".join(f"{c.name[:7]}={(c.vcount - prev_counts[i]) / dt:.0f}fps"
                                  for i, c in enumerate(channels))
-                log(f"out {n / (now - start):.1f}fps; decode {rates}")
+                import resource as _res
+                rss_mb = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss // 1024
+                log(f"out {n / (now - start):.1f}fps; decode {rates}; rss={rss_mb}MB")
                 prev_counts = [c.vcount for c in channels]
                 prev_t = now
                 log_at = now + 30.0
@@ -548,6 +557,11 @@ def main():
         stop.set()
         for c in channels:
             c.running = False
+        for fd in audio_w:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.close(video_w)
         except OSError:
@@ -556,6 +570,10 @@ def main():
             enc.wait(timeout=3)
         except Exception:
             enc.kill()
+        try:
+            os.close(enc_out_r)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

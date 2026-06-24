@@ -34,6 +34,7 @@ CHUNK_SIZE = 65536
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compositor_worker.py")
 
 _server_instance = None
+_mv_keepalives: dict = {}
 
 
 
@@ -347,14 +348,14 @@ class MultiviewServer:
         import gevent
         import gevent.subprocess as gsub
         proc = gsub.Popen(cmd, stdout=gsub.PIPE, stderr=gsub.PIPE)
-        gevent.spawn(self._drain_stderr, proc, f"worker-{n}")
+        stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{n}")
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
             ("X-Accel-Buffering", "no"),
         ])
-        return self._pump_stdout(proc, f"worker {n}")
+        return self._pump_stdout(proc, f"worker {n}", stderr_gl)
 
     def _worker_config(self, tiles, layout, audio_source, settings) -> dict:
         out_w, out_h = _parse_resolution(settings)
@@ -403,7 +404,7 @@ class MultiviewServer:
             "tiles": tile_cfg,
         }
 
-    def _pump_stdout(self, proc, label: str):
+    def _pump_stdout(self, proc, label: str, stderr_gl=None):
         try:
             while True:
                 chunk = proc.stdout.read(CHUNK_SIZE)
@@ -418,6 +419,11 @@ class MultiviewServer:
                 proc.wait()
             except Exception:
                 pass
+            if stderr_gl is not None:
+                try:
+                    stderr_gl.kill(block=False)
+                except Exception:
+                    pass
             logger.info(f"{label} ended, worker killed")
 
     def _drain_stderr(self, proc, label: str):
@@ -452,8 +458,11 @@ class MultiviewServer:
             ("X-Accel-Buffering", "no"),
         ])
         def _body():
-            yield first
-            yield from gen
+            try:
+                yield first
+                yield from gen
+            finally:
+                gen.close()
         return _body()
 
     # --------------------------------------------------------------- helpers
