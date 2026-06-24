@@ -216,15 +216,6 @@ class Channel:
                     aus = cont.streams.audio[0]
                     streams.append(aus)
                     res = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
-                # PTS-based rate limiter: realign decoded frames to wall clock.
-                # Dispatcharr's live_proxy delivers source streams from a ring
-                # buffer, which can be 1.2x-2.8x faster than realtime. On slow
-                # machines the decode CPU is the natural bottleneck; on fast
-                # machines (more headroom) the decoder races ahead, making
-                # self.latest hold "future" content and causing fast-forward.
-                # We pace each decoded video frame to its PTS-implied wall time.
-                clk_pts = None   # PTS (seconds) at the last clock anchor
-                clk_wall = None  # wall time at the last clock anchor
                 for packet in cont.demux(*streams):
                     if not self.running:
                         break
