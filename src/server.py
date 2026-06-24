@@ -19,6 +19,7 @@ logic is needed here.
 
 import json
 import logging
+import os
 import re
 import socket
 import sys
@@ -481,7 +482,7 @@ class MultiviewServer:
                 if not ch_id_str or ch_id_str == "_none":
                     continue
                 try:
-                    ch = Channel.objects.get(id=int(ch_id_str))
+                    ch = Channel.objects.select_related("logo").get(id=int(ch_id_str))
                 except Channel.DoesNotExist:
                     logger.warning(f"Layout {n} slot {m}: id={ch_id_str} not found, skipping")
                     continue
