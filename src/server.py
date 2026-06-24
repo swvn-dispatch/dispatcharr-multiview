@@ -272,23 +272,13 @@ def _audio_metadata_args(audio_source: str, channel_names: list, n: int) -> list
     return args
 
 
-def _usable_logo(url) -> "str | None":
-    """Return url only if it's a local file path that exists on disk."""
-    import os
-    if url and isinstance(url, str) and url.startswith("/"):
-        try:
-            if os.path.isfile(url):
-                return url
-        except Exception:
-            pass
-    return None
-
-
 def _channel_logo(ch) -> "str | None":
-    """Local logo file path for a Channel, or None."""
+    """URL or path for the channel's logo, passable to av.open()."""
     try:
         if getattr(ch, "logo_id", None) is not None:
-            return _usable_logo(ch.logo.url)
+            url = ch.logo.url
+            if url and isinstance(url, str):
+                return url
     except Exception:
         pass
     return None

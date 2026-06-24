@@ -144,9 +144,12 @@ class Channel:
         self.provides_audio = bool(spec.get("audio", False))
         self.lang = spec.get("lang", "und")
         self.featured = bool(spec.get("featured", False))
-        self.fallback = self._make_fallback(spec.get("logo"))
+        self.fallback = black_planes(self.w, self.h)
         self.latest = self.fallback
         self.fresh_until = 0.0
+        logo = spec.get("logo")
+        if logo:
+            threading.Thread(target=self._load_logo, args=(logo,), daemon=True).start()
         self.running = True
         self.vcount = 0          # decoded video frames (for rate diagnostics)
         # audio buffer (only used when provides_audio)
@@ -163,18 +166,38 @@ class Channel:
             try:
                 with av.open(logo) as c:
                     for frame in c.decode(video=0):
-                        side = (min(self.w, self.h) // 3) & ~1
-                        lf = frame.reformat(width=side, height=side, format="yuv420p")
-                        ly, lu, lv = yuv_planes_from_frame(lf, side, side)
-                        oy = ((self.h - side) // 2) & ~1
-                        ox = ((self.w - side) // 2) & ~1
-                        Y[oy:oy + side, ox:ox + side] = ly
-                        U[oy // 2:(oy + side) // 2, ox // 2:(ox + side) // 2] = lu
-                        V[oy // 2:(oy + side) // 2, ox // 2:(ox + side) // 2] = lv
+                        # Scale to fit within one-third of the tile, preserving aspect ratio.
+                        max_w = (self.w // 3) & ~1
+                        max_h = (self.h // 3) & ~1
+                        scale = min(max_w / frame.width, max_h / frame.height)
+                        lw = _even(frame.width * scale)
+                        lh = _even(frame.height * scale)
+                        # Decode as RGBA so transparent areas composite cleanly over black.
+                        # Use to_ndarray() -- planes[0] has stride padding that makes
+                        # raw frombuffer shapes wrong for non-aligned widths.
+                        rf = frame.reformat(width=lw, height=lh, format="rgba")
+                        arr = rf.to_ndarray(format="rgba")   # (lh, lw, 4), stride-free
+                        alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
+                        rgb = (arr[:, :, :3] * alpha).astype(np.uint8)
+                        rgb_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                        lf = rgb_frame.reformat(format="yuv420p")
+                        ly, lu, lv = yuv_planes_from_frame(lf, lw, lh)
+                        oy = ((self.h - lh) // 2) & ~1
+                        ox = ((self.w - lw) // 2) & ~1
+                        Y[oy:oy + lh, ox:ox + lw] = ly
+                        U[oy // 2:(oy + lh) // 2, ox // 2:(ox + lw) // 2] = lu
+                        V[oy // 2:(oy + lh) // 2, ox // 2:(ox + lw) // 2] = lv
                         break
             except Exception as e:  # noqa: BLE001
                 log(f"logo decode failed for {self.name}: {e}")
         return (Y, U, V)
+
+    def _load_logo(self, logo):
+        """Load logo in background and swap self.fallback when ready."""
+        fb = self._make_fallback(logo)
+        self.fallback = fb                  # CPython GIL makes tuple attr swap atomic
+        if self.fresh_until == 0.0:         # no real video yet; update latest too
+            self.latest = fb
 
     def run(self):
         while self.running:
