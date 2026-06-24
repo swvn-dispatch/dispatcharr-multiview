@@ -435,12 +435,26 @@ class MultiviewServer:
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [b"Unknown channel\n"]
 
+        gen = _dispatcharr.live_stream(channel_uuid)
+        try:
+            first = next(gen)
+        except StopIteration:
+            # live_stream returned without yielding -- proxy not ready yet.
+            # Return 503 so the compositor worker sees a clean HTTP error and
+            # retries via its backoff, rather than "Invalid data found when
+            # processing input" from a 200 with an empty body.
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"Channel not ready\n"]
+
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
             ("X-Accel-Buffering", "no"),
         ])
-        return _dispatcharr.live_stream(channel_uuid)
+        def _body():
+            yield first
+            yield from gen
+        return _body()
 
     # --------------------------------------------------------------- helpers
 
