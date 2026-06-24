@@ -151,8 +151,11 @@ class Channel:
         self.vcount = 0          # decoded video frames (for rate diagnostics)
         # audio buffer (only used when provides_audio)
         self.alock = threading.Lock()
-        self.aframes = []
+        self.aframes = []        # list of (pts_s: float|None, ndarray(n,2) int16)
         self.abuffered = 0
+        # video PTS clock anchor — updated by run(), read by audio_pts_now()
+        self.clk_pts: "float | None" = None
+        self.clk_wall: "float | None" = None
 
     def _make_fallback(self, logo):
         Y, U, V = black_planes(self.w, self.h)
@@ -176,6 +179,13 @@ class Channel:
     def run(self):
         while self.running:
             cont = None
+            # Flush stale audio and reset the PTS clock before each new
+            # connection so old samples never bleed into the new stream.
+            with self.alock:
+                self.aframes.clear()
+                self.abuffered = 0
+            self.clk_pts = None
+            self.clk_wall = None
             try:
                 cont = av.open(self.url, options=DECODE_OPTS)
                 vs = cont.streams.video[0]
@@ -201,18 +211,11 @@ class Channel:
                         pass
                 streams = [vs]
                 res = None
+                aus = None
                 if self.provides_audio and cont.streams.audio:
-                    streams.append(cont.streams.audio[0])
+                    aus = cont.streams.audio[0]
+                    streams.append(aus)
                     res = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
-                # PTS-based rate limiter: realign decoded frames to wall clock.
-                # Dispatcharr's live_proxy delivers source streams from a ring
-                # buffer, which can be 1.2x-2.8x faster than realtime. On slow
-                # machines the decode CPU is the natural bottleneck; on fast
-                # machines (more headroom) the decoder races ahead, making
-                # self.latest hold "future" content and causing fast-forward.
-                # We pace each decoded video frame to its PTS-implied wall time.
-                clk_pts = None   # PTS (seconds) at the last clock anchor
-                clk_wall = None  # wall time at the last clock anchor
                 for packet in cont.demux(*streams):
                     if not self.running:
                         break
@@ -223,27 +226,26 @@ class Channel:
                             if frame.pts is not None:
                                 pts_s = float(frame.pts * vs.time_base)
                                 now = time.monotonic()
-                                if clk_pts is None:
-                                    clk_pts, clk_wall = pts_s, now
+                                if self.clk_pts is None:
+                                    self.clk_pts, self.clk_wall = pts_s, now
                                 else:
-                                    gap = (clk_wall + pts_s - clk_pts) - now
+                                    gap = (self.clk_wall + pts_s - self.clk_pts) - now
                                     if 0 < gap < 2.0:
                                         time.sleep(gap)
                                     elif gap <= -2.0:
-                                        # More than 2s behind (slow box or
-                                        # PTS reset): re-anchor to avoid
-                                        # trying to catch up across the gap.
-                                        clk_pts, clk_wall = pts_s, time.monotonic()
+                                        self.clk_pts, self.clk_wall = pts_s, time.monotonic()
                             self.latest = fit_into_tile(frame, self.w, self.h)
                             self.fresh_until = time.monotonic() + TILE_STALE_SECS
                             self.vcount += 1
                     elif res is not None and packet.stream.type == "audio":
                         for frame in packet.decode():
+                            pts_s = (float(frame.pts * aus.time_base)
+                                     if frame.pts is not None else None)
                             for rf in res.resample(frame):
                                 a = rf.to_ndarray()
                                 a = a.reshape(-1, 2) if a.shape[0] == 1 else a.T
                                 with self.alock:
-                                    self.aframes.append(a.astype(np.int16))
+                                    self.aframes.append((pts_s, a.astype(np.int16)))
                                     self.abuffered += a.shape[0]
                                     self._trim()
             except Exception as e:  # noqa: BLE001
@@ -265,24 +267,46 @@ class Channel:
     def _trim(self):
         cap = AUDIO_RATE * 2  # ~2s
         while self.abuffered > cap and self.aframes:
-            drop = self.aframes.pop(0)
+            _, drop = self.aframes.pop(0)
             self.abuffered -= drop.shape[0]
 
-    def take(self, nsamples):
-        """Return exactly nsamples of int16 (nsamples,2), padding silence."""
+    def audio_pts_now(self) -> "float | None":
+        """Current source PTS (seconds) implied by the video clock anchor."""
+        if self.clk_pts is None or self.clk_wall is None:
+            return None
+        return self.clk_pts + (time.monotonic() - self.clk_wall)
+
+    def _align_to_pts(self, pts_limit: float):
+        """Discard buffered audio chunks that end before pts_limit."""
+        with self.alock:
+            while self.aframes:
+                pts_s, chunk = self.aframes[0]
+                if pts_s is None:
+                    break
+                if pts_s + chunk.shape[0] / AUDIO_RATE < pts_limit:
+                    self.aframes.pop(0)
+                    self.abuffered -= chunk.shape[0]
+                else:
+                    break
+
+    def take(self, nsamples: int) -> np.ndarray:
+        """Return exactly nsamples of int16 (nsamples, 2), silence-padded."""
         out = np.zeros((nsamples, 2), np.int16)
         filled = 0
         with self.alock:
             while filled < nsamples and self.aframes:
-                chunk = self.aframes[0]
-                take = min(nsamples - filled, chunk.shape[0])
-                out[filled:filled + take] = chunk[:take]
-                if take == chunk.shape[0]:
+                pts_s, chunk = self.aframes[0]
+                need = nsamples - filled
+                if chunk.shape[0] <= need:
+                    out[filled:filled + chunk.shape[0]] = chunk
                     self.aframes.pop(0)
+                    self.abuffered -= chunk.shape[0]
+                    filled += chunk.shape[0]
                 else:
-                    self.aframes[0] = chunk[take:]
-                self.abuffered -= take
-                filled += take
+                    out[filled:] = chunk[:need]
+                    self.aframes[0] = (pts_s, chunk[need:])
+                    self.abuffered -= need
+                    filled = nsamples
         return out
 
 
@@ -339,13 +363,30 @@ def build_encoder_cmd(cfg, out_w, out_h, audio_read):
 
 
 def audio_feeder(track, fd, stop):
-    written = 0  # samples
+    CHUNK = int(AUDIO_RATE * 0.02)  # 960 samples = 20ms per tick
+    SILENCE = np.zeros((CHUNK, 2), dtype=np.int16)
+
+    # Phase 1: wait for the video PTS clock to establish, then snap the audio
+    # buffer to that position. This discards any audio Dispatcharr pre-buffered
+    # ahead of realtime before we start constant-rate output.
+    while not stop.is_set():
+        pts_now = track.audio_pts_now()
+        if pts_now is not None:
+            track._align_to_pts(pts_now - 0.10)
+            break
+        _write_all(fd, SILENCE.tobytes())
+        time.sleep(0.02)
+
+    # Phase 2: constant wall-clock rate. Smooth output is more important than
+    # perfect PTS tracking; the reconnect flush in Channel.run() handles the
+    # stale-audio problem, so wall-clock pacing is safe here.
     start = time.monotonic()
+    written = 0
     while not stop.is_set():
         target = int((time.monotonic() - start) * AUDIO_RATE)
         need = target - written
         if need > 0:
-            pcm = track.take(need)            # (need, 2) int16, silence-padded
+            pcm = track.take(need)
             if not _write_all(fd, pcm.tobytes()):
                 break
             written += need
