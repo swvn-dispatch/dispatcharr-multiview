@@ -2,6 +2,16 @@
 !.github
 !.gitignore
 
+# beads: track only the jsonl exports, everything else under .beads is local tooling
+!.beads
+.beads/*
+!.beads/*.jsonl
+# .agents/ and .codex/ are local agent tooling, kept ignored by the .* rule above
+
+# agent instruction files stay local and untracked
+AGENTS.md
+CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -137,3 +147,16 @@ dmypy.json
 # Project specific
 *.zip
 README_OLD.md
+
+# Vendored PyAV wheels: downloaded by package.sh per-arch, never committed.
+/src/vendor/*
+!/src/vendor/README.md
+
+# Local dev helper (hardcoded ssh host/container) - stays local
+/dev-deploy.sh
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

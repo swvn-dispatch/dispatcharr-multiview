@@ -24,13 +24,49 @@ while [[ $# -gt 0 ]]; do
             EXPLICIT_VERSION="$2"
             shift 2
             ;;
+        --revendor)
+            REVENDOR=1
+            shift
+            ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--version X.Y.Z]"
+            echo "Usage: $0 [--version X.Y.Z] [--revendor]"
             exit 1
             ;;
     esac
 done
+
+# --- Vendored dependencies (PyAV) -------------------------------------------
+# Shipped per-platform under src/vendor/<os-arch>/ so the plugin needs no install
+# step (Dispatcharr has no pip and a static ffmpeg). Wheels are NOT committed;
+# they are downloaded here. Pass --revendor to force a refresh.
+PYAV_VERSION="14.2.0"
+PYAV_PYTAG="3.13"            # cp313
+# "vendor-subdir:manylinux-platform" pairs (no associative array; bash 3.2 safe)
+VENDOR_ARCHES="linux-x86_64:manylinux2014_x86_64 linux-aarch64:manylinux2014_aarch64"
+
+vendor_one() {
+    local dir="$SRC_DIR/vendor/$1" plat="$2"
+    if [ -d "$dir/av" ] && [ -z "$REVENDOR" ]; then
+        echo "  vendor $1: present (use --revendor to refresh)"
+        return
+    fi
+    echo "  vendor $1: downloading av==$PYAV_VERSION ($plat)..."
+    local tmp; tmp=$(mktemp -d)
+    python3 -m pip download "av==$PYAV_VERSION" --no-deps --only-binary=:all: \
+        --python-version "$PYAV_PYTAG" --implementation cp --platform "$plat" -d "$tmp" >/dev/null
+    local whl; whl=$(ls "$tmp"/av-*.whl)
+    rm -rf "$dir"; mkdir -p "$dir"
+    python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$whl" "$dir"
+    rm -rf "$tmp"
+}
+
+ensure_vendor() {
+    echo "=== Vendoring PyAV (local dev only) ==="
+    for pair in $VENDOR_ARCHES; do
+        vendor_one "${pair%%:*}" "${pair##*:}"
+    done
+}
 
 # Verify source directory and plugin.json exist
 if [ ! -d "$SRC_DIR" ]; then
@@ -80,13 +116,18 @@ fi
 [ -f "$OUTPUT_FILE" ] && rm "$OUTPUT_FILE"
 rm -f "${OUTPUT_BASE}"-*.zip 2>/dev/null || true
 
+# PyAV is NOT bundled in the zip (it would blow Dispatcharr's 200MB import limit);
+# it is installed on demand by the plugin's "Install PyAV" action. --revendor only
+# populates src/vendor locally for dev (synced to the dev box via dev-deploy.sh).
+[ -n "$REVENDOR" ] && ensure_vendor
+
 # Copy source to temp dir with plugin name
 cp -r "$SRC_DIR" "$TEMP_DIR/$PLUGIN_NAME"
 
 # Create package
 echo "Creating package..."
 cd "$TEMP_DIR"
-zip -q -r "$OLDPWD/$OUTPUT_FILE" "$PLUGIN_NAME" -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store"
+zip -q -r "$OLDPWD/$OUTPUT_FILE" "$PLUGIN_NAME" -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store" -x "*/vendor/*"
 cd "$OLDPWD"
 
 # Clean up temp directory
