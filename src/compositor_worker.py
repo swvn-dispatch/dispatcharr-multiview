@@ -204,6 +204,15 @@ class Channel:
                 if self.provides_audio and cont.streams.audio:
                     streams.append(cont.streams.audio[0])
                     res = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
+                # PTS-based rate limiter: realign decoded frames to wall clock.
+                # Dispatcharr's live_proxy delivers source streams from a ring
+                # buffer, which can be 1.2x-2.8x faster than realtime. On slow
+                # machines the decode CPU is the natural bottleneck; on fast
+                # machines (more headroom) the decoder races ahead, making
+                # self.latest hold "future" content and causing fast-forward.
+                # We pace each decoded video frame to its PTS-implied wall time.
+                clk_pts = None   # PTS (seconds) at the last clock anchor
+                clk_wall = None  # wall time at the last clock anchor
                 for packet in cont.demux(*streams):
                     if not self.running:
                         break
@@ -211,6 +220,20 @@ class Channel:
                         continue
                     if packet.stream.type == "video":
                         for frame in packet.decode():
+                            if frame.pts is not None:
+                                pts_s = float(frame.pts * vs.time_base)
+                                now = time.monotonic()
+                                if clk_pts is None:
+                                    clk_pts, clk_wall = pts_s, now
+                                else:
+                                    gap = (clk_wall + pts_s - clk_pts) - now
+                                    if 0 < gap < 2.0:
+                                        time.sleep(gap)
+                                    elif gap <= -2.0:
+                                        # More than 2s behind (slow box or
+                                        # PTS reset): re-anchor to avoid
+                                        # trying to catch up across the gap.
+                                        clk_pts, clk_wall = pts_s, time.monotonic()
                             self.latest = fit_into_tile(frame, self.w, self.h)
                             self.fresh_until = time.monotonic() + TILE_STALE_SECS
                             self.vcount += 1
@@ -278,7 +301,6 @@ def _write_all(fd, data):
 
 def build_encoder_cmd(cfg, out_w, out_h, audio_read):
     bitrate = int(cfg.get("bitrate", 8000))
-    crf = int(cfg.get("crf", 23))
     gop = max(2, round(float(fps_fraction(cfg["fps"])) * 2))
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
            # Cap encode threads so it doesn't grab every core and starve the
@@ -292,9 +314,21 @@ def build_encoder_cmd(cfg, out_w, out_h, audio_read):
     cmd += ["-map", "0:v:0"]
     for i in range(len(audio_read)):
         cmd += ["-map", f"{i + 1}:a:0"]
+    # VBV CBR: -b:v == -minrate == -maxrate forces constant bitrate regardless of
+    # content complexity. CRF (VBR) produces near-zero bitrate for static/logo
+    # content; IPTV players drain their receive buffer faster than realtime when
+    # data rate is very low, causing fast-forward on faster hardware. CBR pads
+    # with H.264 filler NAL units to maintain constant rate.
+    # bufsize = 0.5x target keeps encode latency low.
+    # -muxrate is NOT used: with CBR the encoder already guarantees constant
+    # output rate; adding -muxrate on top creates MPEG-TS null packets that
+    # shift the PCR clock away from the video PTS, causing player sync issues.
     cmd += ["-c:v", "libx264", "-preset", cfg.get("preset") or "ultrafast",
-            "-pix_fmt", "yuv420p", "-crf", str(crf),
-            "-maxrate", f"{bitrate}k", "-bufsize", f"{bitrate * 2}k",
+            "-pix_fmt", "yuv420p",
+            "-b:v", f"{bitrate}k",
+            "-minrate", f"{bitrate}k",
+            "-maxrate", f"{bitrate}k",
+            "-bufsize", f"{bitrate // 2}k",
             "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0"]
     if audio_read:
         cmd += ["-c:a", "ac3", "-b:a", "192k"]

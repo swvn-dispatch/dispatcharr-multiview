@@ -245,7 +245,6 @@ class MultiviewServer:
         return {
             "out_w": out_w, "out_h": out_h, "fps": fps_string(settings),
             "bitrate": int(settings.get("output_bitrate") or 8000),
-            "crf": int(settings.get("output_crf") or 23),
             "preset": settings.get("encoder_preset") or "ultrafast",
             "tiles": tile_cfg,
         }

@@ -57,13 +57,13 @@ _GLOBAL_FIELDS = [
     },
     {
         "id": "output_bitrate",
-        "label": "Max Output Bitrate (kbps)",
+        "label": "Output Bitrate (kbps)",
         "type": "number",
         "default": 8000,
         "min": 1000,
         "max": 40000,
         "placeholder": "8000",
-        "description": "Hard ceiling on output video bitrate in kbps.",
+        "description": "Target output video bitrate in kbps (CBR). Higher values improve quality at the cost of bandwidth. 8000 is a good baseline for 1080p multiview; 12000-16000 for noticeably sharper tiles.",
     },
     {
         "id": "epg_refresh_hours",
@@ -90,12 +90,6 @@ _VIDEO_ENCODER_FIELD = {
 
 def _x264_fields() -> list:
     return [
-        {
-            "id": "output_crf",
-            "label": "CRF (Quality)",
-            "type": "number", "default": 23, "min": 0, "max": 51, "placeholder": "23",
-            "description": "Constant Rate Factor: lower = better quality, higher bitrate. 18-23 is visually lossless. Max bitrate cap still applies.",
-        },
         {
             "id": "encoder_preset",
             "label": "Encoder Preset",
