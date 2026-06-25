@@ -3,13 +3,6 @@
 import json
 import os
 
-# Constants
-
-PLUGIN_DB_KEY = "multiview"
-
-DEFAULT_SERVER_PORT = 9292
-DEFAULT_SERVER_HOST = "127.0.0.1"
-
 
 def _load_plugin_config() -> dict:
     config_path = os.path.join(os.path.dirname(__file__), "plugin.json")

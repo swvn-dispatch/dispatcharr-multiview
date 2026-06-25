@@ -87,11 +87,6 @@ def live_stream(channel_id):
         user_agent=USER_AGENT, user=None, output_format="mpegts",
     )
 
-    # client_manager.add_client(
-    #     client_id, CLIENT_IP,
-    #     user_agent=USER_AGENT, user=None, output_format="mpegts",
-    # )
-
     try:
         buffer = proxy.get_buffer(channel_id)
     except Exception as e:  # noqa: BLE001
