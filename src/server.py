@@ -280,16 +280,28 @@ class MultiviewServer:
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [b"Unknown channel\n"]
 
-        gen = _dispatcharr.live_stream(channel_uuid)
-        try:
-            first = next(gen)
-        except StopIteration:
-            # live_stream returned without yielding -- proxy not ready yet.
-            # Return 503 so the compositor worker sees a clean HTTP error and
-            # retries via its backoff, rather than "Invalid data found when
-            # processing input" from a 200 with an empty body.
-            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
-            return [b"Channel not ready\n"]
+        # Retry briefly while the live_proxy warms up the channel after container
+        # start. live_stream() cleans up its client registration in its finally
+        # block before raising StopIteration, so retrying is safe. Keep retries
+        # low (2) to avoid spamming logs when a channel is genuinely unavailable.
+        first = None
+        gen = None
+        for attempt in range(3):
+            gen = _dispatcharr.live_stream(channel_uuid)
+            try:
+                first = next(gen)
+                break
+            except StopIteration:
+                if attempt < 2:
+                    try:
+                        import gevent as _gv
+                        _gv.sleep(1.0)
+                    except ImportError:
+                        import time as _t
+                        _t.sleep(1.0)
+                else:
+                    start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+                    return [b"Channel not ready\n"]
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -372,31 +384,36 @@ class MultiviewServer:
             sock.bind((self.host, self.port))
             sock.close()
         except OSError as e:
-            logger.error(f"Cannot bind to {self.host}:{self.port}: {e}")
+            logger.info(f"Multiview: port {self.port} already taken, skipping ({e})")
             return False
 
         try:
             from gevent import pywsgi
             import gevent as _gevent
-
-            def _run():
-                try:
-                    self._server = pywsgi.WSGIServer(
-                        (self.host, self.port), self.wsgi_app, log=None,
-                    )
-                    self.running = True
-                    set_server(self)
-                    self._server.serve_forever()
-                except Exception as e:  # noqa: BLE001
-                    logger.error(f"Multiview server crashed: {e}", exc_info=True)
-                finally:
-                    self.running = False
-
-            self._greenlet = _gevent.spawn(_run)
-            return True
         except ImportError:
             logger.error("gevent is not installed; cannot start multiview server")
             return False
+
+        def _run():
+            try:
+                self._server = pywsgi.WSGIServer(
+                    (self.host, self.port), self.wsgi_app, log=None,
+                )
+                self.running = True
+                set_server(self)
+                self._server.serve_forever()
+            except OSError as e:
+                # EADDRINUSE here means a concurrent worker won the race between
+                # our test-bind above and this re-bind -- expected on multi-worker
+                # startup, not an error.
+                logger.info(f"Multiview: port {self.port} taken by concurrent worker ({e})")
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Multiview server crashed: {e}", exc_info=True)
+            finally:
+                self.running = False
+
+        self._greenlet = _gevent.spawn(_run)
+        return True
 
     def stop(self):
         if self._server:
