@@ -26,6 +26,7 @@ import sys
 
 from . import dispatcharr as _dispatcharr
 from . import layouts as _layouts
+from .parameters import resolve_preset
 
 logger = logging.getLogger(__name__)
 
@@ -227,14 +228,7 @@ class MultiviewServer:
             })
 
         encoder = settings.get("video_encoder") or "libx264"
-        _nvenc_presets = {"p1", "p2", "p3", "p4", "p5", "p6", "p7"}
-        _x264_presets  = {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"}
-        if encoder == "h264_nvenc":
-            saved = settings.get("encoder_preset")
-            preset = saved if saved in _nvenc_presets else "p4"
-        else:
-            saved = settings.get("encoder_preset")
-            preset = saved if saved in _x264_presets else "ultrafast"
+        preset = resolve_preset(encoder, settings.get("encoder_preset"))
         return {
             "out_w": out_w, "out_h": out_h, "fps": fps_string(settings),
             "bitrate": int(settings.get("output_bitrate") or 8000),

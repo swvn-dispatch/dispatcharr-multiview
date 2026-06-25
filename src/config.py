@@ -15,6 +15,8 @@ PLUGIN_CONFIG = _load_plugin_config()
 _ENCODER_OPTIONS = [
     {"value": "libx264",    "label": "Software (libx264)"},
     {"value": "h264_nvenc", "label": "NVIDIA NVENC (h264_nvenc)"},
+    {"value": "h264_qsv",   "label": "Intel QSV (h264_qsv)"},
+    {"value": "h264_vaapi", "label": "Intel/AMD VAAPI (h264_vaapi)"},
 ]
 
 
@@ -75,10 +77,25 @@ _VIDEO_ENCODER_FIELD = {
     "type": "select",
     "default": "libx264",
     "options": [],  # populated from _ENCODER_OPTIONS in build_plugin_fields
-    "description": "Software (libx264) or NVIDIA GPU (h264_nvenc). NVENC requires an NVIDIA GPU with driver support.",
+    "description": "Software encoder (libx264) or hardware GPU encoder. NVENC requires NVIDIA GPU; QSV/VAAPI require Intel/AMD GPU with /dev/dri support.",
 }
 
 # Per-encoder quality / preset fields
+#
+# ENCODER_PRESETS maps encoder name -> (valid_preset_set, default_preset).
+# server.py imports this for validation; values must stay in sync with the
+# option lists in the field builders below.
+ENCODER_PRESETS: dict[str, tuple[frozenset, str]] = {}
+
+
+def _register_presets(encoder: str, fields_fn):
+    """Populate ENCODER_PRESETS from a field builder's options list."""
+    for f in fields_fn():
+        if f.get("id") == "encoder_preset":
+            vals = frozenset(o["value"] for o in f.get("options", []))
+            ENCODER_PRESETS[encoder] = (vals, f.get("default", ""))
+            return
+
 
 def _x264_fields() -> list:
     return [
@@ -120,10 +137,38 @@ def _nvenc_fields() -> list:
     ]
 
 
+def _qsv_fields() -> list:
+    return [
+        {
+            "id": "encoder_preset",
+            "label": "Encoder Preset",
+            "type": "select", "default": "medium",
+            "options": [
+                {"value": "veryfast", "label": "Very Fast (lowest quality)"},
+                {"value": "faster",   "label": "Faster"},
+                {"value": "fast",     "label": "Fast"},
+                {"value": "medium",   "label": "Medium (recommended)"},
+                {"value": "slow",     "label": "Slow (higher quality)"},
+            ],
+            "description": "QSV encode speed vs quality. Medium is recommended for live multiview.",
+        },
+    ]
+
+
+def _vaapi_fields() -> list:
+    return []
+
+
 _ENCODER_EXTRA_FIELDS = {
     "libx264":    _x264_fields,
     "h264_nvenc": _nvenc_fields,
+    "h264_qsv":   _qsv_fields,
+    "h264_vaapi": _vaapi_fields,
 }
+
+# Populate ENCODER_PRESETS from the field definitions above.
+for _enc, _fn in _ENCODER_EXTRA_FIELDS.items():
+    _register_presets(_enc, _fn)
 
 _MULTIVIEW_COUNT_FIELD = {
     "id": "multiview_count",
@@ -214,8 +259,8 @@ def _build_warnings_fields(settings: dict) -> list:
                 "description": (
                     f"{layout_str} has more than 3 streams configured with software "
                     f"encoding (libx264). This is CPU-intensive and may cause dropped "
-                    f"frames or slow-motion output. Enable NVIDIA NVENC or another "
-                    f"hardware encoder in Video Settings if available."
+                    f"frames or slow-motion output. Enable a hardware encoder "
+                    f"(NVENC, QSV, VAAPI) in Video Settings if available."
                 ),
             })
 
