@@ -114,23 +114,36 @@ def audio_feeder(track, fd, stop):
     CHUNK = int(AUDIO_RATE * 0.02)  # 960 samples = 20ms per tick
     SILENCE = np.zeros((CHUNK, 2), dtype=np.int16)
 
-    # Phase 1: wait for the video PTS clock to establish, then snap the audio
-    # buffer to that position. This discards any audio Dispatcharr pre-buffered
-    # ahead of realtime before we start constant-rate output.
+    start = None
+    written = 0
+    snapped = False
+    was_valid = False
+
     while not stop.is_set():
         pts_now = track.audio_pts_now()
-        if pts_now is not None:
-            track._align_to_pts(pts_now - 0.10)
-            break
-        _write_all(fd, SILENCE.tobytes())
-        time.sleep(0.02)
 
-    # Phase 2: constant wall-clock rate. Smooth output is more important than
-    # perfect PTS tracking; the reconnect flush in Channel.run() handles the
-    # stale-audio problem, so wall-clock pacing is safe here.
-    start = time.monotonic()
-    written = 0
-    while not stop.is_set():
+        if pts_now is None:
+            if was_valid:
+                # Clock just went None -- reconnect in progress; reset snap state
+                # so we re-anchor when the new stream establishes its first frame.
+                snapped = False
+                start = None
+                written = 0
+            was_valid = False
+            _write_all(fd, SILENCE.tobytes())
+            time.sleep(0.02)
+            continue
+
+        if not snapped:
+            # New clock available (startup or post-reconnect): snap audio buffer
+            # to current video PTS and reset wall-clock counters.
+            track._align_to_pts(pts_now - 0.10)
+            start = time.monotonic()
+            written = 0
+            snapped = True
+
+        was_valid = True
+
         target = int((time.monotonic() - start) * AUDIO_RATE)
         need = target - written
         if need > 0:
