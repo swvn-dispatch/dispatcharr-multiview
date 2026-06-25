@@ -147,6 +147,89 @@ _LAYOUT_OPTIONS = [
 ]
 
 
+def _get_multiview_profile_params() -> str:
+    """Return the ffmpeg parameters string for the globally-enabled default stream profile."""
+    try:
+        from core.models import CoreSettings, StreamProfile
+        default_id = CoreSettings.get_default_stream_profile_id()
+        profile = StreamProfile.objects.filter(id=default_id).first()
+        return profile.parameters if profile else ""
+    except Exception:
+        return ""
+
+
+def _build_warnings_fields(settings: dict) -> list:
+    """Return warning info fields for the settings page. Empty list = no warnings = section hidden."""
+    warnings = []
+
+    try:
+        from . import deps as _deps
+        import platform as _platform
+        arch = _deps.detect_arch()
+        if not arch:
+            warnings.append({
+                "id": "_warn_pyav_arch", "label": "Media Engine (PyAV)", "type": "info",
+                "description": (f"Unsupported CPU architecture ({_platform.machine()}); "
+                                f"PyAV is unavailable, streaming will not work."),
+            })
+        elif not _deps.pyav_status(arch):
+            warnings.append({
+                "id": "_warn_pyav_missing", "label": "Media Engine (PyAV)", "type": "info",
+                "description": (f"PyAV is NOT installed for {arch}. Run the "
+                                f"'Install PyAV' action below before streaming."),
+            })
+    except Exception as e:
+        warnings.append({
+            "id": "_warn_pyav_unknown", "label": "Media Engine (PyAV)", "type": "info",
+            "description": f"PyAV status unknown: {e}",
+        })
+
+    params = _get_multiview_profile_params()
+    if params and any(t in params for t in ("-c copy", "-c:a copy", "-codec:a copy", "acodec copy")):
+        warnings.append({
+            "id": "_warn_audio_copy",
+            "label": "Audio: multi-track will be dropped",
+            "type": "info",
+            "description": (
+                "The default stream profile uses audio copy (-c copy) without mapping "
+                "all tracks. Multi-track audio from multiview will be silently dropped "
+                "-- players will only see one audio track. Fix: create a stream profile "
+                "that includes '-map 0' or '-map 0:a' and set it as the default."
+            ),
+        })
+
+    encoder = settings.get("video_encoder", "libx264")
+    if encoder == "libx264":
+        mv_count = max(1, int(settings.get("multiview_count", 1)))
+        heavy_layouts = [
+            n for n in range(1, mv_count + 1)
+            if max(2, int(settings.get(f"multiview_{n}_channel_count", 4))) > 3
+        ]
+        if heavy_layouts:
+            layout_str = ", ".join(f"Layout {n}" for n in heavy_layouts)
+            warnings.append({
+                "id": "_warn_sw_encode",
+                "label": "Performance: software encoding with 4+ streams",
+                "type": "info",
+                "description": (
+                    f"{layout_str} has more than 3 streams configured with software "
+                    f"encoding (libx264). This is CPU-intensive and may cause dropped "
+                    f"frames or slow-motion output. Enable NVIDIA NVENC or another "
+                    f"hardware encoder in Video Settings if available."
+                ),
+            })
+
+    if not warnings:
+        return []
+
+    return [{
+        "id": "_warnings_header",
+        "label": "── Warnings ──────────────────────────",
+        "type": "info",
+        "description": "Use the refresh button (top-right) or restart Dispatcharr to re-check warnings.",
+    }] + warnings
+
+
 def _get_multiview_channel_ids() -> set:
     """Return the set of Channel IDs that belong to the Dispatcharr Multiview M3U account."""
     try:
@@ -393,6 +476,14 @@ def _build_multiview_block(n: int, ch_count: int, selector_type: str = "classic"
     return fields
 
 
+_VIDEO_SETTINGS_HEADER = {
+    "id": "_video_settings_header",
+    "label": "── Video Settings ───────────────────────",
+    "type": "info",
+    "description": "",
+}
+
+
 def build_plugin_fields(settings: dict) -> list:
     """Build the full field list based on current settings."""
     mv_count = max(1, int(settings.get("multiview_count", 1)))
@@ -401,7 +492,9 @@ def build_plugin_fields(settings: dict) -> list:
     enc_field = dict(_VIDEO_ENCODER_FIELD)
     enc_field["options"] = _ENCODER_OPTIONS
 
-    fields = list(_GLOBAL_FIELDS)
+    fields = _build_warnings_fields(settings)
+    fields.append(_VIDEO_SETTINGS_HEADER)
+    fields.extend(_GLOBAL_FIELDS)
     fields.append(enc_field)
 
     extra_fn = _ENCODER_EXTRA_FIELDS.get(encoder, _x264_fields)
