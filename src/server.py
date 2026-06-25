@@ -233,11 +233,8 @@ def _lang_code(name: str) -> str:
     words = clean.split()
     if len(words) <= 1:
         return ((words[0] if words else "unk") + "   ")[:3].lower()
-    sig = [w for w in words if len(w) >= 2 and w.isupper()]
-    if sig:
-        return ("".join(sig) + "   ")[:3].lower()
-    initials = "".join(w[0] for w in words if w)
-    return (initials + "   ")[:3].lower()
+    parts = [w if (w.isupper() and len(w) >= 2) else w[0] for w in words]
+    return ("".join(parts) + "   ")[:3].lower()
 
 
 def _deduplicate_lang_codes(names: list) -> list:
