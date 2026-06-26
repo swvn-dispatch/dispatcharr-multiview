@@ -172,6 +172,9 @@ class MultiviewServer:
             start_response("200 OK", [("Content-Type", "text/plain")])
             return [b"OK\n"]
 
+        if path.startswith("/dash/api/"):
+            return self._handle_api(path[len("/dash"):], environ, start_response)
+
         if path in ("/dash", "/dash/") or path.startswith("/dash/"):
             norm = path if path.startswith("/dash/") else "/dash/"
             return _load_dash_api().serve_static(norm, start_response)

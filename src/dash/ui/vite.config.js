@@ -10,7 +10,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://localhost:9292',
+      '/dash/api': 'http://localhost:9292',
     },
   },
 });

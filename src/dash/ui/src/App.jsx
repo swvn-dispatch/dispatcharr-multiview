@@ -33,7 +33,7 @@ async function apiFetch(path, { method = 'GET', body = null } = {}) {
 }
 
 async function login(username, password) {
-  const resp = await fetch('/api/auth/token', {
+  const resp = await fetch('/dash/api/auth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
@@ -42,13 +42,13 @@ async function login(username, password) {
   setToken((await resp.json()).access);
 }
 
-const loadFields      = async () => { const r = await apiFetch('/api/fields');                                       if (!r.ok) throw new Error('Failed to load fields'); return r.json(); };
-const loadConfig      = async () => { const r = await apiFetch('/api/config');                                       if (!r.ok) throw new Error('Failed to load config'); return r.json(); };
-const patchConfig     = async (u)  => { const r = await apiFetch('/api/config', { method: 'PATCH', body: u });      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || 'Save failed'); } };
-const triggerRefresh  = async () => (await apiFetch('/api/refresh',         { method: 'POST' })).json();
-const listStreams      = async () => (await apiFetch('/api/streams')).json();
-const restartStreams      = async (n) => (await apiFetch('/api/streams/restart', { method: 'POST', body: n != null ? { n } : {} })).json();
-const reconnectChannel    = async (n, channel_idx) => (await apiFetch('/api/streams/restart', { method: 'POST', body: { n, channel_idx } })).json();
+const loadFields      = async () => { const r = await apiFetch('/dash/api/fields');                                       if (!r.ok) throw new Error('Failed to load fields'); return r.json(); };
+const loadConfig      = async () => { const r = await apiFetch('/dash/api/config');                                       if (!r.ok) throw new Error('Failed to load config'); return r.json(); };
+const patchConfig     = async (u)  => { const r = await apiFetch('/dash/api/config', { method: 'PATCH', body: u });      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || 'Save failed'); } };
+const triggerRefresh  = async () => (await apiFetch('/dash/api/refresh',         { method: 'POST' })).json();
+const listStreams      = async () => (await apiFetch('/dash/api/streams')).json();
+const restartStreams      = async (n) => (await apiFetch('/dash/api/streams/restart', { method: 'POST', body: n != null ? { n } : {} })).json();
+const reconnectChannel    = async (n, channel_idx) => (await apiFetch('/dash/api/streams/restart', { method: 'POST', body: { n, channel_idx } })).json();
 
 // ── Field helpers ─────────────────────────────────────────────────────────────
 
