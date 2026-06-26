@@ -135,6 +135,7 @@ class Channel:
         # video PTS clock anchor — updated by run(), read by audio_pts_now()
         self.clk_pts: "float | None" = None
         self.clk_wall: "float | None" = None
+        self._reconnect_requested = False
 
     def _make_fallback(self, logo):
         Y, U, V = black_planes(self.w, self.h)
@@ -175,9 +176,16 @@ class Channel:
         if self.fresh_until == 0.0:         # no real video yet; update latest too
             self.latest = fb
 
+    def reconnect(self):
+        """Signal run() to drop and reconnect; checked inside the demux loop."""
+        self._reconnect_requested = True
+
     def run(self):
         failures = 0
         while self.running:
+            if self._reconnect_requested:
+                self._reconnect_requested = False
+                failures = 0
             if failures >= RECONNECT_RETRIES:
                 log(f"channel {self.name}: giving up after {RECONNECT_RETRIES} failed retries")
                 break
@@ -222,7 +230,7 @@ class Channel:
                     res = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
                 try:
                     for packet in cont.demux(*streams):
-                        if not self.running:
+                        if not self.running or self._reconnect_requested:
                             break
                         if packet.dts is None:
                             continue

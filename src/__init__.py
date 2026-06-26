@@ -19,7 +19,7 @@ with open(os.path.join(_PLUGIN_DIR, "plugin.json")) as _f:
 
 PLUGIN_DB_KEY = "multiview"
 DEFAULT_SERVER_PORT = 9292
-DEFAULT_SERVER_HOST = "127.0.0.1"
+DEFAULT_SERVER_HOST = "0.0.0.0"
 
 
 def _load_submodule(name: str):
@@ -164,8 +164,9 @@ class Plugin:
         lines = ["#EXTM3U"]
         for n in range(1, mv_count + 1):
             name = settings.get(f"multiview_{n}_name", f"Multiview {n}") or f"Multiview {n}"
-            stream_url = f"http://localhost:{DEFAULT_SERVER_PORT}/stream/{n}"
-            lines.append(f'#EXTINF:-1 tvg-id="multiview_{n}" tvg-name="{name}",{name}')
+            safe_name = name.replace('"', "'")  # quotes break EXTINF attribute parsing
+            stream_url = f"http://127.0.0.1:{DEFAULT_SERVER_PORT}/stream/{n}"
+            lines.append(f'#EXTINF:-1 tvg-id="multiview_{n}" tvg-name="{safe_name}",{safe_name}')
             lines.append(stream_url)
 
         m3u_content = "\n".join(lines) + "\n"
@@ -195,7 +196,7 @@ class Plugin:
                 },
             )
             verb = "created" if created else "updated"
-            self._refresh_m3u_then_epg(account.id, source_id)
+            self._refresh_epg_then_m3u(account.id, source_id)
             return {
                 "status": "success",
                 "message": f"M3U written to {m3u_path} | M3U account {verb} in Dispatcharr",
@@ -207,30 +208,31 @@ class Plugin:
                 "message": f"M3U written to {m3u_path} (could not create M3U account: {e})",
             }
 
-    def _refresh_m3u_then_epg(self, account_id, source_id) -> None:
-        """Refresh the M3U account, then the EPG source, in sequence.
+    def _refresh_epg_then_m3u(self, account_id, source_id) -> None:
+        """Refresh EPG first, then M3U, in sequence.
 
         Firing both refreshes at once collides on Dispatcharr's shared celery DB
         connection ("the last operation didn't produce records (command status:
-        INSERT 0 N)"). A celery chain serializes them; M3U first so the multiview
-        channels exist before the EPG maps programs onto them.
+        INSERT 0 N)"). A celery chain serializes them; EPG first so program data
+        is current before the M3U account sync runs.
+
+        refresh_single_m3u_account internally calls refresh_m3u_groups(full_refresh=True)
+        which calls process_groups, which hits a Python 3.13 / Django ORM incompatibility
+        (StopIteration raised inside QuerySet.__iter__ generator -> RuntimeError).
+        Calling refresh_m3u_groups directly with full_refresh=False skips process_groups
+        and avoids the crash.
         """
         try:
             from celery import chain
             from apps.m3u.tasks import refresh_single_m3u_account
             if source_id is not None:
                 from apps.epg.tasks import refresh_epg_data
-                chain(refresh_single_m3u_account.si(account_id),
-                      refresh_epg_data.si(source_id)).delay()
+                chain(refresh_epg_data.si(source_id),
+                      refresh_single_m3u_account.si(account_id)).delay()
             else:
                 refresh_single_m3u_account.delay(account_id)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Could not trigger M3U/EPG refresh chain: {e}")
-            try:  # best-effort fallback: at least refresh the M3U
-                from apps.m3u.tasks import refresh_single_m3u_account
-                refresh_single_m3u_account.delay(account_id)
-            except Exception:
-                pass
+            logger.warning(f"Could not trigger EPG/M3U refresh chain: {e}")
 
     # start_server
 

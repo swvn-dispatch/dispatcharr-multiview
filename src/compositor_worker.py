@@ -42,6 +42,29 @@ def _write_all(fd, data):
     return True
 
 
+def stdin_listener(channels, stop):
+    """Read JSON control commands from stdin (sent by the plugin server)."""
+    for line in sys.stdin:
+        if stop.is_set():
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cmd = json.loads(line)
+        except Exception:
+            continue
+        if cmd.get("cmd") == "reconnect_channel":
+            idx = cmd.get("idx")
+            if idx is not None and 0 <= idx < len(channels):
+                log(f"reconnect requested: channel {idx} ({channels[idx].name})")
+                channels[idx].reconnect()
+        elif cmd.get("cmd") == "reconnect_all":
+            log("reconnect all channels requested")
+            for c in channels:
+                c.reconnect()
+
+
 def audio_feeder(track, fd, stop):
     CHUNK = int(AUDIO_RATE * 0.02)  # 960 samples = 20ms per tick
     SILENCE = np.zeros((CHUNK, 2), dtype=np.int16)
@@ -98,6 +121,7 @@ def main():
 
     for c in channels:
         threading.Thread(target=c.run, name=f"chan-{c.name}", daemon=True).start()
+    threading.Thread(target=stdin_listener, args=(channels, stop), name="stdin-ctrl", daemon=True).start()
 
     # ffmpeg encodes (libx264, multi-core C) + muxes; we feed it the composited
     # yuv420p canvas on stdin and one PCM track per audio channel on inherited fds.
