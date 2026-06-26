@@ -264,6 +264,25 @@ def _build_warnings_fields(settings: dict) -> list:
                 ),
             })
 
+    try:
+        from apps.proxy.config import BaseConfig as _ProxyConfig
+        proxy_settings = _ProxyConfig.get_proxy_settings()
+        grace = int(proxy_settings.get("channel_init_grace_period", 5))
+        if grace < 8:
+            warnings.append({
+                "id": "_warn_channel_init_timeout",
+                "label": "Proxy: Channel Initialization Timeout is too low",
+                "type": "info",
+                "description": (
+                    f"Channel Initialization Timeout is set to {grace}s in Dispatcharr's "
+                    f"Proxy Settings. Values under 8s can cause multiview tiles to fail on "
+                    f"startup before channels finish initializing. "
+                    f"Set it to at least 10s in Settings → Proxy (higher on lower-power systems)."
+                ),
+            })
+    except Exception:
+        pass
+
     if not warnings:
         return []
 
