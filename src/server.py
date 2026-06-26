@@ -169,6 +169,9 @@ class MultiviewServer:
         path = environ.get("PATH_INFO", "")
         loopback = environ.get("REMOTE_ADDR", "") in ("127.0.0.1", "::1")
 
+        remote = environ.get("REMOTE_ADDR", "")
+        loopback = remote in ("127.0.0.1", "::1")
+
         if path == "/health":
             if deny := self._loopback_only(loopback, start_response):
                 return deny

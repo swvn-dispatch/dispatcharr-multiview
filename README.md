@@ -28,6 +28,18 @@ Add `9292:9292` to your `docker-compose.yml` ports to expose the dashboard.
 
 ---
 
+## Dashboard
+
+A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your Dispatcharr credentials to edit all plugin settings and manage active streams without opening the Dispatcharr admin UI.
+
+- **Settings** auto-save as you change them.
+- **Active Multiviews** button (top bar) shows running streams; per-layout reload and per-channel reconnect are available.
+- **Refresh** regenerates the M3U and EPG and triggers a Dispatcharr sync.
+
+Add `9292:9292` to your `docker-compose.yml` ports to expose the dashboard.
+
+---
+
 ## How it works
 
 Each `/stream/{n}` request spawns a dedicated Python worker process with no gevent overhead, giving the compositor real OS threads and full CPU parallelism:
