@@ -159,33 +159,34 @@ class MultiviewServer:
 
     # ------------------------------------------------------------------ WSGI
 
+    def _loopback_only(self, loopback, start_response):
+        if not loopback:
+            start_response("403 Forbidden", [("Content-Type", "text/plain")])
+            return [b"Forbidden\n"]
+        return None
+
     def wsgi_app(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
-
-        remote = environ.get("REMOTE_ADDR", "")
-        loopback = remote in ("127.0.0.1", "::1")
+        loopback = environ.get("REMOTE_ADDR", "") in ("127.0.0.1", "::1")
 
         if path == "/health":
-            if not loopback:
-                start_response("403 Forbidden", [("Content-Type", "text/plain")])
-                return [b"Forbidden\n"]
+            if deny := self._loopback_only(loopback, start_response):
+                return deny
             start_response("200 OK", [("Content-Type", "text/plain")])
             return [b"OK\n"]
 
         if path.startswith("/dash/api/"):
             return self._handle_api(path[len("/dash"):], environ, start_response)
 
-        if path in ("/dash", "/dash/") or path.startswith("/dash/"):
-            norm = path if path.startswith("/dash/") else "/dash/"
-            return _load_dash_api().serve_static(norm, start_response)
+        if path == "/dash" or path.startswith("/dash/"):
+            return _load_dash_api().serve_static(path if path.startswith("/dash/") else "/dash/", start_response)
 
         if path.startswith("/api/"):
             return self._handle_api(path, environ, start_response)
 
         if path.startswith("/stream/"):
-            if not loopback:
-                start_response("403 Forbidden", [("Content-Type", "text/plain")])
-                return [b"Forbidden\n"]
+            if deny := self._loopback_only(loopback, start_response):
+                return deny
             try:
                 n = int(path.split("/")[2])
             except (IndexError, ValueError):
@@ -194,9 +195,8 @@ class MultiviewServer:
             return self._serve_stream(n, start_response)
 
         if path.startswith("/internal/realsrc/"):
-            if not loopback:
-                start_response("403 Forbidden", [("Content-Type", "text/plain")])
-                return [b"Forbidden\n"]
+            if deny := self._loopback_only(loopback, start_response):
+                return deny
             return self._serve_realsrc(path[len("/internal/realsrc/"):], start_response)
 
         start_response("404 Not Found", [("Content-Type", "text/plain")])
