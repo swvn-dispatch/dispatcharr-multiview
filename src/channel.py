@@ -96,11 +96,21 @@ def fit_into_tile(frame, w, h, valign="center", halign="center"):
     sw, sh = frame.width, frame.height
     if sw <= 0 or sh <= 0:
         return black_planes(w, h)
-    scale = min(w / sw, h / sh)
+    if fit == "cover_v":
+        scale = h / sh
+    elif fit == "cover_h":
+        scale = w / sw
+    else:
+        scale = min(w / sw, h / sh)
     tw, th = _even(sw * scale), _even(sh * scale)
-    tw, th = min(tw, w), min(th, h)
     sf = frame.reformat(width=tw, height=th, format="yuv420p")
     sy, su, sv = yuv_planes_from_frame(sf, tw, th)
+    cx = max(0, (tw - w) // 2) & ~1
+    cy = max(0, (th - h) // 2) & ~1
+    cw, ch = min(tw, w), min(th, h)
+    sy = sy[cy:cy + ch, cx:cx + cw]
+    su = su[cy // 2:cy // 2 + ch // 2, cx // 2:cx // 2 + cw // 2]
+    sv = sv[cy // 2:cy // 2 + ch // 2, cx // 2:cx // 2 + cw // 2]
     Y, U, V = black_planes(w, h)
     if halign == "left":
         ox = 0
