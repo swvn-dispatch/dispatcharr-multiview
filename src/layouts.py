@@ -17,12 +17,14 @@ def _even(v: int) -> int:
 
 
 def tile_rects(layout: str, n: int, out_w: int, out_h: int) -> list:
-    """Return [(x, y, w, h, fit), ...], one entry per tile, for the given layout.
+    """Return [(x, y, w, h, valign, halign), ...], one entry per tile.
 
-    `fit` is how the tile's content should be scaled into its rect:
-    "contain" (preserve aspect ratio, letterbox/pillarbox both axes) or
-    "cover_v"/"cover_h" (fill height/width exactly, cropping the other axis)
-    for tiles stacked along that axis so adjacent tiles meet with no gap.
+    `valign`/`halign` say where to anchor a tile's letterboxed/pillarboxed
+    content within its rect: "center" (default) or, for tiles stacked
+    adjacent to a sibling along an axis, "top"/"bottom"/"left"/"right" to
+    push the content against the shared edge (padding lands on the outer
+    edge instead) so adjacent tiles' content touches with no gap. Aspect
+    ratio is always preserved; content is never cropped.
     """
     if layout == "featured":
         rects = _featured_rects(n, out_w, out_h)
@@ -30,7 +32,8 @@ def tile_rects(layout: str, n: int, out_w: int, out_h: int) -> list:
         rects = _top_featured_rects(n, out_w, out_h)
     else:
         rects = _auto_grid_rects(n, out_w, out_h)
-    return [(_even(x), _even(y), _even(w), _even(h), fit) for (x, y, w, h, fit) in rects]
+    return [(_even(x), _even(y), _even(w), _even(h), valign, halign)
+            for (x, y, w, h, valign, halign) in rects]
 
 
 def _auto_grid_rects(n: int, out_w: int, out_h: int) -> list:
@@ -51,7 +54,7 @@ def _auto_grid_rects(n: int, out_w: int, out_h: int) -> list:
         is_last = r == rows - 1 and empty_cells > 0
         x = c * tile_w + (offset_x if is_last else 0)
         y = r * tile_h
-        rects.append((x, y, tile_w, tile_h, "contain"))
+        rects.append((x, y, tile_w, tile_h, "center", "center"))
     return rects
 
 
@@ -66,9 +69,17 @@ def _featured_rects(n: int, out_w: int, out_h: int) -> list:
     side_w = min(round(side_h * 16 / 9), round(out_w * 0.4))
     main_w = out_w - side_w
 
-    rects = [(0, 0, main_w, out_h, "contain")]
+    rects = [(0, 0, main_w, out_h, "center", "center")]
     for i in range(side_count):
-        rects.append((main_w, i * side_h, side_w, side_h, "cover_v"))
+        if side_count == 1:
+            valign = "center"
+        elif i == 0:
+            valign = "bottom"
+        elif i == side_count - 1:
+            valign = "top"
+        else:
+            valign = "center"
+        rects.append((main_w, i * side_h, side_w, side_h, valign, "center"))
     return rects[:n]
 
 
@@ -87,7 +98,15 @@ def _top_featured_rects(n: int, out_w: int, out_h: int) -> list:
     tile_w = round(bottom_h * 16 / 9)
     x_offset = max(0, (out_w - tile_w * bottom_count) // 2)
 
-    rects = [(0, 0, out_w, main_h, "contain")]
+    rects = [(0, 0, out_w, main_h, "center", "center")]
     for i in range(bottom_count):
-        rects.append((x_offset + i * tile_w, main_h, tile_w, bottom_h, "cover_h"))
+        if bottom_count == 1:
+            halign = "center"
+        elif i == 0:
+            halign = "right"
+        elif i == bottom_count - 1:
+            halign = "left"
+        else:
+            halign = "center"
+        rects.append((x_offset + i * tile_w, main_h, tile_w, bottom_h, "center", halign))
     return rects[:n]

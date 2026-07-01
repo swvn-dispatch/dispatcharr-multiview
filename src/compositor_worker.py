@@ -28,6 +28,9 @@ import numpy as np  # noqa: E402
 
 from parameters import fps_fraction, build_encoder_cmd, validate_encoder  # noqa: E402
 
+DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
+                         # FIFO forward to re-sync (see audio_feeder())
+
 
 # ---------------------------------------------------------------- compositing helpers
 
@@ -98,6 +101,15 @@ def audio_feeder(track, fd, stop):
             snapped = True
 
         was_valid = True
+
+        # Only correct audio-behind-video (silent underruns falling further
+        # back over time); a transient audio-ahead-of-video reading is
+        # self-limiting (FIFO capped by _trim(), audio never paced faster
+        # than real time) and left uncorrected, matching the pre-existing
+        # one-shot snap behavior which is also catch-up-only.
+        last_pts = track.last_taken_pts
+        if last_pts is not None and (pts_now - last_pts) > DRIFT_THRESHOLD:
+            track._align_to_pts(pts_now - 0.10)
 
         target = int((time.monotonic() - start) * AUDIO_RATE)
         need = target - written

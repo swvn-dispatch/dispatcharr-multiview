@@ -86,39 +86,37 @@ def _even(v):
     return max(2, (int(v) // 2) * 2)
 
 
-def fit_into_tile(frame, w, h, fit="contain"):
-    """Scale a decoded frame into a w x h yuv420p tile.
-
-    "contain": preserve full aspect ratio, letterbox/pillarbox both axes
-    (centered on black) - matches the old scale+pad behavior.
-    "cover_v"/"cover_h": fill height/width exactly (no padding on that axis),
-    center-cropping the other axis if the scaled content overflows - used for
-    tiles stacked along that axis so adjacent tiles meet with no gap.
-    """
+def fit_into_tile(frame, w, h, valign="center", halign="center"):
+    """Scale a decoded frame into a w x h yuv420p tile, preserving aspect
+    ratio (content is never cropped). Letterbox/pillarbox padding is
+    centered by default, or pushed to one edge via valign ("center"/"top"/
+    "bottom") and halign ("center"/"left"/"right") so a tile's content can
+    be made to touch an adjacent tile's content with no gap at the shared
+    edge, leaving any padding on the outer edge instead."""
     sw, sh = frame.width, frame.height
     if sw <= 0 or sh <= 0:
         return black_planes(w, h)
-    if fit == "cover_v":
-        scale = h / sh
-    elif fit == "cover_h":
-        scale = w / sw
-    else:
-        scale = min(w / sw, h / sh)
+    scale = min(w / sw, h / sh)
     tw, th = _even(sw * scale), _even(sh * scale)
+    tw, th = min(tw, w), min(th, h)
     sf = frame.reformat(width=tw, height=th, format="yuv420p")
     sy, su, sv = yuv_planes_from_frame(sf, tw, th)
-    cx = max(0, (tw - w) // 2) & ~1
-    cy = max(0, (th - h) // 2) & ~1
-    cw, ch = min(tw, w), min(th, h)
-    sy = sy[cy:cy + ch, cx:cx + cw]
-    su = su[cy // 2:cy // 2 + ch // 2, cx // 2:cx // 2 + cw // 2]
-    sv = sv[cy // 2:cy // 2 + ch // 2, cx // 2:cx // 2 + cw // 2]
     Y, U, V = black_planes(w, h)
-    ox = ((w - cw) // 2) & ~1
-    oy = ((h - ch) // 2) & ~1
-    Y[oy:oy + ch, ox:ox + cw] = sy
-    U[oy // 2:oy // 2 + ch // 2, ox // 2:ox // 2 + cw // 2] = su
-    V[oy // 2:oy // 2 + ch // 2, ox // 2:ox // 2 + cw // 2] = sv
+    if halign == "left":
+        ox = 0
+    elif halign == "right":
+        ox = (w - tw) & ~1
+    else:
+        ox = ((w - tw) // 2) & ~1
+    if valign == "top":
+        oy = 0
+    elif valign == "bottom":
+        oy = (h - th) & ~1
+    else:
+        oy = ((h - th) // 2) & ~1
+    Y[oy:oy + th, ox:ox + tw] = sy
+    U[oy // 2:oy // 2 + th // 2, ox // 2:ox // 2 + tw // 2] = su
+    V[oy // 2:oy // 2 + th // 2, ox // 2:ox // 2 + tw // 2] = sv
     return (Y, U, V)
 
 
@@ -136,7 +134,8 @@ class Channel:
         self.provides_audio = bool(spec.get("audio", False))
         self.lang = spec.get("lang", "und")
         self.featured = bool(spec.get("featured", False))
-        self.fit = spec.get("fit", "contain")
+        self.valign = spec.get("valign", "center")
+        self.halign = spec.get("halign", "center")
         self.fallback = black_planes(self.w, self.h)
         self.latest = self.fallback
         self.fresh_until = 0.0
@@ -152,6 +151,11 @@ class Channel:
         # video PTS clock anchor — updated by run(), read by audio_pts_now()
         self.clk_pts: "float | None" = None
         self.clk_wall: "float | None" = None
+        # PTS of the audio content most recently handed to the caller by take() —
+        # used by audio_feeder() to detect drift against the video clock and
+        # periodically re-sync via _align_to_pts(), without waiting for a full
+        # clk_pts reset. Protected by self.alock (same as aframes/abuffered).
+        self.last_taken_pts: "float | None" = None
         self._reconnect_requested = False
 
     def _make_fallback(self, logo):
@@ -212,6 +216,7 @@ class Channel:
             with self.alock:
                 self.aframes.clear()
                 self.abuffered = 0
+                self.last_taken_pts = None
             self.clk_pts = None
             self.clk_wall = None
             vcount_before = self.vcount
@@ -264,7 +269,7 @@ class Channel:
                                             time.sleep(gap)
                                         elif gap <= -2.0:
                                             self.clk_pts, self.clk_wall = pts_s, time.monotonic()
-                                self.latest = fit_into_tile(frame, self.w, self.h, self.fit)
+                                self.latest = fit_into_tile(frame, self.w, self.h, self.valign, self.halign)
                                 self.fresh_until = time.monotonic() + TILE_STALE_SECS
                                 self.vcount += 1
                         elif res is not None and packet.stream.type == "audio":
@@ -344,9 +349,13 @@ class Channel:
                     self.aframes.pop(0)
                     self.abuffered -= chunk.shape[0]
                     filled += chunk.shape[0]
+                    if pts_s is not None:
+                        self.last_taken_pts = pts_s + chunk.shape[0] / AUDIO_RATE
                 else:
                     out[filled:] = chunk[:need]
                     self.aframes[0] = (pts_s, chunk[need:])
                     self.abuffered -= need
                     filled = nsamples
+                    if pts_s is not None:
+                        self.last_taken_pts = pts_s + need / AUDIO_RATE
         return out
