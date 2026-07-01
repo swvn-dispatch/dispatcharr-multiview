@@ -86,23 +86,39 @@ def _even(v):
     return max(2, (int(v) // 2) * 2)
 
 
-def fit_into_tile(frame, w, h):
-    """Scale a decoded frame into a w x h yuv420p tile preserving aspect ratio,
-    centered on black (letterbox/pillarbox) - matches the old scale+pad behavior."""
+def fit_into_tile(frame, w, h, fit="contain"):
+    """Scale a decoded frame into a w x h yuv420p tile.
+
+    "contain": preserve full aspect ratio, letterbox/pillarbox both axes
+    (centered on black) - matches the old scale+pad behavior.
+    "cover_v"/"cover_h": fill height/width exactly (no padding on that axis),
+    center-cropping the other axis if the scaled content overflows - used for
+    tiles stacked along that axis so adjacent tiles meet with no gap.
+    """
     sw, sh = frame.width, frame.height
     if sw <= 0 or sh <= 0:
         return black_planes(w, h)
-    scale = min(w / sw, h / sh)
+    if fit == "cover_v":
+        scale = h / sh
+    elif fit == "cover_h":
+        scale = w / sw
+    else:
+        scale = min(w / sw, h / sh)
     tw, th = _even(sw * scale), _even(sh * scale)
-    tw, th = min(tw, w), min(th, h)
     sf = frame.reformat(width=tw, height=th, format="yuv420p")
     sy, su, sv = yuv_planes_from_frame(sf, tw, th)
+    cx = max(0, (tw - w) // 2) & ~1
+    cy = max(0, (th - h) // 2) & ~1
+    cw, ch = min(tw, w), min(th, h)
+    sy = sy[cy:cy + ch, cx:cx + cw]
+    su = su[cy // 2:cy // 2 + ch // 2, cx // 2:cx // 2 + cw // 2]
+    sv = sv[cy // 2:cy // 2 + ch // 2, cx // 2:cx // 2 + cw // 2]
     Y, U, V = black_planes(w, h)
-    ox = ((w - tw) // 2) & ~1
-    oy = ((h - th) // 2) & ~1
-    Y[oy:oy + th, ox:ox + tw] = sy
-    U[oy // 2:oy // 2 + th // 2, ox // 2:ox // 2 + tw // 2] = su
-    V[oy // 2:oy // 2 + th // 2, ox // 2:ox // 2 + tw // 2] = sv
+    ox = ((w - cw) // 2) & ~1
+    oy = ((h - ch) // 2) & ~1
+    Y[oy:oy + ch, ox:ox + cw] = sy
+    U[oy // 2:oy // 2 + ch // 2, ox // 2:ox // 2 + cw // 2] = su
+    V[oy // 2:oy // 2 + ch // 2, ox // 2:ox // 2 + cw // 2] = sv
     return (Y, U, V)
 
 
@@ -120,6 +136,7 @@ class Channel:
         self.provides_audio = bool(spec.get("audio", False))
         self.lang = spec.get("lang", "und")
         self.featured = bool(spec.get("featured", False))
+        self.fit = spec.get("fit", "contain")
         self.fallback = black_planes(self.w, self.h)
         self.latest = self.fallback
         self.fresh_until = 0.0
@@ -247,7 +264,7 @@ class Channel:
                                             time.sleep(gap)
                                         elif gap <= -2.0:
                                             self.clk_pts, self.clk_wall = pts_s, time.monotonic()
-                                self.latest = fit_into_tile(frame, self.w, self.h)
+                                self.latest = fit_into_tile(frame, self.w, self.h, self.fit)
                                 self.fresh_until = time.monotonic() + TILE_STALE_SECS
                                 self.vcount += 1
                         elif res is not None and packet.stream.type == "audio":

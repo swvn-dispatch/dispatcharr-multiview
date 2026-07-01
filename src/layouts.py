@@ -17,14 +17,20 @@ def _even(v: int) -> int:
 
 
 def tile_rects(layout: str, n: int, out_w: int, out_h: int) -> list:
-    """Return [(x, y, w, h), ...], one rect per tile, for the given layout."""
+    """Return [(x, y, w, h, fit), ...], one entry per tile, for the given layout.
+
+    `fit` is how the tile's content should be scaled into its rect:
+    "contain" (preserve aspect ratio, letterbox/pillarbox both axes) or
+    "cover_v"/"cover_h" (fill height/width exactly, cropping the other axis)
+    for tiles stacked along that axis so adjacent tiles meet with no gap.
+    """
     if layout == "featured":
         rects = _featured_rects(n, out_w, out_h)
     elif layout == "top_featured":
         rects = _top_featured_rects(n, out_w, out_h)
     else:
         rects = _auto_grid_rects(n, out_w, out_h)
-    return [(_even(x), _even(y), _even(w), _even(h)) for (x, y, w, h) in rects]
+    return [(_even(x), _even(y), _even(w), _even(h), fit) for (x, y, w, h, fit) in rects]
 
 
 def _auto_grid_rects(n: int, out_w: int, out_h: int) -> list:
@@ -45,7 +51,7 @@ def _auto_grid_rects(n: int, out_w: int, out_h: int) -> list:
         is_last = r == rows - 1 and empty_cells > 0
         x = c * tile_w + (offset_x if is_last else 0)
         y = r * tile_h
-        rects.append((x, y, tile_w, tile_h))
+        rects.append((x, y, tile_w, tile_h, "contain"))
     return rects
 
 
@@ -60,9 +66,9 @@ def _featured_rects(n: int, out_w: int, out_h: int) -> list:
     side_w = min(round(side_h * 16 / 9), round(out_w * 0.4))
     main_w = out_w - side_w
 
-    rects = [(0, 0, main_w, out_h)]
+    rects = [(0, 0, main_w, out_h, "contain")]
     for i in range(side_count):
-        rects.append((main_w, i * side_h, side_w, side_h))
+        rects.append((main_w, i * side_h, side_w, side_h, "cover_v"))
     return rects[:n]
 
 
@@ -81,7 +87,7 @@ def _top_featured_rects(n: int, out_w: int, out_h: int) -> list:
     tile_w = round(bottom_h * 16 / 9)
     x_offset = max(0, (out_w - tile_w * bottom_count) // 2)
 
-    rects = [(0, 0, out_w, main_h)]
+    rects = [(0, 0, out_w, main_h, "contain")]
     for i in range(bottom_count):
-        rects.append((x_offset + i * tile_w, main_h, tile_w, bottom_h))
+        rects.append((x_offset + i * tile_w, main_h, tile_w, bottom_h, "cover_h"))
     return rects[:n]

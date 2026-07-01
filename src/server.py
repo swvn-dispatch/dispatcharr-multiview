@@ -284,7 +284,7 @@ class MultiviewServer:
         # tiles) decodes at lower effort to save CPU.
         featured_layout = layout in ("featured", "top_featured")
         tile_cfg = []
-        for i, (t, (x, y, w, h)) in enumerate(zip(tiles, rects)):
+        for i, (t, (x, y, w, h, fit)) in enumerate(zip(tiles, rects)):
             tile_cfg.append({
                 "url": f"http://127.0.0.1:{self.port}/internal/realsrc/{t['id']}",
                 "x": x, "y": y, "w": w, "h": h,
@@ -292,6 +292,7 @@ class MultiviewServer:
                 "audio": i in audio_idx,
                 "lang": langs.get(i, "und"),
                 "featured": featured_layout and i == 0,
+                "fit": fit,
             })
 
         encoder = settings.get("video_encoder") or "libx264"
