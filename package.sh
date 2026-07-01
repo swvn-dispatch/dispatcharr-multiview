@@ -121,13 +121,23 @@ rm -f "${OUTPUT_BASE}"-*.zip 2>/dev/null || true
 # populates src/vendor locally for dev (synced to the dev box via dev-deploy.sh).
 [ -n "$REVENDOR" ] && ensure_vendor
 
+# Build the dashboard (React/Vite source in src/dash/ui/ -> built output in src/dash/static/)
+if [ -d "$SRC_DIR/dash/ui" ]; then
+    echo "=== Building dashboard ==="
+    (cd "$SRC_DIR/dash/ui" && npm install --silent && npm run build)
+fi
+
 # Copy source to temp dir with plugin name
 cp -r "$SRC_DIR" "$TEMP_DIR/$PLUGIN_NAME"
 
 # Create package
 echo "Creating package..."
 cd "$TEMP_DIR"
-zip -q -r "$OLDPWD/$OUTPUT_FILE" "$PLUGIN_NAME" -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store" -x "*/vendor/*"
+# Exclude: compiled Python, caches, macOS attrs, vendored PyAV wheels, dashboard source tree
+zip -q -r "$OLDPWD/$OUTPUT_FILE" "$PLUGIN_NAME" \
+    -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store" \
+    -x "*/vendor/*" \
+    -x "*/dash/ui/*"
 cd "$OLDPWD"
 
 # Clean up temp directory

@@ -160,3 +160,9 @@ README_OLD.md
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Dashboard Vite source: node_modules stays local
+src/dash/ui/node_modules/
+
+# Dashboard build output: hashed bundles are rebuilt by package.sh / dev-deploy.sh build
+src/dash/static/assets/
