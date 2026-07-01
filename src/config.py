@@ -22,7 +22,38 @@ _ENCODER_OPTIONS = [
 
 # Global fields (always shown)
 
-_GLOBAL_FIELDS = [
+_GLOBAL_SETTINGS_FIELDS = [
+    {
+        "id": "dash_enabled",
+        "label": "Web Dashboard",
+        "type": "select",
+        "default": "disabled",
+        "options": [
+            {"value": "disabled", "label": "Disabled"},
+            {"value": "enabled",  "label": "Enabled"},
+        ],
+        "description": (
+            "Serves a mobile-friendly PWA dashboard at http://<host>:9292/dash/ "
+            "for editing settings and managing active streams without the "
+            "Dispatcharr admin UI. Off by default. You may need to add "
+            "9292:9292 to your docker-compose.yml ports to reach it from "
+            "outside the container. Changing this setting requires a "
+            "plugin/Dispatcharr reload (e.g. restart Dispatcharr) to take effect."
+        ),
+    },
+    {
+        "id": "epg_refresh_hours",
+        "label": "Auto-Refresh Interval (hours)",
+        "type": "number",
+        "default": 24,
+        "min": 0,
+        "max": 168,
+        "placeholder": "24",
+        "description": "How often to automatically regenerate M3U and EPG. 0 = manual only (Regenerate M3U button).",
+    },
+]
+
+_VIDEO_OUTPUT_FIELDS = [
     {
         "id": "output_resolution",
         "label": "Output Resolution",
@@ -58,34 +89,6 @@ _GLOBAL_FIELDS = [
         "max": 40000,
         "placeholder": "8000",
         "description": "Target output video bitrate in kbps (CBR). Higher values improve quality at the cost of bandwidth. 8000 is a good baseline for 1080p multiview; 12000-16000 for noticeably sharper tiles.",
-    },
-    {
-        "id": "epg_refresh_hours",
-        "label": "Auto-Refresh Interval (hours)",
-        "type": "number",
-        "default": 24,
-        "min": 0,
-        "max": 168,
-        "placeholder": "24",
-        "description": "How often to automatically regenerate M3U and EPG. 0 = manual only (Regenerate M3U button).",
-    },
-    {
-        "id": "dash_enabled",
-        "label": "Web Dashboard",
-        "type": "select",
-        "default": "disabled",
-        "options": [
-            {"value": "disabled", "label": "Disabled"},
-            {"value": "enabled",  "label": "Enabled"},
-        ],
-        "description": (
-            "Serves a mobile-friendly PWA dashboard at http://<host>:9292/dash/ "
-            "for editing settings and managing active streams without the "
-            "Dispatcharr admin UI. Off by default. You may need to add "
-            "9292:9292 to your docker-compose.yml ports to reach it from "
-            "outside the container. Changing this setting requires a "
-            "plugin/Dispatcharr reload (e.g. restart Dispatcharr) to take effect."
-        ),
     },
 ]
 
@@ -570,6 +573,13 @@ def _build_multiview_block(n: int, ch_count: int, selector_type: str = "classic"
     return fields
 
 
+_GLOBAL_SETTINGS_HEADER = {
+    "id": "_global_settings_header",
+    "label": "── Global Settings ──────────────────────",
+    "type": "info",
+    "description": "",
+}
+
 _VIDEO_SETTINGS_HEADER = {
     "id": "_video_settings_header",
     "label": "── Video Settings ───────────────────────",
@@ -587,14 +597,15 @@ def build_plugin_fields(settings: dict) -> list:
     enc_field["options"] = _ENCODER_OPTIONS
 
     fields = _build_warnings_fields(settings)
+    fields.append(_GLOBAL_SETTINGS_HEADER)
+    fields.extend(_GLOBAL_SETTINGS_FIELDS)
+    fields.append(_MULTIVIEW_COUNT_FIELD)
     fields.append(_VIDEO_SETTINGS_HEADER)
-    fields.extend(_GLOBAL_FIELDS)
+    fields.extend(_VIDEO_OUTPUT_FIELDS)
     fields.append(enc_field)
 
     extra_fn = _ENCODER_EXTRA_FIELDS.get(encoder, _x264_fields)
     fields.extend(extra_fn())
-
-    fields.append(_MULTIVIEW_COUNT_FIELD)
 
     for n in range(1, mv_count + 1):
         ch_count = max(2, int(settings.get(f"multiview_{n}_channel_count", 4)))
