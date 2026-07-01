@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import socket
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,14 @@ class Plugin:
         {
             "id": "install_pyav_amd64",
             "label": "Install / Update PyAV (amd64 / x86_64)",
-            "description": "Download and install the PyAV media dependency for x86_64 hosts. Required before streaming. Needs internet access.",
+            "description": (
+                "Download and install the PyAV media dependency for x86_64 hosts. "
+                "Required before streaming. Needs internet access. Running this "
+                "once is treated as consent for the plugin to automatically "
+                "reinstall PyAV for you later if it's ever found missing or "
+                "outdated (e.g. after a plugin update resets the vendored copy) "
+                "-- you shouldn't need to click this again after the first time."
+            ),
             "button_label": "Install PyAV (amd64)",
             "button_variant": "filled",
             "button_color": "blue",
@@ -84,7 +92,14 @@ class Plugin:
         {
             "id": "install_pyav_arm64",
             "label": "Install / Update PyAV (arm64 / aarch64)",
-            "description": "Download and install the PyAV media dependency for aarch64 hosts. Required before streaming. Needs internet access.",
+            "description": (
+                "Download and install the PyAV media dependency for aarch64 hosts. "
+                "Required before streaming. Needs internet access. Running this "
+                "once is treated as consent for the plugin to automatically "
+                "reinstall PyAV for you later if it's ever found missing or "
+                "outdated (e.g. after a plugin update resets the vendored copy) "
+                "-- you shouldn't need to click this again after the first time."
+            ),
             "button_label": "Install PyAV (arm64)",
             "button_variant": "filled",
             "button_color": "blue",
@@ -94,10 +109,17 @@ class Plugin:
     # Lifecycle (init)
 
     def __init__(self):
+        threading.Thread(target=self._auto_repair_pyav, daemon=True).start()
         try:
             self._autostart()
         except Exception as e:
             logger.warning(f"Multiview server auto-start skipped: {e}")
+
+    def _auto_repair_pyav(self):
+        try:
+            self._deps().maybe_auto_install()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Multiview PyAV auto-repair skipped: {e}")
 
     def _autostart(self):
         existing = _server().get_server()

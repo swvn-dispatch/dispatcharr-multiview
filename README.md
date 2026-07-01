@@ -10,7 +10,7 @@ This project is maintained in my spare time. If it's saved you some headaches, a
 
 ---
 
-> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. It is a one-time step per host and takes about 30 seconds. Streams return a 503 until it completes.
+> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. It is a one-time step per host and takes about 30 seconds. Streams return a 503 until it completes. After that first run, the plugin remembers your consent and automatically reinstalls PyAV in the background if it's ever found missing or outdated (e.g. after a plugin update resets the vendored copy) -- no need to click it again.
 
 ---
 

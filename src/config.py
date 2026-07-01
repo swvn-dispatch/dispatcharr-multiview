@@ -236,10 +236,22 @@ def _build_warnings_fields(settings: dict) -> list:
                                 f"PyAV is unavailable, streaming will not work."),
             })
         elif not _deps.pyav_status(arch):
+            if settings.get(f"pyav_consent_{arch}"):
+                desc = (
+                    f"PyAV is not currently installed for {arch}. Since you've "
+                    f"previously installed it, the plugin will automatically "
+                    f"reinstall it in the background on next load."
+                )
+                err = settings.get("pyav_auto_install_error")
+                if err:
+                    desc += (f" Last automatic attempt failed: {err}. You can also "
+                             f"click 'Install PyAV' below to retry immediately.")
+            else:
+                desc = (f"PyAV is NOT installed for {arch}. Run the "
+                        f"'Install PyAV' action below before streaming.")
             warnings.append({
                 "id": "_warn_pyav_missing", "label": "Media Engine (PyAV)", "type": "info",
-                "description": (f"PyAV is NOT installed for {arch}. Run the "
-                                f"'Install PyAV' action below before streaming."),
+                "description": desc,
             })
     except Exception as e:
         warnings.append({
