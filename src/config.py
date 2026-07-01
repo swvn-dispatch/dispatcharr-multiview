@@ -69,6 +69,24 @@ _GLOBAL_FIELDS = [
         "placeholder": "24",
         "description": "How often to automatically regenerate M3U and EPG. 0 = manual only (Regenerate M3U button).",
     },
+    {
+        "id": "dash_enabled",
+        "label": "Web Dashboard",
+        "type": "select",
+        "default": "disabled",
+        "options": [
+            {"value": "disabled", "label": "Disabled"},
+            {"value": "enabled",  "label": "Enabled"},
+        ],
+        "description": (
+            "Serves a mobile-friendly PWA dashboard at http://<host>:9292/dash/ "
+            "for editing settings and managing active streams without the "
+            "Dispatcharr admin UI. Off by default. You may need to add "
+            "9292:9292 to your docker-compose.yml ports to reach it from "
+            "outside the container. Changing this setting requires a "
+            "plugin/Dispatcharr reload (e.g. restart Dispatcharr) to take effect."
+        ),
+    },
 ]
 
 _VIDEO_ENCODER_FIELD = {

@@ -175,6 +175,11 @@ class MultiviewServer:
             start_response("200 OK", [("Content-Type", "text/plain")])
             return [b"OK\n"]
 
+        is_dash_path = path == "/dash" or path.startswith("/dash/") or path.startswith("/api/")
+        if is_dash_path and _settings().get("dash_enabled", "disabled") != "enabled":
+            start_response("404 Not Found", [("Content-Type", "text/plain")])
+            return [b"Not Found\n"]
+
         if path.startswith("/dash/api/"):
             return self._handle_api(path[len("/dash"):], environ, start_response)
 

@@ -18,6 +18,8 @@ This project is maintained in my spare time. If it's saved you some headaches, a
 
 A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your Dispatcharr credentials to edit all plugin settings and manage active streams without opening the Dispatcharr admin UI.
 
+**Disabled by default.** Enable it via the **Web Dashboard** setting on the plugin settings page, then reload the plugin (or restart Dispatcharr) for the change to take effect.
+
 - **Settings** auto-save as you change them.
 - **Active Multiviews** button (top bar) shows running streams; per-layout reload and per-channel reconnect are available.
 - **Refresh** regenerates the M3U and EPG and triggers a Dispatcharr sync.
