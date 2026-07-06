@@ -175,7 +175,7 @@ def handle_channels(environ, start_response):
             pass
 
         channels = []
-        for ch in Channel.objects.order_by("channel_number").values("id", "name", "channel_number"):
+        for ch in Channel.objects.order_by("channel_number").values("id", "name", "channel_number").distinct():
             if ch["id"] in excluded:
                 continue
             num = int(ch["channel_number"]) if ch["channel_number"] is not None else ""
