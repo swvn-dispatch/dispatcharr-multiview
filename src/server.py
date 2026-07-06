@@ -178,6 +178,20 @@ class MultiviewServer:
             start_response("200 OK", [("Content-Type", "text/plain")])
             return [b"OK\n"]
 
+        try:
+            return self._route(path, loopback, environ, start_response)
+        finally:
+            # Everything below here can touch Django's ORM (settings, channel
+            # lookups, plugin config) outside of Django's own request cycle,
+            # which never runs Django's usual request_finished cleanup. Do it
+            # ourselves so connections don't accumulate and eventually go stale.
+            try:
+                from django.db import close_old_connections
+                close_old_connections()
+            except Exception:
+                pass
+
+    def _route(self, path, loopback, environ, start_response):
         is_dash_path = path == "/dash" or path.startswith("/dash/") or path.startswith("/api/")
         if is_dash_path and _settings().get("dash_enabled", "disabled") != "enabled":
             start_response("404 Not Found", [("Content-Type", "text/plain")])
