@@ -483,7 +483,12 @@ export function App() {
     <AppShell header={{ height: 56 }}>
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between" wrap="nowrap">
-          <Image src={logoUrl} h={32} w="auto" style={{ flexShrink: 0 }} />
+          <Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+            <Image src={logoUrl} h={32} w="auto" />
+            <Text size="xs" c="dimmed">
+              v{__APP_VERSION__}
+            </Text>
+          </Group>
           <Group gap="xs" wrap="nowrap">
             <Button size="sm" leftSection={<IconActivity size={16} />}
               color={activeCount > 0 ? 'teal' : undefined}
