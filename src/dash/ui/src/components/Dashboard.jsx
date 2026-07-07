@@ -4,7 +4,7 @@ import { notifications } from '@mantine/notifications';
 import { IconRefresh, IconActivity } from '@tabler/icons-react';
 import { AppHeader, SettingsPanel, ConfirmModal } from '@swvn-dispatch/dispatch-ui-kit';
 import logoUrl from '/logo.png';
-import { loadFields, loadConfig, patchConfig, triggerRefresh, listStreams, setUnauthorizedHandler } from '../api.js';
+import { loadFields, loadConfig, patchConfig, triggerRefresh, listStreams, setUnauthorizedHandler, getUsername } from '../api.js';
 import { isTrigger } from '../utils/fields.js';
 import { LayoutCard } from './LayoutCard.jsx';
 import { ActiveStreamsModal } from './ActiveStreamsModal.jsx';
@@ -135,6 +135,7 @@ export function Dashboard({ onLoggedOut }) {
         appName="Multiview"
         version={__APP_VERSION__}
         githubUrl="https://github.com/swvn-dispatch/dispatcharr-multiview"
+        username={getUsername()}
         onLogout={onLoggedOut}
         actions={[
           {

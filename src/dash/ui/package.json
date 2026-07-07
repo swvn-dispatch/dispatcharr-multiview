@@ -12,7 +12,7 @@
     "@mantine/core": "~8.0.1",
     "@mantine/hooks": "~8.0.1",
     "@mantine/notifications": "~8.0.1",
-    "@swvn-dispatch/dispatch-ui-kit": "0.1.5",
+    "@swvn-dispatch/dispatch-ui-kit": "0.1.6",
     "@tabler/icons-react": "^3.31.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

@@ -14,6 +14,7 @@ const client = createApiClient({
 export const login = client.login;
 export const logout = client.logout;
 export const isAuthenticated = client.isAuthenticated;
+export const getUsername = client.getUsername;
 
 const { request } = client;
 
