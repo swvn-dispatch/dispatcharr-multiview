@@ -231,6 +231,8 @@ class MultiviewServer:
         api._server = self  # inject current server so handlers can call kill_active_streams etc.
         if path == "/api/auth/token":
             return api.handle_auth_token(environ, start_response)
+        if path == "/api/auth/refresh":
+            return api.handle_auth_refresh(environ, start_response)
         if path == "/api/config":
             return api.handle_config(environ, start_response)
         if path == "/api/channels":

@@ -117,6 +117,30 @@ def handle_auth_token(environ, start_response):
         return _json_error(start_response, "500 Internal Server Error", f"Token error: {e}")
 
 
+def handle_auth_refresh(environ, start_response):
+    if environ.get("REQUEST_METHOD") == "OPTIONS":
+        return cors_preflight(start_response)
+    if environ.get("REQUEST_METHOD") != "POST":
+        return _json_error(start_response, "405 Method Not Allowed", "POST only")
+
+    try:
+        data = json.loads(_read_body(environ))
+    except Exception:
+        return _json_error(start_response, "400 Bad Request", "Invalid JSON")
+
+    refresh_str = data.get("refresh", "")
+    if not refresh_str:
+        return _json_error(start_response, "400 Bad Request", "refresh required")
+
+    try:
+        from rest_framework_simplejwt.tokens import RefreshToken
+        from rest_framework_simplejwt.exceptions import TokenError
+        token = RefreshToken(refresh_str)
+        return _json_ok(start_response, {"access": str(token.access_token)})
+    except TokenError:
+        return _json_error(start_response, "401 Unauthorized", "Refresh token invalid or expired")
+
+
 def handle_config(environ, start_response):
     if environ.get("REQUEST_METHOD") == "OPTIONS":
         return cors_preflight(start_response)
