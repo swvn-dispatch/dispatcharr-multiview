@@ -27,7 +27,7 @@ A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your 
 
 Add `9292:9292` to your `docker-compose.yml` ports to expose the dashboard.
 
-The dashboard SPA (`src/dash/ui/`) is React + Mantine, and shares its theme, header bar, login screen, confirm modal, and settings-panel components with the `force-fallback` plugin's dashboard via a separate package, `@swvn-dispatch/dispatch-ui-kit`. See [that package's README](https://github.com/swvn-dispatch/plugins/blob/main/ui-kit/README.md) for the component list and local-testing instructions.
+The dashboard SPA (`src/dash/ui/`) is React + Mantine, and shares its theme, header bar, login screen, confirm modal, and settings-panel components with the `source-switch` plugin's dashboard via a separate package, `@swvn-dispatch/dispatch-ui-kit`. See [that package's README](https://github.com/swvn-dispatch/plugins/blob/main/ui-kit/README.md) for the component list and local-testing instructions.
 
 ```bash
 cd src/dash/ui
