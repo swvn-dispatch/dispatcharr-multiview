@@ -1,4 +1,5 @@
-"""REST API handlers for /api/* and static file serving for /dash/*."""
+"""REST API handlers for /api/* and static file serving under the dashboard's
+runtime-configurable mount path (dash_path setting, default /dash)."""
 
 import json
 import logging
@@ -371,9 +372,13 @@ def handle_fields(environ, start_response):
         return _json_error(start_response, "500 Internal Server Error", str(e))
 
 
-def serve_static(path: str, start_response):
-    """Serve files from src/dash/static/."""
-    rel = path[len("/dash/"):] or "index.html"
+def serve_static(mount_path: str, sub_path: str, start_response):
+    """Serve files from dash/static/, under a runtime-configurable mount path.
+
+    mount_path: normalized prefix the server routed on, e.g. "/dash".
+    sub_path: request path relative to mount_path, e.g. "/", "/assets/index-x.js".
+    """
+    rel = sub_path.lstrip("/") or "index.html"
 
     # Block path traversal
     safe = os.path.normpath(rel)
@@ -391,10 +396,20 @@ def serve_static(path: str, start_response):
 
     mime, _ = mimetypes.guess_type(file_path)
     mime = mime or "application/octet-stream"
-    cache_control = "no-cache" if mime == "text/html" else "public, max-age=3600"
 
     with open(file_path, "rb") as f:
         data = f.read()
+
+    if mime == "text/html":
+        # The SPA build uses relative asset paths (base: './'), so it doesn't
+        # know its own mount path at build time. Inject it at request time so
+        # the frontend can build correct API/asset URLs.
+        base = (mount_path or "") + "/"
+        snippet = f'<script>window.__BASE_PATH__={json.dumps(base)};</script>'.encode()
+        data = data.replace(b"<head>", b"<head>" + snippet, 1)
+        cache_control = "no-cache"
+    else:
+        cache_control = "public, max-age=3600"
 
     start_response("200 OK", [
         ("Content-Type", mime),

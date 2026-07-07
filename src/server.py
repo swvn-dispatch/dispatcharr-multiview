@@ -108,6 +108,22 @@ def _settings() -> dict:
         return {}
 
 
+def _normalized_dash_path() -> str:
+    """Return the configured mount path, normalized to e.g. '/dash' (no trailing slash).
+
+    Unlike force-fallback, this always returns a non-empty path -- this
+    server also handles /stream/* and /internal/realsrc/* for the actual
+    multiview output, so an empty (root-mount) dash_path isn't supported
+    here; it would make the dashboard's catch-all static serving swallow
+    those routes. Falls back to the default if configured as empty/"/".
+    """
+    raw = (_settings().get("dash_path") or "/dash").strip()
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    raw = raw.rstrip("/")
+    return raw or "/dash"
+
+
 # --- audio track labeling (unchanged; see lessons OLD notes) ------------------
 
 def _lang_code(name: str) -> str:
@@ -192,20 +208,9 @@ class MultiviewServer:
                 pass
 
     def _route(self, path, loopback, environ, start_response):
-        is_dash_path = path == "/dash" or path.startswith("/dash/") or path.startswith("/api/")
-        if is_dash_path and _settings().get("dash_enabled", "disabled") != "enabled":
-            start_response("404 Not Found", [("Content-Type", "text/plain")])
-            return [b"Not Found\n"]
-
-        if path.startswith("/dash/api/"):
-            return self._handle_api(path[len("/dash"):], environ, start_response)
-
-        if path == "/dash" or path.startswith("/dash/"):
-            return _load_dash_api().serve_static(path if path.startswith("/dash/") else "/dash/", start_response)
-
-        if path.startswith("/api/"):
-            return self._handle_api(path, environ, start_response)
-
+        # Checked first, unconditionally, so a dash_path that happens to
+        # collide with these reserved prefixes can't shadow the plugin's
+        # actual streaming endpoints (see _normalized_dash_path's docstring).
         if path.startswith("/stream/"):
             if deny := self._loopback_only(loopback, start_response):
                 return deny
@@ -220,6 +225,29 @@ class MultiviewServer:
             if deny := self._loopback_only(loopback, start_response):
                 return deny
             return self._serve_realsrc(path[len("/internal/realsrc/"):], start_response)
+
+        dash_path = _normalized_dash_path()
+        is_dash_path = path == dash_path or path.startswith(dash_path + "/") or path.startswith("/api/")
+        if is_dash_path and _settings().get("dash_enabled", "disabled") != "enabled":
+            start_response("404 Not Found", [("Content-Type", "text/plain")])
+            return [b"Not Found\n"]
+
+        # Redirect the bare mount root (no trailing slash) so the browser's
+        # location bar ends in "/" -- the SPA build uses relative asset paths,
+        # which resolve against the current document's directory.
+        if path == dash_path:
+            start_response("302 Found", [("Location", dash_path + "/")])
+            return [b""]
+
+        if path.startswith(dash_path + "/api/"):
+            return self._handle_api(path[len(dash_path):], environ, start_response)
+
+        if path.startswith(dash_path + "/"):
+            sub = path[len(dash_path):] or "/"
+            return _load_dash_api().serve_static(dash_path, sub, start_response)
+
+        if path.startswith("/api/"):
+            return self._handle_api(path, environ, start_response)
 
         start_response("404 Not Found", [("Content-Type", "text/plain")])
         return [b"Not Found\n"]

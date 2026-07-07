@@ -33,12 +33,26 @@ _GLOBAL_SETTINGS_FIELDS = [
             {"value": "enabled",  "label": "Enabled"},
         ],
         "description": (
-            "Serves a mobile-friendly PWA dashboard at http://<host>:9292/dash/ "
-            "for editing settings and managing active streams without the "
-            "Dispatcharr admin UI. Off by default. You may need to add "
-            "9292:9292 to your docker-compose.yml ports to reach it from "
-            "outside the container. Changing this setting requires a "
+            "Serves a mobile-friendly PWA dashboard on port 9292 (fixed -- "
+            "shared with the multiview stream output itself, not "
+            "configurable) for editing settings and managing active streams "
+            "without the Dispatcharr admin UI. Off by default. You may need "
+            "to add 9292:9292 to your docker-compose.yml ports to reach it "
+            "from outside the container. Changing this setting requires a "
             "plugin/Dispatcharr reload (e.g. restart Dispatcharr) to take effect."
+        ),
+    },
+    {
+        "id": "dash_path",
+        "label": "Dashboard Mount Path",
+        "type": "string",
+        "default": "/dash",
+        "placeholder": "/dash",
+        "description": (
+            "URL path the dashboard is served under, e.g. '/dash' gives "
+            "http://<host>:9292/dash/. Takes effect immediately, no restart "
+            "needed. Avoid '/stream' and '/internal', which are reserved for "
+            "the plugin's own streaming endpoints."
         ),
     },
     {

@@ -7,7 +7,6 @@ export function setUnauthorizedHandler(fn) {
 
 const client = createApiClient({
   tokenKey: 'mv_token',
-  basePath: '/dash/',
   onUnauthorized: (err) => handleUnauthorized(err),
 });
 
