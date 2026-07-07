@@ -132,7 +132,9 @@ export function Dashboard({ onLoggedOut }) {
     <AppShell header={{ height: 56 }}>
       <AppHeader
         logoUrl={logoUrl}
+        appName="Multiview"
         version={__APP_VERSION__}
+        githubUrl="https://github.com/swvn-dispatch/dispatcharr-multiview"
         onLogout={onLoggedOut}
         actions={[
           {

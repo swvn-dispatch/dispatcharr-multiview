@@ -164,5 +164,10 @@ README_OLD.md
 # Dashboard Vite source: node_modules stays local
 src/dash/ui/node_modules/
 
+# ui-kit dependency is pinned exactly in package.json — no lockfile needed
+# for reproducibility of that; not tracking avoids lockfile-vs-package.json
+# drift maintenance across this repo and force-fallback
+src/dash/ui/package-lock.json
+
 # Dashboard build output: hashed bundles are rebuilt by package.sh / dev-deploy.sh build
 src/dash/static/assets/

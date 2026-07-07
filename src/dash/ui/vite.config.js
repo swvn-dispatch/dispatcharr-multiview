@@ -11,6 +11,11 @@ const pluginVersion = JSON.parse(readFileSync(pluginJsonPath, 'utf-8')).version;
 export default defineConfig({
   plugins: [react()],
   base: '/dash/',
+  // Forces a single React/Mantine instance even when @swvn-dispatch/dispatch-ui-kit
+  // is npm-linked from a local checkout (which has its own copies for its own build).
+  resolve: {
+    dedupe: ['react', 'react-dom', '@mantine/core', '@mantine/hooks', '@mantine/notifications'],
+  },
   define: { __APP_VERSION__: JSON.stringify(pluginVersion) },
   build: {
     outDir: '../static',
