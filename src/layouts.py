@@ -16,7 +16,7 @@ def _even(v: int) -> int:
     return int(v) - (int(v) % 2)
 
 
-def tile_rects(layout: str, n: int, out_w: int, out_h: int) -> list:
+def tile_rects(layout: str, n: int, out_w: int, out_h: int, custom_registry: dict = None) -> list:
     """Return [(x, y, w, h, valign, halign), ...], one entry per tile.
 
     `valign`/`halign` say where to anchor a tile's letterboxed/pillarboxed
@@ -25,7 +25,25 @@ def tile_rects(layout: str, n: int, out_w: int, out_h: int) -> list:
     push the content against the shared edge (padding lands on the outer
     edge instead) so adjacent tiles' content touches with no gap. Aspect
     ratio is always preserved; content is never cropped.
+
+    `layout` of the form "custom:<style_id>" looks up a user-defined style in
+    *custom_registry* (the `multiview_custom_layouts` settings dict: style_id
+    -> {"name": ..., "tiles": {channel_count_str: [[x,y,w,h,valign,halign], ...]}}
+    with x/y/w/h as 0..1 fractions of the output canvas). Falls back to the
+    auto-grid if the style or this specific channel count isn't defined.
     """
+    if isinstance(layout, str) and layout.startswith("custom:"):
+        style = (custom_registry or {}).get(layout[len("custom:"):])
+        tiles = (style or {}).get("tiles", {}).get(str(n)) if style else None
+        if tiles:
+            rects = [
+                (x * out_w, y * out_h, w * out_w, h * out_h, valign, halign)
+                for (x, y, w, h, valign, halign) in tiles
+            ]
+            return [(_even(x), _even(y), _even(w), _even(h), valign, halign)
+                    for (x, y, w, h, valign, halign) in rects]
+        layout = "auto"
+
     if layout == "featured":
         rects = _featured_rects(n, out_w, out_h)
     elif layout == "top_featured":

@@ -19,6 +19,9 @@ const { request } = client;
 
 export const loadFields = () => request('/fields');
 export const loadConfig = () => request('/config');
+export const loadChannels = () => request('/channels');
+export const previewStyle = (layout, channelCount) =>
+  request(`/styles/preview?layout=${encodeURIComponent(layout)}&channel_count=${channelCount}`);
 export const patchConfig = (updates) => request('/config', { method: 'PATCH', body: JSON.stringify(updates) });
 export const triggerRefresh = () => request('/refresh', { method: 'POST' });
 export const listStreams = () => request('/streams');

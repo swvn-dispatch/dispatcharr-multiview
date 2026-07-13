@@ -24,6 +24,7 @@ import re
 import socket
 import sys
 
+from . import config as _mvconfig
 from . import dispatcharr as _dispatcharr
 from . import layouts as _layouts
 from .parameters import resolve_preset
@@ -103,9 +104,16 @@ def set_server(s):
 def _settings() -> dict:
     try:
         from apps.plugins.models import PluginConfig
-        return PluginConfig.objects.get(key="multiview").settings
+        cfg = PluginConfig.objects.get(key="multiview")
     except Exception:
-        return {}
+        settings, _ = _mvconfig.ensure_layout_order({})
+        return settings
+
+    settings, changed = _mvconfig.ensure_layout_order(cfg.settings)
+    if changed:
+        cfg.settings = settings
+        cfg.save()
+    return settings
 
 
 def _normalized_dash_path() -> str:
@@ -215,11 +223,14 @@ class MultiviewServer:
             if deny := self._loopback_only(loopback, start_response):
                 return deny
             try:
-                n = int(path.split("/")[2])
-            except (IndexError, ValueError):
+                layout_id = path.split("/")[2]
+            except IndexError:
                 start_response("400 Bad Request", [("Content-Type", "text/plain")])
                 return [b"Invalid stream index\n"]
-            return self._serve_stream(n, start_response)
+            if not layout_id:
+                start_response("400 Bad Request", [("Content-Type", "text/plain")])
+                return [b"Invalid stream index\n"]
+            return self._serve_stream(layout_id, start_response)
 
         if path.startswith("/internal/realsrc/"):
             if deny := self._loopback_only(loopback, start_response):
@@ -273,25 +284,27 @@ class MultiviewServer:
             return api.handle_streams_list(environ, start_response)
         if path == "/api/streams/restart":
             return api.handle_streams_restart(environ, start_response)
+        if path == "/api/styles/preview":
+            return api.handle_styles_preview(environ, start_response)
         start_response("404 Not Found", [("Content-Type", "text/plain")])
         return [b"Not Found\n"]
 
-    def _serve_stream(self, n: int, start_response):
-        logger.info(f"Stream request: layout {n}")
+    def _serve_stream(self, layout_id: str, start_response):
+        logger.info(f"Stream request: layout {layout_id}")
         try:
-            tiles, layout, audio_source = self._resolve_layout(n)
+            tiles, layout, audio_source = self._resolve_layout(layout_id)
         except LookupError as e:
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [str(e).encode()]
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Layout {n} error: {e}", exc_info=True)
+            logger.error(f"Layout {layout_id} error: {e}", exc_info=True)
             start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
             return [b"error\n"]
 
         from . import deps as _deps
         arch = _deps.detect_arch()
         if not arch or not _deps.pyav_status(arch):
-            logger.warning(f"Stream {n}: PyAV not installed for {arch or 'this arch'}")
+            logger.warning(f"Stream {layout_id}: PyAV not installed for {arch or 'this arch'}")
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [(f"PyAV media engine not installed for {arch or 'this CPU arch'}. "
                      f"Open the Multiview plugin settings and run the 'Install PyAV' "
@@ -306,19 +319,20 @@ class MultiviewServer:
         import gevent
         import gevent.subprocess as gsub
         proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE)
-        stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{n}")
-        self._active_procs[proc] = {"n": n, "cfg": cfg}
+        stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{layout_id}")
+        self._active_procs[proc] = {"n": layout_id, "cfg": cfg}
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
             ("Cache-Control", "no-cache"),
             ("X-Accel-Buffering", "no"),
         ])
-        return self._pump_stdout(proc, f"worker {n}", stderr_gl)
+        return self._pump_stdout(proc, f"worker {layout_id}", stderr_gl)
 
     def _worker_config(self, tiles, layout, audio_source, settings) -> dict:
         out_w, out_h = _parse_resolution(settings)
-        rects = _layouts.tile_rects(layout, len(tiles), out_w, out_h)
+        custom_registry = settings.get("multiview_custom_layouts", {})
+        rects = _layouts.tile_rects(layout, len(tiles), out_w, out_h, custom_registry)
         names = [t["name"] for t in tiles]
 
         # Which tiles contribute an audio track, and their language codes.
@@ -364,7 +378,9 @@ class MultiviewServer:
             if n not in seen:
                 tiles = info["cfg"].get("tiles", [])
                 seen[n] = {"n": n, "channels": [{"idx": i, "name": t.get("name", f"Channel {i+1}")} for i, t in enumerate(tiles)]}
-        return [seen[n] for n in sorted(seen)]
+        order = _settings().get("multiview_order", [])
+        order_rank = {layout_id: i for i, layout_id in enumerate(order)}
+        return sorted(seen.values(), key=lambda s: order_rank.get(s["n"], len(order)))
 
     def kill_active_streams(self) -> int:
         procs = list(self._active_procs)
@@ -375,7 +391,7 @@ class MultiviewServer:
                 pass
         return len(procs)
 
-    def kill_stream(self, n: int) -> int:
+    def kill_stream(self, n: str) -> int:
         to_kill = [p for p, info in list(self._active_procs.items()) if info["n"] == n]
         for proc in to_kill:
             try:
@@ -384,7 +400,7 @@ class MultiviewServer:
                 pass
         return len(to_kill)
 
-    def reconnect_channel(self, n: int, idx: int) -> bool:
+    def reconnect_channel(self, n: str, idx: int) -> bool:
         import json as _json
         for proc, info in list(self._active_procs.items()):
             if info["n"] == n:
@@ -477,27 +493,24 @@ class MultiviewServer:
 
     # --------------------------------------------------------------- helpers
 
-    def _resolve_layout(self, n: int):
+    def _resolve_layout(self, layout_id: str):
         """Return (tiles, layout, audio_source).
 
         tiles: list of {"id": channel_id, "name": str, "logo": str|None}. At
         least 2 required.
         """
-        from apps.plugins.models import PluginConfig
         from apps.channels.models import Channel
 
-        try:
-            settings = PluginConfig.objects.get(key="multiview").settings
-        except Exception:
-            settings = {}
+        settings = _settings()
+        n = layout_id  # short alias for the log/error messages below
 
-        ch_count = max(2, int(settings.get(f"multiview_{n}_channel_count", 4)))
-        layout = settings.get(f"multiview_{n}_layout", "auto")
-        selector_type = settings.get(f"multiview_{n}_selector_type", "classic")
+        ch_count = max(2, int(settings.get(f"multiview_{layout_id}_channel_count", 4)))
+        layout = settings.get(f"multiview_{layout_id}_layout", "auto")
+        selector_type = settings.get(f"multiview_{layout_id}_selector_type", "classic")
 
         tiles = []
         if selector_type == "regex":
-            pattern = settings.get(f"multiview_{n}_regex_pattern", "").strip()
+            pattern = settings.get(f"multiview_{layout_id}_regex_pattern", "").strip()
             if not pattern:
                 raise LookupError(f"Layout {n} is in regex mode but has no pattern configured")
             matched = list(
@@ -506,12 +519,12 @@ class MultiviewServer:
             )
             for ch in matched:
                 tiles.append({"id": ch.id, "name": ch.name, "logo": _channel_logo(ch)})
-            audio_source = settings.get(f"multiview_{n}_audio_source", "0")
+            audio_source = settings.get(f"multiview_{layout_id}_audio_source", "0")
             if audio_source in ("regex_first", "regex_lowest"):
                 audio_source = "0"
         else:
             for m in range(1, ch_count + 1):
-                ch_id_str = settings.get(f"multiview_{n}_channel_{m}", "_none")
+                ch_id_str = settings.get(f"multiview_{layout_id}_channel_{m}", "_none")
                 if not ch_id_str or ch_id_str == "_none":
                     continue
                 try:
@@ -520,7 +533,7 @@ class MultiviewServer:
                     logger.warning(f"Layout {n} slot {m}: id={ch_id_str} not found, skipping")
                     continue
                 tiles.append({"id": ch.id, "name": ch.name, "logo": _channel_logo(ch)})
-            audio_source = settings.get(f"multiview_{n}_audio_source", "0")
+            audio_source = settings.get(f"multiview_{layout_id}_audio_source", "0")
 
         if len(tiles) < 2:
             raise LookupError(

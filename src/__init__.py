@@ -165,13 +165,17 @@ class Plugin:
     @property
     def fields(self):
         """Regenerate fields from current DB settings on every request."""
+        config_mod = _config()
         try:
             from apps.plugins.models import PluginConfig
             cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings = cfg.settings
+            settings, changed = config_mod.ensure_layout_order(cfg.settings)
+            if changed:
+                cfg.settings = settings
+                cfg.save()
         except Exception:
-            settings = {}
-        return _config().build_plugin_fields(settings)
+            settings, _changed = config_mod.ensure_layout_order({})
+        return config_mod.build_plugin_fields(settings)
 
     # Action dispatcher
 
@@ -192,20 +196,24 @@ class Plugin:
     # generate_m3u
 
     def _generate_m3u(self) -> dict:
+        config_mod = _config()
         try:
             from apps.plugins.models import PluginConfig
             cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings = cfg.settings
+            settings, changed = config_mod.ensure_layout_order(cfg.settings)
+            if changed:
+                cfg.settings = settings
+                cfg.save()
         except Exception:
-            settings = {}
-        mv_count = max(1, int(settings.get("multiview_count", 1)))
+            settings, _changed = config_mod.ensure_layout_order({})
+        order = settings.get("multiview_order", [])
 
         lines = ["#EXTM3U"]
-        for n in range(1, mv_count + 1):
+        for n in order:
             name = settings.get(f"multiview_{n}_name", f"Multiview {n}") or f"Multiview {n}"
             safe_name = name.replace('"', "'")  # quotes break EXTINF attribute parsing
             stream_url = f"http://127.0.0.1:{DEFAULT_SERVER_PORT}/stream/{n}"
-            lines.append(f'#EXTINF:-1 tvg-id="multiview_{n}" tvg-name="{safe_name}",{safe_name}')
+            lines.append(f'#EXTINF:-1 tvg-id="mv-{n}" tvg-name="{safe_name}",{safe_name}')
             lines.append(stream_url)
 
         m3u_content = "\n".join(lines) + "\n"
