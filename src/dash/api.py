@@ -1,14 +1,19 @@
 """REST API handlers for /api/* and static file serving under the dashboard's
 runtime-configurable mount path (dash_path setting, default /dash)."""
 
+import base64
 import json
 import logging
 import mimetypes
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BACKGROUNDS_DIR = os.path.join(_PLUGIN_DIR, "style_backgrounds")
+_MAX_BACKGROUND_BYTES = 5 * 1024 * 1024
 _PLUGIN_KEY = "multiview"
 
 _CORS_HEADERS = [
@@ -63,15 +68,18 @@ def _verify_token(environ) -> bool:
 
 
 def _get_settings() -> dict:
+    config_mod = _get_config_mod()
     try:
         from apps.plugins.models import PluginConfig
         cfg = PluginConfig.objects.get(key=_PLUGIN_KEY)
     except Exception:
-        settings, _ = _get_config_mod().ensure_layout_order({})
+        settings, _ = config_mod.ensure_layout_order({})
+        settings, _ = config_mod.reconcile_layout_count(settings)
         return settings
 
-    settings, changed = _get_config_mod().ensure_layout_order(cfg.settings)
-    if changed:
+    settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
+    settings, changed2 = config_mod.reconcile_layout_count(settings)
+    if changed1 or changed2:
         cfg.settings = settings
         cfg.save()
     return settings
@@ -149,6 +157,25 @@ def handle_auth_refresh(environ, start_response):
         return _json_error(start_response, "401 Unauthorized", "Refresh token invalid or expired")
 
 
+def _plugin_version() -> str:
+    try:
+        with open(os.path.join(_PLUGIN_DIR, "plugin.json")) as f:
+            return json.load(f).get("version", "")
+    except Exception:
+        return ""
+
+
+def _dispatcharr_version() -> str:
+    # Dispatcharr's version lives in a plain top-level `version.py` module
+    # (not under the `dispatcharr` package) -- not a stable public API, so
+    # this is defensive: a future Dispatcharr release could move/remove it.
+    try:
+        import version as _dv
+        return getattr(_dv, "__version__", "")
+    except Exception:
+        return ""
+
+
 def handle_config(environ, start_response):
     if environ.get("REQUEST_METHOD") == "OPTIONS":
         return cors_preflight(start_response)
@@ -160,7 +187,12 @@ def handle_config(environ, start_response):
     if method == "GET":
         settings = _get_settings()
         layout_count = len(settings.get("multiview_order", []))
-        return _json_ok(start_response, {"settings": settings, "layout_count": layout_count})
+        return _json_ok(start_response, {
+            "settings": settings,
+            "layout_count": layout_count,
+            "plugin_version": _plugin_version(),
+            "dispatcharr_version": _dispatcharr_version(),
+        })
 
     if method in ("PATCH", "POST"):
         try:
@@ -395,6 +427,99 @@ def handle_styles_preview(environ, start_response):
         return _json_error(start_response, "500 Internal Server Error", str(e))
 
 
+def _sanitize_filename(name: str) -> str:
+    base = os.path.basename(name or "background")
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    return base or "background"
+
+
+def handle_style_background(environ, start_response):
+    """GET serves a style's saved background image; POST uploads/replaces one.
+
+    Uploads are base64-in-JSON, not multipart -- this raw WSGI app has no
+    form-parsing anywhere, matching every other endpoint's json-in/json-out
+    convention. Image validity is only checked lightly (size cap) rather than
+    decoded here: PyAV must never be imported into this gevent-patched
+    process (compositor_worker.py runs it in a separate plain-CPython
+    subprocess specifically to avoid that conflict) -- a bad file just fails
+    gracefully later when the worker tries to decode it, same as the
+    existing per-channel logo fallback already handles decode failures.
+    """
+    if environ.get("REQUEST_METHOD") == "OPTIONS":
+        return cors_preflight(start_response)
+    if not _verify_token(environ):
+        return _json_error(start_response, "401 Unauthorized", "Authentication required")
+
+    method = environ.get("REQUEST_METHOD", "GET")
+
+    if method == "GET":
+        from urllib.parse import parse_qs
+        qs = parse_qs(environ.get("QUERY_STRING", ""))
+        style_id = (qs.get("style_id") or [""])[0]
+        if not style_id:
+            return _json_error(start_response, "400 Bad Request", "style_id required")
+        settings = _get_settings()
+        style = settings.get("multiview_custom_layouts", {}).get(style_id)
+        filename = style.get("background_image") if style else None
+        if not filename:
+            return _json_error(start_response, "404 Not Found", "No background image set")
+        path = os.path.join(_BACKGROUNDS_DIR, filename)
+        if not os.path.isfile(path):
+            return _json_error(start_response, "404 Not Found", "Background image file missing")
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return _json_error(start_response, "500 Internal Server Error", str(e))
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        start_response("200 OK", [
+            ("Content-Type", content_type),
+            ("Content-Length", str(len(data))),
+        ] + _CORS_HEADERS)
+        return [data]
+
+    if method == "POST":
+        try:
+            body = json.loads(_read_body(environ))
+        except Exception:
+            return _json_error(start_response, "400 Bad Request", "Invalid JSON")
+        style_id = body.get("style_id")
+        filename = body.get("filename")
+        data_b64 = body.get("data_base64")
+        if not style_id or not filename or not data_b64:
+            return _json_error(start_response, "400 Bad Request", "style_id, filename, data_base64 required")
+
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            return _json_error(start_response, "400 Bad Request", "Invalid base64 data")
+        if len(raw) > _MAX_BACKGROUND_BYTES:
+            return _json_error(start_response, "400 Bad Request", f"Image too large (max {_MAX_BACKGROUND_BYTES // (1024*1024)}MB)")
+
+        stored_name = f"{style_id}_{_sanitize_filename(filename)}"
+        try:
+            os.makedirs(_BACKGROUNDS_DIR, exist_ok=True)
+            with open(os.path.join(_BACKGROUNDS_DIR, stored_name), "wb") as f:
+                f.write(raw)
+        except OSError as e:
+            return _json_error(start_response, "500 Internal Server Error", f"Failed to save image: {e}")
+
+        try:
+            settings = _get_settings()
+            custom_layouts = dict(settings.get("multiview_custom_layouts", {}))
+            style = dict(custom_layouts.get(style_id, {}))
+            style["background_image"] = stored_name
+            custom_layouts[style_id] = style
+            _save_settings({"multiview_custom_layouts": custom_layouts})
+        except Exception as e:
+            logger.error(f"Failed to save background_image reference: {e}", exc_info=True)
+            return _json_error(start_response, "500 Internal Server Error", str(e))
+
+        return _json_ok(start_response, {"status": "ok", "filename": stored_name})
+
+    return _json_error(start_response, "405 Method Not Allowed", "GET or POST only")
+
+
 def handle_fields(environ, start_response):
     if environ.get("REQUEST_METHOD") == "OPTIONS":
         return cors_preflight(start_response)
@@ -419,8 +544,8 @@ def handle_fields(environ, start_response):
             fid = f.get("id", "")
             if fid.startswith("_warn") and fid != "_warnings_header":
                 warnings.append(f)
-            elif fid.startswith("_"):
-                continue  # skip section headers
+            elif fid.startswith("_") or fid == "multiview_count":
+                continue  # skip section headers and the native-page-only count field
             else:
                 m = layout_re.match(fid)
                 if m:

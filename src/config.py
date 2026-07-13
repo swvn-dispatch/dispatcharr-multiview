@@ -206,6 +206,21 @@ _ENCODER_EXTRA_FIELDS = {
 for _enc, _fn in _ENCODER_EXTRA_FIELDS.items():
     _register_presets(_enc, _fn)
 
+_MULTIVIEW_COUNT_FIELD = {
+    "id": "multiview_count",
+    "label": "Number of Multiview Layouts",
+    "type": "number",
+    "default": 1,
+    "min": 1,
+    "description": (
+        "How many multiview streams to define. "
+        "After changing this value, save and reload the plugin to see the new layout blocks. "
+        "Our own dashboard (/dash) manages layouts directly and hides this field -- "
+        "it's only needed when adding a layout from this native settings page."
+    ),
+    "placeholder": "1",
+}
+
 # Per-layout field builders
 
 _LAYOUT_OPTIONS = [
@@ -217,6 +232,26 @@ _LAYOUT_OPTIONS = [
 
 def _new_layout_id() -> str:
     return secrets.token_hex(4)
+
+
+def _backfill_layout_names(settings: dict) -> tuple:
+    """Fill in a missing multiview_{id}_name for any layout already in
+    multiview_order. Covers layouts that migrated under an earlier build of
+    this migration (before it started persisting the name explicitly) --
+    without this, a layout stuck in that state would stay nameless forever,
+    since ensure_layout_order's migration branch only ever runs once.
+    """
+    order = settings.get("multiview_order", [])
+    missing = [
+        (idx, layout_id) for idx, layout_id in enumerate(order)
+        if f"multiview_{layout_id}_name" not in settings
+    ]
+    if not missing:
+        return settings, False
+    new_settings = dict(settings)
+    for idx, layout_id in missing:
+        new_settings[f"multiview_{layout_id}_name"] = f"Multiview {idx + 1}"
+    return new_settings, True
 
 
 def ensure_layout_order(settings: dict) -> tuple:
@@ -236,7 +271,7 @@ def ensure_layout_order(settings: dict) -> tuple:
     generate different ids) on every request.
     """
     if "multiview_order" in settings:
-        return settings, False
+        return _backfill_layout_names(settings)
 
     new_settings = dict(settings)
 
@@ -252,14 +287,64 @@ def ensure_layout_order(settings: dict) -> tuple:
                 if key.startswith(prefix):
                     suffix = key[len(prefix):]
                     new_settings[f"multiview_{new_id}_{suffix}"] = new_settings.pop(key)
+            # The name field is only ever filled in client-side from the
+            # field default -- persist it for real so it survives migration
+            # instead of depending on that client-side illusion.
+            name_key = f"multiview_{new_id}_name"
+            if name_key not in new_settings:
+                new_settings[name_key] = f"Multiview {n}"
             order.append(new_id)
-        new_settings.pop("multiview_count", None)
         new_settings["multiview_order"] = order
+        new_settings["multiview_count"] = len(order)
         return new_settings, True
 
     # Brand new install: bootstrap a single empty layout, same as the old
     # `max(1, int(settings.get("multiview_count", 1)))` default.
     new_settings["multiview_order"] = [_new_layout_id()]
+    new_settings["multiview_count"] = 1
+    return new_settings, True
+
+
+def reconcile_layout_count(settings: dict) -> tuple:
+    """Grow/shrink multiview_order to match multiview_count.
+
+    multiview_count is the only layout-management control exposed on
+    Dispatcharr's native plugin settings page. That page fully overwrites
+    PluginConfig.settings on save (PluginManager.update_settings()) with no
+    visibility into multiview_order, so a native-page edit to the count is
+    reconciled here, lazily, the next time any of our own settings-read call
+    sites runs (mirrors ensure_layout_order's own call pattern -- call this
+    right after it, persist if either reports a change).
+    """
+    order = list(settings.get("multiview_order", []))
+    desired = settings.get("multiview_count")
+    if desired is None:
+        return settings, False
+    desired = max(1, int(desired))
+    if desired == len(order):
+        return settings, False
+
+    new_settings = dict(settings)
+    if desired > len(order):
+        for _ in range(desired - len(order)):
+            new_id = _new_layout_id()
+            position = len(order) + 1
+            new_settings[f"multiview_{new_id}_name"] = f"Multiview {position}"
+            new_settings[f"multiview_{new_id}_layout"] = "auto"
+            new_settings[f"multiview_{new_id}_selector_type"] = "classic"
+            new_settings[f"multiview_{new_id}_channel_count"] = 4
+            new_settings[f"multiview_{new_id}_epg_source_mode"] = "dummy"
+            order.append(new_id)
+    else:
+        while len(order) > desired:
+            removed_id = order.pop()
+            prefix = f"multiview_{removed_id}_"
+            for key in list(new_settings.keys()):
+                if key.startswith(prefix):
+                    new_settings.pop(key, None)
+
+    new_settings["multiview_order"] = order
+    new_settings["multiview_count"] = len(order)
     return new_settings, True
 
 
@@ -664,15 +749,19 @@ def build_plugin_fields(settings: dict) -> list:
     layout_style_options = _LAYOUT_OPTIONS + [
         {"value": f"custom:{style_id}", "label": f"Custom: {info.get('name') or style_id}"}
         for style_id, info in custom_layouts.items()
-        if info.get("tiles")
+        if info.get("elements")
     ]
 
     enc_field = dict(_VIDEO_ENCODER_FIELD)
     enc_field["options"] = _ENCODER_OPTIONS
 
+    count_field = dict(_MULTIVIEW_COUNT_FIELD)
+    count_field["default"] = len(order)
+
     fields = _build_warnings_fields(settings)
     fields.append(_GLOBAL_SETTINGS_HEADER)
     fields.extend(_GLOBAL_SETTINGS_FIELDS)
+    fields.append(count_field)
     fields.append(_VIDEO_SETTINGS_HEADER)
     fields.extend(_VIDEO_OUTPUT_FIELDS)
     fields.append(enc_field)

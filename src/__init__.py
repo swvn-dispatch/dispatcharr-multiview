@@ -169,12 +169,14 @@ class Plugin:
         try:
             from apps.plugins.models import PluginConfig
             cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings, changed = config_mod.ensure_layout_order(cfg.settings)
-            if changed:
+            settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
+            settings, changed2 = config_mod.reconcile_layout_count(settings)
+            if changed1 or changed2:
                 cfg.settings = settings
                 cfg.save()
         except Exception:
             settings, _changed = config_mod.ensure_layout_order({})
+            settings, _changed = config_mod.reconcile_layout_count(settings)
         return config_mod.build_plugin_fields(settings)
 
     # Action dispatcher
@@ -200,12 +202,14 @@ class Plugin:
         try:
             from apps.plugins.models import PluginConfig
             cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings, changed = config_mod.ensure_layout_order(cfg.settings)
-            if changed:
+            settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
+            settings, changed2 = config_mod.reconcile_layout_count(settings)
+            if changed1 or changed2:
                 cfg.settings = settings
                 cfg.save()
         except Exception:
             settings, _changed = config_mod.ensure_layout_order({})
+            settings, _changed = config_mod.reconcile_layout_count(settings)
         order = settings.get("multiview_order", [])
 
         lines = ["#EXTM3U"]

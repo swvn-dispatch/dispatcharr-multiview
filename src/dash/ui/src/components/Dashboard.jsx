@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { AppShell, Stack, Text, Loader, Center, Button, Menu, ActionIcon } from '@mantine/core';
+import { AppShell, Stack, Text, Loader, Center, Button, Menu, ActionIcon, Modal } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import { IconRefresh, IconActivity, IconSettings, IconDownload, IconUpload, IconPalette } from '@tabler/icons-react';
 import { AppHeader, SettingsPanel, ConfirmModal } from '@swvn-dispatch/dispatch-ui-kit';
@@ -10,9 +10,71 @@ import logoUrl from '/logo.png';
 import { loadFields, loadConfig, patchConfig, triggerRefresh, listStreams, restartStreams, loadChannels, setUnauthorizedHandler, getUsername } from '../api.js';
 import { isTrigger } from '../utils/fields.js';
 import { genId } from '../utils/id.js';
+import { downloadJson } from '../utils/download.js';
 import { LayoutCard } from './LayoutCard.jsx';
 import { ActiveStreamsModal } from './ActiveStreamsModal.jsx';
-import { StyleBuilderPage } from './StyleBuilder.jsx';
+import { StyleBuilder } from './StyleBuilder.jsx';
+
+const LAYOUT_KEY_RE = /^multiview_([0-9a-f]{8})_(.+)$/;
+
+// Transforms the flat multiview_{id}_field settings keys into a clean
+// {global, layouts: [...], custom_styles, plugin_version, dispatcharr_version}
+// export shape. Array position in `layouts` *is* the display order -- the
+// separate multiview_order id-list doesn't appear in the exported shape at all.
+function toExportObject(settings, order, pluginVersion, dispatcharrVersion) {
+  const layouts = order.map((id) => {
+    const obj = { id };
+    const channels = [];
+    for (const [key, value] of Object.entries(settings)) {
+      const m = key.match(LAYOUT_KEY_RE);
+      if (!m || m[1] !== id) continue;
+      const chMatch = m[2].match(/^channel_(\d+)$/);
+      if (chMatch) channels[parseInt(chMatch[1], 10) - 1] = value;
+      else obj[m[2]] = value;
+    }
+    if (channels.length) obj.channels = channels;
+    return obj;
+  });
+
+  const global = {};
+  for (const [key, value] of Object.entries(settings)) {
+    if (key === 'multiview_order' || key === 'multiview_count' || key === 'multiview_custom_layouts') continue;
+    if (LAYOUT_KEY_RE.test(key)) continue;
+    global[key] = value; // dash_enabled, output_resolution, video_encoder, stray keys, etc.
+  }
+
+  return {
+    global,
+    layouts,
+    custom_styles: settings.multiview_custom_layouts ?? {},
+    plugin_version: pluginVersion,
+    dispatcharr_version: dispatcharrVersion,
+  };
+}
+
+// Reverses toExportObject back into flat multiview_{id}_field keys, with
+// fresh ids (never reuse ids from the file -- avoids colliding with layouts
+// that already exist in this instance).
+function fromExportObject(parsed) {
+  const flat = {};
+  const newOrder = [];
+  for (const layout of parsed.layouts) {
+    const newId = genId();
+    newOrder.push(newId);
+    for (const [key, value] of Object.entries(layout)) {
+      if (key === 'id') continue;
+      if (key === 'channels') {
+        value.forEach((v, i) => { flat[`multiview_${newId}_channel_${i + 1}`] = v; });
+      } else {
+        flat[`multiview_${newId}_${key}`] = value;
+      }
+    }
+  }
+  Object.assign(flat, parsed.global ?? {});
+  flat.multiview_order = newOrder;
+  flat.multiview_custom_layouts = parsed.custom_styles ?? {};
+  return flat;
+}
 
 function SortableLayoutCard({ id, ...props }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
@@ -34,7 +96,7 @@ export function Dashboard({ onLoggedOut }) {
   const [error, setError] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [streamsOpen, setStreamsOpen] = useState(false);
-  const [view, setView] = useState('dashboard'); // 'dashboard' | 'styles'
+  const [styleBuilderOpen, setStyleBuilderOpen] = useState(false);
   const [activeCount, setActiveCount] = useState(0);
   const [activeStreamIds, setActiveStreamIds] = useState(() => new Set());
   const [confirm, setConfirm] = useState(null);
@@ -182,15 +244,9 @@ export function Dashboard({ onLoggedOut }) {
   async function handleExportBackup() {
     try {
       const config = await loadConfig();
-      const blob = new Blob([JSON.stringify(config.settings ?? {}, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `multiview-backup-${new Date().toISOString().slice(0, 10)}.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      const order = currentOrder();
+      const exportObj = toExportObject(config.settings ?? {}, order, config.plugin_version, config.dispatcharr_version);
+      downloadJson(exportObj, `multiview-backup-${new Date().toISOString().slice(0, 10)}.json`);
     } catch (err) {
       notifications.show({ title: 'Export failed', message: err.message, color: 'red', autoClose: 4000 });
     }
@@ -209,21 +265,30 @@ export function Dashboard({ onLoggedOut }) {
 
       // Never reuse ids from the file -- avoids colliding with layouts that
       // already exist in this instance and sidesteps merging two order lists.
-      const oldOrder = Array.isArray(parsed.multiview_order) ? parsed.multiview_order : [];
-      const idMap = Object.fromEntries(oldOrder.map((oldId) => [oldId, genId()]));
-      const newOrder = oldOrder.map((oldId) => idMap[oldId]);
-
-      const layoutKeyRe = /^multiview_([0-9a-f]{8})_(.+)$/;
-      const remapped = {};
-      for (const [key, value] of Object.entries(parsed)) {
-        if (key === 'multiview_order') continue;
-        const m = key.match(layoutKeyRe);
-        if (m && idMap[m[1]]) {
-          remapped[`multiview_${idMap[m[1]]}_${m[2]}`] = value;
-        } else if (!m) {
-          remapped[key] = value; // global setting, or a shared registry like multiview_custom_layouts
+      let remapped;
+      let newOrder;
+      if (Array.isArray(parsed.layouts)) {
+        // Current export shape: {global, layouts: [...], custom_styles, plugin_version, dispatcharr_version}.
+        remapped = fromExportObject(parsed);
+        newOrder = remapped.multiview_order;
+      } else {
+        // Pre-restructure flat export: multiview_order + multiview_{id}_* keys
+        // scattered at the top level alongside global settings.
+        const oldOrder = Array.isArray(parsed.multiview_order) ? parsed.multiview_order : [];
+        const idMap = Object.fromEntries(oldOrder.map((oldId) => [oldId, genId()]));
+        newOrder = oldOrder.map((oldId) => idMap[oldId]);
+        remapped = {};
+        for (const [key, value] of Object.entries(parsed)) {
+          if (key === 'multiview_order') continue;
+          const m = key.match(LAYOUT_KEY_RE);
+          if (m && idMap[m[1]]) {
+            remapped[`multiview_${idMap[m[1]]}_${m[2]}`] = value;
+          } else if (!m) {
+            remapped[key] = value; // global setting, or a shared registry like multiview_custom_layouts
+          }
+          // else: a per-layout key whose id isn't in multiview_order -- orphaned, dropped
         }
-        // else: a per-layout key whose id isn't in multiview_order -- orphaned, dropped
+        remapped.multiview_order = newOrder;
       }
 
       // channel_{m} and epg_forward_channel store a Dispatcharr Channel.id DB
@@ -306,12 +371,14 @@ export function Dashboard({ onLoggedOut }) {
             onClick: () => setStreamsOpen(true),
             active: activeCount > 0,
             count: activeCount,
+            variant: 'default',
           },
           {
             key: 'refresh',
             label: 'Refresh M3U & EPG',
             icon: IconRefresh,
             loading: refreshing,
+            variant: 'default',
             onClick: () =>
               setConfirm({
                 title: 'Refresh M3U & EPG',
@@ -325,8 +392,8 @@ export function Dashboard({ onLoggedOut }) {
             key: 'style-builder',
             label: 'Style Builder',
             icon: IconPalette,
-            onClick: () => setView('styles'),
-            active: view === 'styles',
+            variant: 'default',
+            onClick: () => setStyleBuilderOpen(true),
           },
         ]}
         extra={
@@ -355,45 +422,51 @@ export function Dashboard({ onLoggedOut }) {
         onChange={handleImportFile}
       />
 
+      <Modal
+        opened={styleBuilderOpen}
+        onClose={() => setStyleBuilderOpen(false)}
+        title="Style Builder"
+        fullScreen
+        styles={{ body: { height: '100%', display: 'flex', flexDirection: 'column', overflowY: 'auto' } }}
+      >
+        <StyleBuilder settings={settings} onFieldsReload={fetchFields} />
+      </Modal>
+
       <AppShell.Main>
-        {view === 'styles' ? (
-          <StyleBuilderPage settings={settings} onFieldsReload={fetchFields} onBack={() => setView('dashboard')} />
-        ) : (
-          <Stack p="md" maw={860} mx="auto">
-            <SettingsPanel
-              fields={globalFields}
-              warnings={warnings}
-              values={settings}
-              onSave={patchConfig}
-              onOptimisticChange={handleSettingsChange}
-              shouldReload={isTrigger}
-              onReload={fetchFields}
-              onSaved={() => notifications.show({ message: 'Saved', color: 'green', autoClose: 1500 })}
-              onError={(err) => notifications.show({ title: 'Save failed', message: err.message, color: 'red', autoClose: 4000 })}
-            />
-            <Text size="xs" tt="uppercase" fw={700} c="dimmed" mt="sm">Layouts</Text>
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-              <SortableContext items={currentOrder()} strategy={verticalListSortingStrategy}>
-                {layouts.map(({ n: id, position, fields }) => (
-                  <SortableLayoutCard
-                    key={id}
-                    id={id}
-                    position={position}
-                    fields={fields}
-                    settings={settings}
-                    canRemove={layout_count > 1}
-                    hasActiveStream={activeStreamIds.has(id)}
-                    onSettingsChange={handleSettingsChange}
-                    onFieldsReload={fetchFields}
-                    onRemove={() => handleRemoveLayout(id)}
-                    onChannelCountChange={(delta) => handleChangeChannelCount(id, delta)}
-                  />
-                ))}
-              </SortableContext>
-            </DndContext>
-            <Button variant="default" onClick={handleAddLayout}>+ Add Layout</Button>
-          </Stack>
-        )}
+        <Stack p="md" maw={860} mx="auto">
+          <SettingsPanel
+            fields={globalFields}
+            warnings={warnings}
+            values={settings}
+            onSave={patchConfig}
+            onOptimisticChange={handleSettingsChange}
+            shouldReload={isTrigger}
+            onReload={fetchFields}
+            onSaved={() => notifications.show({ message: 'Saved', color: 'green', autoClose: 1500 })}
+            onError={(err) => notifications.show({ title: 'Save failed', message: err.message, color: 'red', autoClose: 4000 })}
+          />
+          <Text size="xs" tt="uppercase" fw={700} c="dimmed" mt="sm">Layouts</Text>
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <SortableContext items={currentOrder()} strategy={verticalListSortingStrategy}>
+              {layouts.map(({ n: id, position, fields }) => (
+                <SortableLayoutCard
+                  key={id}
+                  id={id}
+                  position={position}
+                  fields={fields}
+                  settings={settings}
+                  canRemove={layout_count > 1}
+                  hasActiveStream={activeStreamIds.has(id)}
+                  onSettingsChange={handleSettingsChange}
+                  onFieldsReload={fetchFields}
+                  onRemove={() => handleRemoveLayout(id)}
+                  onChannelCountChange={(delta) => handleChangeChannelCount(id, delta)}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
+          <Button variant="default" onClick={handleAddLayout}>+ Add Layout</Button>
+        </Stack>
       </AppShell.Main>
 
       <ActiveStreamsModal opened={streamsOpen} onClose={() => setStreamsOpen(false)} settings={settings} />

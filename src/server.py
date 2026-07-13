@@ -48,6 +48,7 @@ def _parse_resolution(settings: dict) -> tuple:
 
 CHUNK_SIZE = 65536
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compositor_worker.py")
+_BACKGROUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "style_backgrounds")
 
 _server_instance = None
 _dash_api = None
@@ -107,10 +108,12 @@ def _settings() -> dict:
         cfg = PluginConfig.objects.get(key="multiview")
     except Exception:
         settings, _ = _mvconfig.ensure_layout_order({})
+        settings, _ = _mvconfig.reconcile_layout_count(settings)
         return settings
 
-    settings, changed = _mvconfig.ensure_layout_order(cfg.settings)
-    if changed:
+    settings, changed1 = _mvconfig.ensure_layout_order(cfg.settings)
+    settings, changed2 = _mvconfig.reconcile_layout_count(settings)
+    if changed1 or changed2:
         cfg.settings = settings
         cfg.save()
     return settings
@@ -286,6 +289,8 @@ class MultiviewServer:
             return api.handle_streams_restart(environ, start_response)
         if path == "/api/styles/preview":
             return api.handle_styles_preview(environ, start_response)
+        if path == "/api/styles/background":
+            return api.handle_style_background(environ, start_response)
         start_response("404 Not Found", [("Content-Type", "text/plain")])
         return [b"Not Found\n"]
 
@@ -335,6 +340,15 @@ class MultiviewServer:
         rects = _layouts.tile_rects(layout, len(tiles), out_w, out_h, custom_registry)
         names = [t["name"] for t in tiles]
 
+        background = None
+        if isinstance(layout, str) and layout.startswith("custom:"):
+            style = custom_registry.get(layout[len("custom:"):]) or {}
+            bg_filename = style.get("background_image")
+            if bg_filename:
+                bg_path = os.path.join(_BACKGROUNDS_DIR, bg_filename)
+                if os.path.isfile(bg_path):
+                    background = bg_path
+
         # Which tiles contribute an audio track, and their language codes.
         if audio_source == "all":
             audio_idx = set(range(len(tiles)))
@@ -368,6 +382,7 @@ class MultiviewServer:
             "bitrate": int(settings.get("output_bitrate") or 8000),
             "preset": preset,
             "video_encoder": encoder,
+            "background": background,
             "tiles": tile_cfg,
         }
 
