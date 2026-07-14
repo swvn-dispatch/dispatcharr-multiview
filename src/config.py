@@ -348,6 +348,35 @@ def reconcile_layout_count(settings: dict) -> tuple:
     return new_settings, True
 
 
+def ensure_custom_layout_order(settings: dict) -> tuple:
+    """Ensure *settings* has a `multiview_custom_layouts_order` list of
+    style ids, mirroring `ensure_layout_order`'s rationale: dict key order
+    on `multiview_custom_layouts` isn't a reliable place to record display
+    order (not guaranteed to round-trip through JSON storage), so an
+    explicit ordered id list is kept alongside it instead. Migrates once
+    from the dict's existing keys if the order list is missing, and appends
+    any "orphan" ids present in the dict but absent from the order list
+    (e.g. a style added directly via API without going through this path).
+
+    Returns (settings, changed). Callers must persist `settings` back to
+    the DB when changed=True.
+    """
+    layouts = settings.get("multiview_custom_layouts", {})
+    order = settings.get("multiview_custom_layouts_order")
+    if order is None:
+        new_settings = dict(settings)
+        new_settings["multiview_custom_layouts_order"] = list(layouts.keys())
+        return new_settings, True
+
+    orphans = [style_id for style_id in layouts.keys() if style_id not in order]
+    if not orphans:
+        return settings, False
+
+    new_settings = dict(settings)
+    new_settings["multiview_custom_layouts_order"] = [*order, *orphans]
+    return new_settings, True
+
+
 def _get_multiview_profile_params() -> str:
     """Return the ffmpeg parameters string for the globally-enabled default stream profile."""
     try:

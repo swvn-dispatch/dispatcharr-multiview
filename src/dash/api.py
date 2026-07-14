@@ -75,11 +75,13 @@ def _get_settings() -> dict:
     except Exception:
         settings, _ = config_mod.ensure_layout_order({})
         settings, _ = config_mod.reconcile_layout_count(settings)
+        settings, _ = config_mod.ensure_custom_layout_order(settings)
         return settings
 
     settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
     settings, changed2 = config_mod.reconcile_layout_count(settings)
-    if changed1 or changed2:
+    settings, changed3 = config_mod.ensure_custom_layout_order(settings)
+    if changed1 or changed2 or changed3:
         cfg.settings = settings
         cfg.save()
     return settings

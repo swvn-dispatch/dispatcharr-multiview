@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import { Stack, Group, Text, Button, TextInput, NumberInput, Select, ActionIcon, SegmentedControl, Switch } from '@mantine/core';
-import { IconTrash, IconPlus, IconArrowUp, IconArrowDown, IconArrowLeft, IconPhoto, IconX, IconDownload, IconUpload } from '@tabler/icons-react';
+import { Stack, Group, Text, Button, TextInput, NumberInput, Select, ActionIcon, SegmentedControl, Switch, SimpleGrid, Table, Collapse } from '@mantine/core';
+import { useMediaQuery } from '@mantine/hooks';
+import { IconTrash, IconPlus, IconArrowUp, IconArrowDown, IconCopy, IconPhoto, IconX, IconDownload, IconUpload, IconChevronDown, IconChevronUp, IconDeviceFloppy } from '@tabler/icons-react';
 import { notifications } from '@mantine/notifications';
 import { Rnd } from 'react-rnd';
 import { patchConfig, previewStyle, uploadStyleBackground, fetchStyleBackgroundBlob } from '../api.js';
@@ -9,6 +10,7 @@ import { resolveElements, splitRow, distributeDynamicCounts } from '../utils/sty
 import { snapRect, buildSnapTargets } from '../utils/snap.js';
 import { downloadJson } from '../utils/download.js';
 import { blobToBase64 } from '../utils/file.js';
+import { ALIGN_VALUES, validateStyleEntry } from '../utils/validate.js';
 
 const ELEMENT_LABELS = { static: 'Static', row: 'Auto Row', grid: 'Auto Grid' };
 const ELEMENT_STYLES = {
@@ -17,17 +19,64 @@ const ELEMENT_STYLES = {
   grid: { border: '2px dotted var(--mantine-color-orange-5)', background: 'rgba(253, 126, 20, 0.12)' },
 };
 
+// react-rnd/re-resizable renders each resize handle as an already-sized,
+// already-positioned hit-area div (generous default touch targets); this
+// style only adds a visible fill/border on top -- deliberately not setting
+// width/height/position, so the existing hit area is untouched and only
+// its visibility changes. Corners only (edges keep their normal invisible
+// hit area -- a corner dot is enough of an affordance without covering the
+// whole box outline), and only on mobile: shown only on the selected
+// element, and only where there's no hover to reveal an invisible handle
+// in the first place -- on desktop the existing yellow selection outline
+// is affordance enough, and a mouse can find the edge/corner hit areas via
+// hover/cursor changes anyway.
+const RESIZE_HANDLE_CORNER = { background: 'var(--mantine-color-yellow-5)', border: '1px solid rgba(0, 0, 0, 0.4)', borderRadius: '50%' };
+const RESIZE_HANDLE_STYLES_MOBILE = {
+  topLeft: RESIZE_HANDLE_CORNER,
+  topRight: RESIZE_HANDLE_CORNER,
+  bottomLeft: RESIZE_HANDLE_CORNER,
+  bottomRight: RESIZE_HANDLE_CORNER,
+};
+
 const BUILTINS = [
   { value: 'auto', label: 'Auto Grid' },
   { value: 'featured', label: 'Featured' },
   { value: 'top_featured', label: 'Top Featured' },
 ];
 
+// Element-based reconstructions of each built-in, for the read-only
+// preview -- real element combinations that behave like the algorithm
+// they're standing in for (not a channel-count-frozen snapshot), so the
+// preview canvas actually adapts to the preview channel count via the
+// same resolveElements pipeline a real custom style uses:
+// - "auto": a single whole-canvas grid element. _split_grid uses the exact
+//   same cols/rows/centering formula as the built-in's own _auto_grid_rects
+//   (see layouts.py), so this is a mathematically exact reproduction, not
+//   an approximation.
+// - "featured"/"top_featured": a fixed static main tile plus a row element
+//   absorbing the rest, matching the built-ins' documented "~60/40 split,
+//   remainder stacked in a row" structure. The real algorithms compute the
+//   side/bottom size dynamically per channel count (capped at 60/40); a
+//   static split can't reproduce that exactly, but it's the same shape a
+//   user would build by hand to approximate it.
+const BUILTIN_ELEMENT_TEMPLATES = {
+  auto: [
+    { id: 'b-grid', type: 'grid', x: 0, y: 0, w: 1, h: 1, valign: 'center', halign: 'center' },
+  ],
+  featured: [
+    { id: 'b-main', type: 'static', x: 0, y: 0, w: 0.6, h: 1, valign: 'center', halign: 'center' },
+    { id: 'b-side', type: 'row', direction: 'vertical', x: 0.6, y: 0, w: 0.4, h: 1, valign: 'center', halign: 'center' },
+  ],
+  top_featured: [
+    { id: 'b-main', type: 'static', x: 0, y: 0, w: 1, h: 0.6, valign: 'center', halign: 'center' },
+    { id: 'b-bottom', type: 'row', direction: 'horizontal', x: 0, y: 0.6, w: 1, h: 0.4, valign: 'center', halign: 'center' },
+  ],
+};
+
 // Only the fractions matter for a preview -- a single representative channel
 // count is enough to show the general shape of a built-in style.
 const PREVIEW_CHANNEL_COUNT = 4;
-const CHANNEL_COUNTS = Array.from({ length: 8 }, (_, i) => String(i + 2)); // "2".."9"
-const ALIGN_OPTIONS = ['center', 'top', 'bottom', 'left', 'right'].map((v) => ({ value: v, label: v }));
+const ALIGN_OPTIONS = ALIGN_VALUES.map((v) => ({ value: v, label: v }));
 
 // Internal division lines for every row/grid element at the given preview
 // channel count -- reuses splitRow/splitGrid directly (not a separate
@@ -77,24 +126,32 @@ function computeSubdivisionGuides(elements, n) {
   return guides;
 }
 
-// Measures a ref'd element's live content-box size via ResizeObserver.
-// Returns null until the first real measurement lands -- callers must not
-// substitute a guessed size in the meantime, since any pixel<->fraction
-// math done against a guess (rather than the real, possibly much larger,
-// rendered size) would compute badly wrong fractions.
-function useContainerSize(ref) {
+// Measures a live-mounted element's content-box size via ResizeObserver.
+// Uses a callback ref (state-backed), not a plain useRef -- a useRef
+// object's *identity* never changes across renders, so an effect gated on
+// `[ref]` only ever runs once and can end up watching a stale/detached
+// node if the underlying DOM element is later unmounted and a new one
+// mounted in its place (e.g. a conditionally-rendered container). A
+// callback ref re-fires this hook's effect every time React actually
+// attaches or detaches a node, so the observer always tracks the current
+// live element. Returns [size, setNode]; pass setNode as the target's
+// `ref` prop. `size` is null until the first real measurement lands --
+// callers must not substitute a guessed size in the meantime, since any
+// pixel<->fraction math done against a guess (rather than the real,
+// possibly much larger, rendered size) would compute badly wrong fractions.
+function useContainerSize() {
+  const [node, setNode] = useState(null);
   const [size, setSize] = useState(null);
   useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
+    if (!node) return;
     const observer = new ResizeObserver((entries) => {
       const { width, height } = entries[0].contentRect;
       if (width > 0 && height > 0) setSize({ width: Math.round(width), height: Math.round(height) });
     });
-    observer.observe(el);
+    observer.observe(node);
     return () => observer.disconnect();
-  }, [ref]);
-  return size;
+  }, [node]);
+  return [size, setNode];
 }
 
 // Clamps a fraction to [0, 1] and snaps values within epsilon of 0 or 1 to
@@ -109,6 +166,22 @@ function clampFraction(v) {
 
 function clampRect({ x, y, w, h }) {
   return { x: clampFraction(x), y: clampFraction(y), w: clampFraction(w), h: clampFraction(h) };
+}
+
+// Fits the largest 16:9 box into a measured containerW x containerH space,
+// letterboxing whichever dimension isn't the limiting factor. Used instead
+// of a CSS aspect-ratio + hardcoded vh maxHeight clamp so the canvas always
+// exactly fills whatever room the surrounding flex layout leaves it,
+// shrinking as needed with no guessed magic numbers.
+function fitCanvasSize(containerW, containerH) {
+  const ratio = 16 / 9;
+  let width = containerW;
+  let height = width / ratio;
+  if (height > containerH) {
+    height = containerH;
+    width = height * ratio;
+  }
+  return { width: Math.round(width), height: Math.round(height) };
 }
 
 function TilePreview({ tiles }) {
@@ -133,7 +206,7 @@ function TilePreview({ tiles }) {
   );
 }
 
-function ElementCanvas({ elements, selectedIdx, onSelect, onElementChange, backgroundUrl, previewCountNum, snapToCanvas, snapToElements, canvasW, canvasH }) {
+function ElementCanvas({ elements, selectedIdx, onSelect, onElementChange, backgroundUrl, previewCountNum, snapToCanvas, snapToElements, canvasW, canvasH, isMobile, readOnly }) {
   const [guides, setGuides] = useState([]); // active drag/resize guides only -- subdivisionGuides are always shown separately
   const [liveOverride, setLiveOverride] = useState(null); // { idx, x, y, w, h } in fractions, live during drag/resize
 
@@ -157,11 +230,19 @@ function ElementCanvas({ elements, selectedIdx, onSelect, onElementChange, backg
   }
 
   function computeSnap(idx, rect) {
+    // Subdivisions recomputed with the dragged element itself excluded --
+    // a row/grid's own internal divider lines move together with it (fixed
+    // offset relative to its own live position), so they're meaningless
+    // (and can be spuriously self-attracting) as snap targets for that
+    // same element's own drag/resize. They stay valid targets for every
+    // other element, and are still rendered regardless (see
+    // `subdivisionGuides` above, unfiltered).
+    const othersOnly = computeSubdivisionGuides(effectiveElements.filter((_, i) => i !== idx), previewCountNum);
     const { targetsX, targetsY } = buildSnapTargets({
       canvasW,
       canvasH,
       others: othersPx(idx),
-      subdivisions: subdivisionGuides,
+      subdivisions: othersOnly,
       snapToCanvas,
       snapToElements,
     });
@@ -196,6 +277,9 @@ function ElementCanvas({ elements, selectedIdx, onSelect, onElementChange, backg
             minWidth={20}
             minHeight={20}
             lockAspectRatio={el.lockAspect ? el.w / el.h : false}
+            resizeHandleStyles={isSelected && isMobile && !readOnly ? RESIZE_HANDLE_STYLES_MOBILE : undefined}
+            disableDragging={readOnly}
+            enableResizing={!readOnly}
             onMouseDown={() => onSelect(i)}
             onDrag={(e, d) => {
               const snapped = computeSnap(i, { x: d.x, y: d.y, w: base.w, h: base.h });
@@ -256,25 +340,42 @@ function ElementCanvas({ elements, selectedIdx, onSelect, onElementChange, backg
   );
 }
 
-function StyleEditor({ style, styleId, onUpdate }) {
-  const [previewCount, setPreviewCount] = useState('4');
+function StyleEditor({ style, styleId, onUpdate, readOnly = false }) {
+  // Local draft, decoupled from the persisted `style` prop -- every
+  // mutation (name, elements, background) edits `draft` only; nothing
+  // reaches the server until "Save" is clicked. Resyncs from `style`
+  // whenever a *different* style is opened (styleId changes), so switching
+  // away without saving cleanly discards any in-progress edits ("open and
+  // just not change anything"). For a read-only built-in, `style.elements`
+  // is a fixed element-based reconstruction (BUILTIN_ELEMENT_TEMPLATES) --
+  // it flows through the exact same draft/resolveElements pipeline as a
+  // real style, so it already adapts correctly to preview-count changes
+  // with no special-casing needed here.
+  const [draft, setDraft] = useState(style);
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    setDraft(style);
+    setDirty(false);
+  }, [styleId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [previewCount, setPreviewCount] = useState(4);
   const [selectedIdx, setSelectedIdx] = useState(null);
   const [backgroundUrl, setBackgroundUrl] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [snapToElements, setSnapToElements] = useState(true);
   const [snapToCanvas, setSnapToCanvas] = useState(true);
   const fileInputRef = useRef(null);
-  const canvasContainerRef = useRef(null);
-  const canvasSize = useContainerSize(canvasContainerRef);
-  const elements = style.elements ?? [];
-  const previewCountNum = parseInt(previewCount, 10);
-  const previewTiles = resolveElements(elements, previewCountNum) ?? [];
+  const [canvasSize, setCanvasNode] = useContainerSize();
+  const isMobile = useMediaQuery('(max-width: 48em)');
+  const previewCountNum = previewCount || 4;
+  const elements = draft.elements ?? [];
   const selected = selectedIdx != null ? elements[selectedIdx] : null;
 
   useEffect(() => {
     let cancelled = false;
     let objectUrl = null;
-    if (style.background_image) {
+    if (draft.background_image) {
       fetchStyleBackgroundBlob(styleId).then((blob) => {
         if (cancelled || !blob) return;
         objectUrl = URL.createObjectURL(blob);
@@ -287,10 +388,21 @@ function StyleEditor({ style, styleId, onUpdate }) {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [styleId, style.background_image]);
+  }, [styleId, draft.background_image]);
 
   function updateElements(next) {
-    onUpdate({ ...style, elements: next });
+    setDraft((d) => ({ ...d, elements: next }));
+    setDirty(true);
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      await onUpdate(draft);
+      setDirty(false);
+    } finally {
+      setSaving(false);
+    }
   }
 
   async function handleBackgroundFile(e) {
@@ -301,7 +413,8 @@ function StyleEditor({ style, styleId, onUpdate }) {
     try {
       const dataBase64 = await blobToBase64(file);
       const result = await uploadStyleBackground(styleId, file.name, dataBase64);
-      onUpdate({ ...style, background_image: result.filename });
+      setDraft((d) => ({ ...d, background_image: result.filename }));
+      setDirty(true);
     } catch (err) {
       notifications.show({ title: 'Upload failed', message: err.message, color: 'red', autoClose: 4000 });
     } finally {
@@ -310,7 +423,8 @@ function StyleEditor({ style, styleId, onUpdate }) {
   }
 
   function handleRemoveBackground() {
-    onUpdate({ ...style, background_image: null });
+    setDraft((d) => ({ ...d, background_image: null }));
+    setDirty(true);
   }
 
   function addElement(type) {
@@ -325,6 +439,14 @@ function StyleEditor({ style, styleId, onUpdate }) {
     updateElements(elements.filter((_, i) => i !== idx));
     if (selectedIdx === idx) setSelectedIdx(null);
     else if (selectedIdx != null && selectedIdx > idx) setSelectedIdx(selectedIdx - 1);
+  }
+
+  function duplicateElement(idx) {
+    const source = elements[idx];
+    const copy = { ...source, id: genId(), x: clampFraction(source.x + 0.02), y: clampFraction(source.y + 0.02) };
+    const next = [...elements.slice(0, idx + 1), copy, ...elements.slice(idx + 1)];
+    updateElements(next);
+    setSelectedIdx(idx + 1);
   }
 
   function moveElement(idx, delta) {
@@ -342,82 +464,212 @@ function StyleEditor({ style, styleId, onUpdate }) {
   }
 
   return (
-    <Stack gap="sm">
-      <Group gap="xs" align="flex-end">
+    <Stack gap="sm" style={{ flex: 1, minHeight: 0 }}>
+      <Group gap="xs" align="flex-end" wrap="wrap">
         <TextInput
           size="xs"
           label="Style name"
-          value={style.name ?? ''}
-          onChange={(e) => onUpdate({ ...style, name: e.currentTarget.value })}
+          value={draft.name ?? ''}
+          onChange={(e) => { setDraft((d) => ({ ...d, name: e.currentTarget.value })); setDirty(true); }}
           placeholder="Style name"
-          style={{ maxWidth: 240 }}
+          disabled={readOnly}
+          style={{ flex: isMobile ? '1 1 100%' : '1 1 200px' }}
         />
-        <Select
+        <NumberInput
           size="xs"
           label="Preview channel count"
-          data={CHANNEL_COUNTS}
+          min={2}
+          max={9}
           value={previewCount}
-          onChange={(v) => v && setPreviewCount(v)}
-          w={160}
+          onChange={(v) => setPreviewCount(v || 4)}
+          w={isMobile ? '100%' : 150}
         />
-        <Switch size="xs" label="Snap to elements" checked={snapToElements} onChange={(e) => setSnapToElements(e.currentTarget.checked)} />
-        <Switch size="xs" label="Snap to canvas" checked={snapToCanvas} onChange={(e) => setSnapToCanvas(e.currentTarget.checked)} />
-      </Group>
-
-      <Group gap="xs" align="flex-end">
-        <Button size="xs" variant="default" leftSection={<IconPlus size={12} />} onClick={() => addElement('static')}>
-          Static Position
-        </Button>
-        <Button size="xs" variant="default" leftSection={<IconPlus size={12} />} onClick={() => addElement('row')}>
-          Auto Row
-        </Button>
-        <Button size="xs" variant="default" leftSection={<IconPlus size={12} />} onClick={() => addElement('grid')}>
-          Auto Grid
-        </Button>
+        <Switch size="xs" label="Snap to elements" disabled={readOnly} checked={snapToElements} onChange={(e) => setSnapToElements(e.currentTarget.checked)} />
+        <Switch size="xs" label="Snap to canvas" disabled={readOnly} checked={snapToCanvas} onChange={(e) => setSnapToCanvas(e.currentTarget.checked)} />
         <Button
           size="xs"
-          variant="default"
-          leftSection={<IconPhoto size={12} />}
-          loading={uploading}
-          onClick={() => fileInputRef.current?.click()}
+          leftSection={<IconDeviceFloppy size={14} />}
+          disabled={readOnly || !dirty}
+          loading={saving}
+          color={dirty ? 'blue' : 'gray'}
+          variant={dirty ? 'filled' : 'default'}
+          onClick={handleSave}
+          style={isMobile ? { flex: '1 1 100%' } : undefined}
         >
-          {style.background_image ? 'Change Background' : 'Background Image'}
+          {dirty ? 'Save' : 'Saved'}
         </Button>
-        {style.background_image && (
-          <ActionIcon size="sm" variant="subtle" color="red" onClick={handleRemoveBackground} aria-label="Remove background">
-            <IconX size={14} />
-          </ActionIcon>
-        )}
-        <input ref={fileInputRef} type="file" accept="image/png,image/jpeg" style={{ display: 'none' }} onChange={handleBackgroundFile} />
       </Group>
 
-      {elements.length === 0 ? (
-        <Text size="xs" c="dimmed">Add a Static Position, Auto Row, or Auto Grid to get started.</Text>
-      ) : (
-        <>
-          <Text size="xs" c="dimmed">Drag a box to move it, drag its edge/corner to resize it. Click a box or list row to select it.</Text>
-          {previewTiles.length === 0 && (
-            <Text size="xs" c="orange">This style can't cover {previewCount} channels yet -- add an Auto Row/Grid, more Static Positions, or raise a Max channels cap.</Text>
-          )}
-          <Group align="flex-start" gap="md" wrap="wrap" justify="center">
-            <div ref={canvasContainerRef} style={{ width: '100%', maxWidth: 1400, aspectRatio: '16 / 9', maxHeight: 'min(60vh, calc(100vh - 320px))' }}>
-              {canvasSize && (
-                <ElementCanvas
-                  elements={elements}
-                  selectedIdx={selectedIdx}
-                  onSelect={setSelectedIdx}
-                  onElementChange={updateElementField}
-                  backgroundUrl={backgroundUrl}
-                  previewCountNum={previewCountNum}
-                  snapToCanvas={snapToCanvas}
-                  snapToElements={snapToElements}
-                  canvasW={canvasSize.width}
-                  canvasH={canvasSize.height}
-                />
-              )}
+      <SimpleGrid cols={isMobile ? 2 : 4} spacing="xs">
+        <Button size="xs" variant="default" leftSection={<IconPlus size={12} />} disabled={readOnly} onClick={() => addElement('static')}>
+          Static Position
+        </Button>
+        <Button size="xs" variant="default" leftSection={<IconPlus size={12} />} disabled={readOnly} onClick={() => addElement('row')}>
+          Auto Row
+        </Button>
+        <Button size="xs" variant="default" leftSection={<IconPlus size={12} />} disabled={readOnly} onClick={() => addElement('grid')}>
+          Auto Grid
+        </Button>
+        <Group gap={4} wrap="nowrap">
+          <Button
+            size="xs"
+            variant="default"
+            leftSection={<IconPhoto size={12} />}
+            loading={uploading}
+            disabled={readOnly}
+            onClick={() => fileInputRef.current?.click()}
+            style={{ flex: 1 }}
+          >
+            {draft.background_image ? 'Change Background' : 'Background Image'}
+          </Button>
+          <ActionIcon size="sm" variant="subtle" color="red" disabled={readOnly || !draft.background_image} onClick={handleRemoveBackground} aria-label="Remove background">
+            <IconX size={14} />
+          </ActionIcon>
+        </Group>
+        <input ref={fileInputRef} type="file" accept="image/png,image/jpeg" style={{ display: 'none' }} onChange={handleBackgroundFile} />
+      </SimpleGrid>
+
+      <Text size="xs" c="dimmed">
+        {readOnly
+          ? (elements.length === 0 ? 'This style has no representable elements at this channel count.' : 'Click a box or list row to inspect its properties.')
+          : (elements.length === 0 ? 'Add a Static Position, Auto Row, or Auto Grid to get started.' : 'Drag a box to move it, drag its edge/corner to resize it. Click a box or list row to select it.')}
+      </Text>
+      <Group align="stretch" gap="sm" wrap={isMobile ? 'wrap' : 'nowrap'} style={{ flex: 1, minHeight: 0 }}>
+            {/* Properties column -- always rendered with a fixed row set so
+                selecting/deselecting/switching element type never changes
+                this panel's height (no layout jump elsewhere on the page). */}
+            <Stack gap={6} p="sm" w={isMobile ? '100%' : 260} style={{ flexShrink: 0, minHeight: 0, overflowY: 'auto', border: '1px solid var(--mantine-color-dark-4)', borderRadius: 6 }}>
+              <Text size="xs" fw={600}>{selected ? (selected.name || ELEMENT_LABELS[selected.type]) : 'No element selected'}</Text>
+              <Table withRowBorders={false} verticalSpacing={4} horizontalSpacing="xs" style={{ tableLayout: 'fixed', width: '100%' }}>
+                <Table.Tbody>
+                  <Table.Tr>
+                    <Table.Td w={80}><Text size="xs" c="dimmed">Direction</Text></Table.Td>
+                    <Table.Td>
+                      <SegmentedControl
+                        size="xs"
+                        fullWidth
+                        disabled={!selected || readOnly || selected.type !== 'row'}
+                        data={[{ label: 'Horiz', value: 'horizontal' }, { label: 'Vert', value: 'vertical' }]}
+                        value={selected?.direction ?? 'horizontal'}
+                        onChange={(v) => selectedIdx != null && updateElementField(selectedIdx, { direction: v })}
+                      />
+                    </Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td w={80}><Text size="xs" c="dimmed">Max channels</Text></Table.Td>
+                    <Table.Td>
+                      <NumberInput
+                        size="xs"
+                        placeholder="Unlimited"
+                        disabled={!selected || readOnly || !['row', 'grid'].includes(selected.type)}
+                        min={1}
+                        value={selected?.max ?? ''}
+                        onChange={(v) => selectedIdx != null && updateElementField(selectedIdx, { max: v === '' ? null : v })}
+                      />
+                    </Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td w={80}><Text size="xs" c="dimmed">Anchor</Text></Table.Td>
+                    <Table.Td>
+                      <Group grow gap={4} wrap="nowrap">
+                        <Select
+                          size="xs"
+                          placeholder="V anchor"
+                          disabled={!selected || readOnly}
+                          data={ALIGN_OPTIONS}
+                          value={selected?.valign ?? null}
+                          onChange={(v) => v && selectedIdx != null && updateElementField(selectedIdx, { valign: v })}
+                        />
+                        <Select
+                          size="xs"
+                          placeholder="H anchor"
+                          disabled={!selected || readOnly}
+                          data={ALIGN_OPTIONS}
+                          value={selected?.halign ?? null}
+                          onChange={(v) => v && selectedIdx != null && updateElementField(selectedIdx, { halign: v })}
+                        />
+                      </Group>
+                    </Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td w={80}><Text size="xs" c="dimmed">Size</Text></Table.Td>
+                    <Table.Td>
+                      <Group grow gap={4} wrap="nowrap">
+                        <NumberInput
+                          size="xs"
+                          label="Width (px)"
+                          description="of 1920"
+                          disabled={!selected || readOnly}
+                          min={1}
+                          value={selected ? Math.round(selected.w * 1920) : ''}
+                          onChange={(v) => v && selectedIdx != null && updateElementField(selectedIdx, { w: v / 1920 })}
+                        />
+                        <NumberInput
+                          size="xs"
+                          label="Height (px)"
+                          description="of 1080"
+                          disabled={!selected || readOnly}
+                          min={1}
+                          value={selected ? Math.round(selected.h * 1080) : ''}
+                          onChange={(v) => v && selectedIdx != null && updateElementField(selectedIdx, { h: v / 1080 })}
+                        />
+                      </Group>
+                    </Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td w={80}><Text size="xs" c="dimmed">Lock aspect</Text></Table.Td>
+                    <Table.Td>
+                      <Switch
+                        size="xs"
+                        disabled={!selected || readOnly}
+                        checked={!!selected?.lockAspect}
+                        onChange={(e) => selectedIdx != null && updateElementField(selectedIdx, { lockAspect: e.currentTarget.checked })}
+                      />
+                    </Table.Td>
+                  </Table.Tr>
+                </Table.Tbody>
+              </Table>
+            </Stack>
+
+            {/* Canvas column -- fills whatever space is left, fitted to
+                16:9 in JS (fitCanvasSize) rather than a CSS aspect-ratio +
+                hardcoded vh clamp, so it shrinks correctly no matter how
+                much room the properties/layers columns and surrounding
+                chrome leave it. */}
+            <div
+              ref={setCanvasNode}
+              style={
+                isMobile
+                  ? { width: '100%', aspectRatio: '16 / 9' }
+                  : { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }
+              }
+            >
+              {canvasSize && (() => {
+                const fitted = fitCanvasSize(canvasSize.width, canvasSize.height);
+                return (
+                  <div style={{ width: fitted.width, height: fitted.height }}>
+                    <ElementCanvas
+                      elements={elements}
+                      selectedIdx={selectedIdx}
+                      onSelect={setSelectedIdx}
+                      onElementChange={updateElementField}
+                      backgroundUrl={backgroundUrl}
+                      previewCountNum={previewCountNum}
+                      snapToCanvas={snapToCanvas}
+                      snapToElements={snapToElements}
+                      canvasW={fitted.width}
+                      canvasH={fitted.height}
+                      isMobile={isMobile}
+                      readOnly={readOnly}
+                    />
+                  </div>
+                );
+              })()}
             </div>
 
-            <Stack gap={4} w={190}>
+            {/* Layers column -- scrolls internally if it has more rows
+                than fit, rather than growing the whole page. */}
+            <Stack gap={6} p="sm" w={isMobile ? '100%' : 220} style={{ flexShrink: 0, minHeight: 0, overflowY: 'auto', border: '1px solid var(--mantine-color-dark-4)', borderRadius: 6 }}>
               <Text size="xs" fw={600} c="dimmed">Elements</Text>
               {elements.map((el, i) => (
                 <Group
@@ -429,7 +681,8 @@ function StyleEditor({ style, styleId, onUpdate }) {
                     cursor: 'pointer',
                     padding: 4,
                     borderRadius: 4,
-                    background: selectedIdx === i ? 'var(--mantine-color-blue-9)' : 'transparent',
+                    background: selectedIdx === i ? 'rgba(51, 154, 240, 0.18)' : 'transparent',
+                    borderLeft: selectedIdx === i ? '2px solid var(--mantine-color-blue-5)' : '2px solid transparent',
                   }}
                 >
                   <Text size="xs" c="dimmed">{i + 1}.</Text>
@@ -438,89 +691,28 @@ function StyleEditor({ style, styleId, onUpdate }) {
                     variant="unstyled"
                     value={el.name ?? ''}
                     placeholder={ELEMENT_LABELS[el.type]}
+                    disabled={readOnly}
                     onChange={(e) => updateElementField(i, { name: e.currentTarget.value })}
                     onClick={(e) => e.stopPropagation()}
                     style={{ flex: 1, minWidth: 0 }}
                     styles={{ input: { minHeight: 'unset', height: 'auto', padding: 0 } }}
                   />
-                  <ActionIcon size="xs" variant="subtle" disabled={i === 0} onClick={(e) => { e.stopPropagation(); moveElement(i, -1); }}>
+                  <ActionIcon size="xs" variant="subtle" disabled={readOnly} onClick={(e) => { e.stopPropagation(); duplicateElement(i); }} aria-label="Duplicate element">
+                    <IconCopy size={12} />
+                  </ActionIcon>
+                  <ActionIcon size="xs" variant="subtle" disabled={readOnly || i === 0} onClick={(e) => { e.stopPropagation(); moveElement(i, -1); }}>
                     <IconArrowUp size={12} />
                   </ActionIcon>
-                  <ActionIcon size="xs" variant="subtle" disabled={i === elements.length - 1} onClick={(e) => { e.stopPropagation(); moveElement(i, 1); }}>
+                  <ActionIcon size="xs" variant="subtle" disabled={readOnly || i === elements.length - 1} onClick={(e) => { e.stopPropagation(); moveElement(i, 1); }}>
                     <IconArrowDown size={12} />
                   </ActionIcon>
-                  <ActionIcon size="xs" variant="subtle" color="red" onClick={(e) => { e.stopPropagation(); removeElement(i); }}>
+                  <ActionIcon size="xs" variant="subtle" color="red" disabled={readOnly} onClick={(e) => { e.stopPropagation(); removeElement(i); }}>
                     <IconTrash size={12} />
                   </ActionIcon>
                 </Group>
               ))}
             </Stack>
           </Group>
-
-          {selected && (
-            <Group gap="xs" p="xs" align="flex-end" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 6 }}>
-              <Text size="xs" fw={600}>{selected.name || ELEMENT_LABELS[selected.type]}:</Text>
-              {selected.type === 'row' && (
-                <SegmentedControl
-                  size="xs"
-                  data={[{ label: 'Horiz', value: 'horizontal' }, { label: 'Vert', value: 'vertical' }]}
-                  value={selected.direction}
-                  onChange={(v) => updateElementField(selectedIdx, { direction: v })}
-                />
-              )}
-              {(selected.type === 'row' || selected.type === 'grid') && (
-                <NumberInput
-                  size="xs"
-                  label="Max channels"
-                  placeholder="Unlimited"
-                  w={110}
-                  min={1}
-                  value={selected.max ?? ''}
-                  onChange={(v) => updateElementField(selectedIdx, { max: v === '' ? null : v })}
-                />
-              )}
-              <Select
-                size="xs"
-                w={90}
-                label="V anchor"
-                data={ALIGN_OPTIONS}
-                value={selected.valign}
-                onChange={(v) => v && updateElementField(selectedIdx, { valign: v })}
-              />
-              <Select
-                size="xs"
-                w={90}
-                label="H anchor"
-                data={ALIGN_OPTIONS}
-                value={selected.halign}
-                onChange={(v) => v && updateElementField(selectedIdx, { halign: v })}
-              />
-              <NumberInput
-                size="xs"
-                w={110}
-                label="Width (1080p px)"
-                min={1}
-                value={Math.round(selected.w * 1920)}
-                onChange={(v) => v && updateElementField(selectedIdx, { w: v / 1920 })}
-              />
-              <NumberInput
-                size="xs"
-                w={110}
-                label="Height (1080p px)"
-                min={1}
-                value={Math.round(selected.h * 1080)}
-                onChange={(v) => v && updateElementField(selectedIdx, { h: v / 1080 })}
-              />
-              <Switch
-                size="xs"
-                label="Lock aspect ratio"
-                checked={!!selected.lockAspect}
-                onChange={(e) => updateElementField(selectedIdx, { lockAspect: e.currentTarget.checked })}
-              />
-            </Group>
-          )}
-        </>
-      )}
     </Stack>
   );
 }
@@ -554,11 +746,23 @@ async function importStyleEntry(entry) {
   return [newId, style];
 }
 
+// Picks an achievable preview channel count for a style: PREVIEW_CHANNEL_COUNT
+// if it has a row/grid element (can absorb any remainder), otherwise the
+// style can only ever show exactly as many channels as it has static
+// elements -- falling back to that (instead of always requesting
+// PREVIEW_CHANNEL_COUNT) avoids resolveElements legitimately returning
+// nothing for an all-static style with fewer statics than that count.
+function previewCountFor(elements) {
+  const hasDynamic = elements.some((e) => e.type === 'row' || e.type === 'grid');
+  return hasDynamic ? PREVIEW_CHANNEL_COUNT : Math.max(elements.length, 1);
+}
+
 // Clickable gallery tile for a custom style -- same visual shape as a
 // built-in's TilePreview + label, plus small export/delete actions that
 // stopPropagation so they don't also open the editor.
 function CustomStyleTile({ id, style, onOpen, onExport, onDelete }) {
-  const tiles = resolveElements(style.elements ?? [], PREVIEW_CHANNEL_COUNT) ?? [];
+  const elements = style.elements ?? [];
+  const tiles = resolveElements(elements, previewCountFor(elements)) ?? [];
   return (
     <Stack gap={4} align="center" style={{ cursor: 'pointer', flexShrink: 0 }} onClick={() => onOpen(id)}>
       <TilePreview tiles={tiles} />
@@ -601,9 +805,27 @@ function NewStyleTile({ onClick }) {
 
 export function StyleBuilder({ settings, onFieldsReload }) {
   const customLayouts = settings.multiview_custom_layouts ?? {};
+  // Explicit ordered id list, mirroring multiview_order for layouts -- the
+  // dict's own key order isn't a reliable place to record display order
+  // (not guaranteed to round-trip through JSON storage), so this is the
+  // only source of truth for carousel position. Falls back to the dict's
+  // current keys if the backend hasn't migrated it in yet (defensive only;
+  // ensure_custom_layout_order always provides it in practice).
+  const customOrder = settings.multiview_custom_layouts_order ?? Object.keys(customLayouts);
   const [builtinPreviews, setBuiltinPreviews] = useState({});
   const [openStyleId, setOpenStyleId] = useState(null);
+  const [openBuiltin, setOpenBuiltin] = useState(null); // {value, label} from BUILTINS, mutually exclusive with openStyleId
+  const [carouselOpen, setCarouselOpen] = useState(true);
   const importStylesRef = useRef(null);
+  const isMobile = useMediaQuery('(max-width: 48em)');
+
+  // Collapse the carousel by default the moment a style is opened on
+  // mobile, to reclaim vertical space for the editor -- only fires on
+  // open/close (not every render), so a manual re-expand during editing
+  // isn't immediately fought.
+  useEffect(() => {
+    if ((openStyleId || openBuiltin) && isMobile) setCarouselOpen(false);
+  }, [openStyleId, openBuiltin]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     let cancelled = false;
@@ -620,9 +842,9 @@ export function StyleBuilder({ settings, onFieldsReload }) {
     };
   }, []);
 
-  async function saveRegistry(next) {
+  async function saveRegistry(nextLayouts, nextOrder) {
     try {
-      await patchConfig({ multiview_custom_layouts: next });
+      await patchConfig({ multiview_custom_layouts: nextLayouts, multiview_custom_layouts_order: nextOrder });
       await onFieldsReload();
     } catch (err) {
       notifications.show({ title: 'Save failed', message: err.message, color: 'red', autoClose: 4000 });
@@ -632,7 +854,7 @@ export function StyleBuilder({ settings, onFieldsReload }) {
   async function handleNewStyle() {
     try {
       const id = genId();
-      await saveRegistry({ ...customLayouts, [id]: { name: 'New Style', elements: [] } });
+      await saveRegistry({ ...customLayouts, [id]: { name: 'New Style', elements: [] } }, [...customOrder, id]);
       setOpenStyleId(id);
     } catch (err) {
       notifications.show({ title: 'Failed', message: err.message, color: 'red', autoClose: 4000 });
@@ -642,12 +864,12 @@ export function StyleBuilder({ settings, onFieldsReload }) {
   function handleDeleteStyle(id) {
     const next = { ...customLayouts };
     delete next[id];
-    saveRegistry(next);
+    saveRegistry(next, customOrder.filter((oid) => oid !== id));
     if (openStyleId === id) setOpenStyleId(null);
   }
 
   function handleStyleUpdate(id, next) {
-    saveRegistry({ ...customLayouts, [id]: next });
+    return saveRegistry({ ...customLayouts, [id]: next }, customOrder);
   }
 
   async function handleExportStyle(id, style) {
@@ -670,66 +892,102 @@ export function StyleBuilder({ settings, onFieldsReload }) {
       }
       if (Array.isArray(parsed.elements)) {
         // Single-style shape: {name, elements, ...}.
+        validateStyleEntry(parsed);
         const [newId, style] = await importStyleEntry(parsed);
-        await saveRegistry({ ...customLayouts, [newId]: style });
+        await saveRegistry({ ...customLayouts, [newId]: style }, [...customOrder, newId]);
         notifications.show({ message: `Style "${style.name}" imported`, color: 'green', autoClose: 2000 });
       } else {
         // Whole-registry shape: {styleId: {name, elements, ...}, ...}.
+        // Validate every entry up front -- no partial/half-applied registry
+        // if a later entry turns out to be malformed.
+        const entries = Object.entries(parsed);
+        entries.forEach(([id, entry]) => validateStyleEntry(entry, `style "${id}"`));
         const additions = {};
-        for (const entry of Object.values(parsed)) {
+        const newIds = [];
+        for (const [, entry] of entries) {
           const [newId, style] = await importStyleEntry(entry);
           additions[newId] = style;
+          newIds.push(newId);
         }
-        await saveRegistry({ ...customLayouts, ...additions });
-        notifications.show({ message: `Imported ${Object.keys(additions).length} style(s)`, color: 'green', autoClose: 2000 });
+        await saveRegistry({ ...customLayouts, ...additions }, [...customOrder, ...newIds]);
+        notifications.show({ message: `Imported ${newIds.length} style(s)`, color: 'green', autoClose: 2000 });
       }
     } catch (err) {
       notifications.show({ title: 'Import failed', message: err.message, color: 'red', autoClose: 4000 });
     }
   }
 
-  const customEntries = Object.entries(customLayouts);
+  const customEntries = customOrder.filter((id) => customLayouts[id]).map((id) => [id, customLayouts[id]]);
   const openStyle = openStyleId ? customLayouts[openStyleId] : null;
+  // Built-ins are algorithmic, not element-based -- BUILTIN_ELEMENT_TEMPLATES
+  // is a real element reconstruction that behaves like the algorithm it
+  // stands in for, flowing through the same draft/resolveElements pipeline
+  // as any real style (adapts correctly to preview-count changes for free).
+  const openBuiltinStyle = openBuiltin ? { name: openBuiltin.label, elements: BUILTIN_ELEMENT_TEMPLATES[openBuiltin.value] } : null;
+
+  function openCustomStyle(id) {
+    setOpenBuiltin(null);
+    setOpenStyleId(id);
+  }
+
+  function openBuiltinPreview(b) {
+    setOpenStyleId(null);
+    setOpenBuiltin(b);
+  }
+
+  // No "nothing open" state -- there's always an editor showing something,
+  // defaulting to the first custom style (most useful default -- you
+  // opened this to work on your own styles) or, failing that, the first
+  // built-in. Also re-defaults if the currently-open style was deleted out
+  // from under it (customLayouts no longer has that id).
+  useEffect(() => {
+    if (openStyle || openBuiltinStyle) return;
+    if (customEntries.length > 0) {
+      setOpenBuiltin(null);
+      setOpenStyleId(customEntries[0][0]);
+    } else {
+      setOpenStyleId(null);
+      setOpenBuiltin(BUILTINS[0]);
+    }
+  }, [openStyle, openBuiltinStyle, customEntries]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <Stack gap="md" style={{ flex: 1, minHeight: 0 }}>
+    <Stack gap="xs" style={{ flex: 1, minHeight: 0 }}>
       <Group justify="space-between" gap="xs">
-        <Text size="xs" c="dimmed">Built-in styles are read-only. Click a custom style to edit it.</Text>
+        <Group gap={4}>
+          <Text size="xs" c="dimmed">Click a built-in to preview it, or a custom style to edit it.</Text>
+          {isMobile && (
+            <ActionIcon size="xs" variant="subtle" onClick={() => setCarouselOpen((v) => !v)} aria-label={carouselOpen ? 'Collapse styles' : 'Expand styles'}>
+              {carouselOpen ? <IconChevronUp size={12} /> : <IconChevronDown size={12} />}
+            </ActionIcon>
+          )}
+        </Group>
         <Button size="xs" variant="default" leftSection={<IconUpload size={12} />} onClick={() => importStylesRef.current?.click()}>
           Import
         </Button>
         <input ref={importStylesRef} type="file" accept="application/json" style={{ display: 'none' }} onChange={handleImportStylesFile} />
       </Group>
 
-      <Group gap="md" wrap="nowrap" style={{ overflowX: 'auto', paddingBottom: 4 }}>
-        {BUILTINS.map((b) => (
-          <Stack key={b.value} gap={4} align="center" style={{ flexShrink: 0 }}>
-            <TilePreview tiles={builtinPreviews[b.value]} />
-            <Text size="xs">{b.label}</Text>
-          </Stack>
-        ))}
-        {customEntries.map(([id, style]) => (
-          <CustomStyleTile key={id} id={id} style={style} onOpen={setOpenStyleId} onExport={handleExportStyle} onDelete={handleDeleteStyle} />
-        ))}
-        <NewStyleTile onClick={handleNewStyle} />
-      </Group>
+      <Collapse in={!isMobile || carouselOpen}>
+        <Group align="flex-start" gap="md" wrap="nowrap" style={{ overflowX: 'auto', paddingBottom: 4 }}>
+          {BUILTINS.map((b) => (
+            <Stack key={b.value} gap={4} align="center" style={{ flexShrink: 0, cursor: 'pointer' }} onClick={() => openBuiltinPreview(b)}>
+              <TilePreview tiles={builtinPreviews[b.value]} />
+              <Text size="xs">{b.label}</Text>
+            </Stack>
+          ))}
+          {customEntries.map(([id, style]) => (
+            <CustomStyleTile key={id} id={id} style={style} onOpen={openCustomStyle} onExport={handleExportStyle} onDelete={handleDeleteStyle} />
+          ))}
+          <NewStyleTile onClick={handleNewStyle} />
+        </Group>
+      </Collapse>
 
       {openStyle ? (
-        <Stack gap="sm" style={{ flex: 1, minHeight: 0 }}>
-          <Button
-            size="xs"
-            variant="subtle"
-            leftSection={<IconArrowLeft size={14} />}
-            onClick={() => setOpenStyleId(null)}
-            style={{ alignSelf: 'flex-start' }}
-          >
-            Close editor
-          </Button>
-          <StyleEditor style={openStyle} styleId={openStyleId} onUpdate={(next) => handleStyleUpdate(openStyleId, next)} />
-        </Stack>
-      ) : (
-        <Text size="xs" c="dimmed">Select a custom style above to edit it, or create a new one.</Text>
-      )}
+        <StyleEditor style={openStyle} styleId={openStyleId} onUpdate={(next) => handleStyleUpdate(openStyleId, next)} />
+      ) : openBuiltinStyle ? (
+        <StyleEditor style={openBuiltinStyle} styleId={`builtin:${openBuiltin.value}`} onUpdate={() => {}} readOnly />
+      ) : null}
     </Stack>
   );
 }

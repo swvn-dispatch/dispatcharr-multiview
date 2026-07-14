@@ -11,6 +11,7 @@ import { loadFields, loadConfig, patchConfig, triggerRefresh, listStreams, resta
 import { isTrigger } from '../utils/fields.js';
 import { genId } from '../utils/id.js';
 import { downloadJson } from '../utils/download.js';
+import { validateBackupObject, validateLegacyBackupObject } from '../utils/validate.js';
 import { LayoutCard } from './LayoutCard.jsx';
 import { ActiveStreamsModal } from './ActiveStreamsModal.jsx';
 import { StyleBuilder } from './StyleBuilder.jsx';
@@ -38,15 +39,29 @@ function toExportObject(settings, order, pluginVersion, dispatcharrVersion) {
 
   const global = {};
   for (const [key, value] of Object.entries(settings)) {
-    if (key === 'multiview_order' || key === 'multiview_count' || key === 'multiview_custom_layouts') continue;
+    if (key === 'multiview_order' || key === 'multiview_count' || key === 'multiview_custom_layouts' || key === 'multiview_custom_layouts_order') continue;
     if (LAYOUT_KEY_RE.test(key)) continue;
     global[key] = value; // dash_enabled, output_resolution, video_encoder, stray keys, etc.
+  }
+
+  // Built in the explicit multiview_custom_layouts_order sequence, not the
+  // dict's own key order -- that order isn't reliably preserved through
+  // backend storage (see ensure_custom_layout_order in config.py), so
+  // spreading the raw dict here would risk baking a scrambled order into
+  // the export. JS object insertion order *is* preserved through
+  // JSON.stringify/parse, so building it in the right order here is enough
+  // for a re-import to come back in the right order too.
+  const customLayouts = settings.multiview_custom_layouts ?? {};
+  const customOrder = settings.multiview_custom_layouts_order ?? Object.keys(customLayouts);
+  const custom_styles = {};
+  for (const id of customOrder) {
+    if (customLayouts[id]) custom_styles[id] = customLayouts[id];
   }
 
   return {
     global,
     layouts,
-    custom_styles: settings.multiview_custom_layouts ?? {},
+    custom_styles,
     plugin_version: pluginVersion,
     dispatcharr_version: dispatcharrVersion,
   };
@@ -73,6 +88,7 @@ function fromExportObject(parsed) {
   Object.assign(flat, parsed.global ?? {});
   flat.multiview_order = newOrder;
   flat.multiview_custom_layouts = parsed.custom_styles ?? {};
+  flat.multiview_custom_layouts_order = Object.keys(parsed.custom_styles ?? {});
   return flat;
 }
 
@@ -269,11 +285,13 @@ export function Dashboard({ onLoggedOut }) {
       let newOrder;
       if (Array.isArray(parsed.layouts)) {
         // Current export shape: {global, layouts: [...], custom_styles, plugin_version, dispatcharr_version}.
+        validateBackupObject(parsed);
         remapped = fromExportObject(parsed);
         newOrder = remapped.multiview_order;
       } else {
         // Pre-restructure flat export: multiview_order + multiview_{id}_* keys
         // scattered at the top level alongside global settings.
+        validateLegacyBackupObject(parsed);
         const oldOrder = Array.isArray(parsed.multiview_order) ? parsed.multiview_order : [];
         const idMap = Object.fromEntries(oldOrder.map((oldId) => [oldId, genId()]));
         newOrder = oldOrder.map((oldId) => idMap[oldId]);
@@ -427,7 +445,10 @@ export function Dashboard({ onLoggedOut }) {
         onClose={() => setStyleBuilderOpen(false)}
         title="Style Builder"
         fullScreen
-        styles={{ body: { height: '100%', display: 'flex', flexDirection: 'column', overflowY: 'auto' } }}
+        styles={{
+          content: { display: 'flex', flexDirection: 'column' },
+          body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflowY: 'auto' },
+        }}
       >
         <StyleBuilder settings={settings} onFieldsReload={fetchFields} />
       </Modal>

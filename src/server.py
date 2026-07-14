@@ -109,11 +109,13 @@ def _settings() -> dict:
     except Exception:
         settings, _ = _mvconfig.ensure_layout_order({})
         settings, _ = _mvconfig.reconcile_layout_count(settings)
+        settings, _ = _mvconfig.ensure_custom_layout_order(settings)
         return settings
 
     settings, changed1 = _mvconfig.ensure_layout_order(cfg.settings)
     settings, changed2 = _mvconfig.reconcile_layout_count(settings)
-    if changed1 or changed2:
+    settings, changed3 = _mvconfig.ensure_custom_layout_order(settings)
+    if changed1 or changed2 or changed3:
         cfg.settings = settings
         cfg.save()
     return settings
