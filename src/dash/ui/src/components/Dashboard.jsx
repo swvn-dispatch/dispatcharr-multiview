@@ -40,6 +40,7 @@ function toExportObject(settings, order, pluginVersion, dispatcharrVersion) {
   const global = {};
   for (const [key, value] of Object.entries(settings)) {
     if (key === 'multiview_order' || key === 'multiview_count' || key === 'multiview_custom_layouts' || key === 'multiview_custom_layouts_order') continue;
+    if (key === 'multiview_pre_migration_backup' || key === 'multiview_pre_reconcile_backup') continue;
     if (LAYOUT_KEY_RE.test(key)) continue;
     global[key] = value; // dash_enabled, output_resolution, video_encoder, stray keys, etc.
   }

@@ -1,5 +1,6 @@
 """Plugin configuration and field definitions for Dispatcharr Multiview."""
 
+import datetime
 import json
 import os
 import secrets
@@ -234,6 +235,30 @@ def _new_layout_id() -> str:
     return secrets.token_hex(4)
 
 
+_BACKUP_KEYS = ("multiview_pre_migration_backup", "multiview_pre_reconcile_backup")
+
+
+def _snapshot_before(settings: dict, backup_key: str) -> dict:
+    """Stash a single most-recent copy of *settings* under backup_key before a
+    destructive change (legacy migration rename, or reconcile_layout_count's
+    shrink path deleting layout keys). Manual-recovery safety net only, not a
+    version history -- overwrites any prior snapshot under the same key.
+
+    Recovery (Django shell):
+        from apps.plugins.models import PluginConfig
+        cfg = PluginConfig.objects.get(key="multiview")
+        cfg.settings = cfg.settings["multiview_pre_reconcile_backup"]["settings"]
+        cfg.save()
+    """
+    clean = {k: v for k, v in settings.items() if k not in _BACKUP_KEYS}
+    new_settings = dict(settings)
+    new_settings[backup_key] = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "settings": clean,
+    }
+    return new_settings
+
+
 def _backfill_layout_names(settings: dict) -> tuple:
     """Fill in a missing multiview_{id}_name for any layout already in
     multiview_order. Covers layouts that migrated under an earlier build of
@@ -278,6 +303,7 @@ def ensure_layout_order(settings: dict) -> tuple:
     legacy_count = settings.get("multiview_count")
     is_legacy = legacy_count is not None or any(k.startswith("multiview_1_") for k in settings)
     if is_legacy:
+        new_settings = _snapshot_before(new_settings, "multiview_pre_migration_backup")
         count = max(1, int(legacy_count or 1))
         order = []
         for n in range(1, count + 1):
@@ -336,6 +362,7 @@ def reconcile_layout_count(settings: dict) -> tuple:
             new_settings[f"multiview_{new_id}_epg_source_mode"] = "dummy"
             order.append(new_id)
     else:
+        new_settings = _snapshot_before(new_settings, "multiview_pre_reconcile_backup")
         while len(order) > desired:
             removed_id = order.pop()
             prefix = f"multiview_{removed_id}_"

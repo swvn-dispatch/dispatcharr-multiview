@@ -95,6 +95,13 @@ def _save_settings(updates: dict):
             cfg.settings.pop(k, None)
         else:
             cfg.settings[k] = v
+    # Keep the legacy multiview_count field (still authoritative for
+    # reconcile_layout_count, which detects native-settings-page edits) in
+    # sync whenever the dashboard itself changes multiview_order -- otherwise
+    # reconcile_layout_count treats the dashboard's own change as drift and
+    # deletes it back out on the very next settings read.
+    if updates.get("multiview_order") is not None:
+        cfg.settings["multiview_count"] = len(cfg.settings.get("multiview_order") or [])
     cfg.save()
 
 
