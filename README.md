@@ -23,22 +23,17 @@ A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your 
 - **Settings** auto-save as you change them.
 - **Active Multiviews** button (top bar) shows running streams; per-layout reload and per-channel reconnect are available.
 - **Refresh** regenerates the M3U and EPG and triggers a Dispatcharr sync.
+- Click the logo (top-left) for links to this repo and Ko-fi support.
 
 Add `9292:9292` to your `docker-compose.yml` ports to expose the dashboard.
 
----
+The dashboard SPA (`src/dash/ui/`) is React + Mantine, and shares its theme, header bar, login screen, confirm modal, and settings-panel components with the `source-switch` plugin's dashboard via a separate package, `@swvn-dispatch/dispatch-ui-kit`. See [that package's README](https://github.com/swvn-dispatch/plugins/blob/main/ui-kit/README.md) for the component list and local-testing instructions.
 
-## Dashboard
-
-A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your Dispatcharr credentials to edit all plugin settings and manage active streams without opening the Dispatcharr admin UI.
-
-**Disabled by default.** Enable it via the **Web Dashboard** setting on the plugin settings page, then reload the plugin (or restart Dispatcharr) for the change to take effect.
-
-- **Settings** auto-save as you change them.
-- **Active Multiviews** button (top bar) shows running streams; per-layout reload and per-channel reconnect are available.
-- **Refresh** regenerates the M3U and EPG and triggers a Dispatcharr sync.
-
-Add `9292:9292` to your `docker-compose.yml` ports to expose the dashboard.
+```bash
+cd src/dash/ui
+npm install   # needs a personal GitHub Packages PAT — see ui-kit README
+npm run dev
+```
 
 ---
 

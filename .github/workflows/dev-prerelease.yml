@@ -63,7 +63,16 @@ jobs:
         run: |
           sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.PLUGIN_VERSION }}\"/" src/plugin.json
 
+      - name: Set up Node (for dashboard build + @swvn-dispatch registry auth)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com
+          scope: '@swvn-dispatch'
+
       - name: Package plugin
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.SETH_PAT }}
         run: |
           chmod +x package.sh
           ./package.sh
