@@ -112,6 +112,14 @@ function computeSubdivisionGuides(elements, n) {
       return;
     }
 
+    // Pieces are now naturally-sized and centered as a block (see
+    // splitRow), so they no longer necessarily start at the element's own
+    // x0/y0 -- a centered or right/bottom-aligned block's leading piece
+    // starts partway into the element. Excluding boundaries by comparing
+    // against x0/y0 therefore let the block's own leading edge through as
+    // a spurious extra guide line; exclude the *pieces'* own leading edge
+    // (their minimum start) instead, so only real inter-piece boundaries
+    // are drawn.
     const pieces = splitRow(el, count);
     const xs = new Set();
     const ys = new Set();
@@ -120,8 +128,12 @@ function computeSubdivisionGuides(elements, n) {
       ys.add(py);
     }
     const eps = 1e-6;
-    for (const x of xs) if (x > x0 + eps) guides.push({ axis: 'x', pos: x, from: y0, to: y1 });
-    for (const y of ys) if (y > y0 + eps) guides.push({ axis: 'y', pos: y, from: x0, to: x1 });
+    const xsSorted = [...xs].sort((a, b) => a - b);
+    const ysSorted = [...ys].sort((a, b) => a - b);
+    const xStart = xsSorted[0] ?? x0;
+    const yStart = ysSorted[0] ?? y0;
+    for (const x of xsSorted) if (x > xStart + eps) guides.push({ axis: 'x', pos: x, from: y0, to: y1 });
+    for (const y of ysSorted) if (y > yStart + eps) guides.push({ axis: 'y', pos: y, from: x0, to: x1 });
   });
   return guides;
 }
