@@ -13,7 +13,16 @@ import math
 
 
 def _even(v: int) -> int:
-    return int(v) - (int(v) % 2)
+    """Round to the nearest even integer.
+
+    Must round (not truncate): custom-registry rects go fraction -> pixel ->
+    fraction -> pixel through _split_row/_split_grid, and a plain int(v)
+    truncation turns a value that's a hair below an integer due to float
+    error (e.g. 639.999999998) into 638 instead of 640 -- a systematic 1-2px
+    gap between otherwise-touching tiles.
+    """
+    r = int(round(v))
+    return r - (r % 2)
 
 
 def tile_rects(layout: str, n: int, out_w: int, out_h: int, custom_registry: dict = None) -> list:
@@ -161,27 +170,36 @@ def _split_row(el: dict, count: int, out_w: int, out_h: int) -> list:
     halign = el.get("halign", "center")
     vertical = el.get("direction") == "vertical"
     row_w_px, row_h_px = w * out_w, h * out_h
+    # Round the row's own origin, the natural tile size, and the block
+    # offset to even pixels *once*, then step by that same integer for
+    # every piece -- arbitrary (freeform-dragged) el x/y/w/h fractions
+    # otherwise survive a fraction -> pixel -> fraction -> pixel round
+    # trip with float error, which independently rounding each piece's
+    # position and width can turn into a systematic 1-2px gap between
+    # tiles that are supposed to touch.
     pieces = []
     if vertical:
-        natural_px = min(row_h_px / count, row_w_px * 9 / 16)
+        row_y_px = _even(y * out_h)
+        natural_px = _even(min(row_h_px / count, row_w_px * 9 / 16))
         total_px = natural_px * count
         avail_px = row_h_px
-        offset_px = 0 if valign == "top" else (avail_px - total_px if valign == "bottom" else (avail_px - total_px) / 2)
+        offset_px = _even(0 if valign == "top" else (avail_px - total_px if valign == "bottom" else (avail_px - total_px) / 2))
         piece_h = natural_px / out_h
         for i in range(count):
             piece_valign = "center" if count == 1 else ("bottom" if i == 0 else "top" if i == count - 1 else "center")
-            piece_y = y + (offset_px + i * natural_px) / out_h
-            pieces.append((x, piece_y, w, piece_h, piece_valign, halign))
+            piece_y_px = row_y_px + offset_px + i * natural_px
+            pieces.append((x, piece_y_px / out_h, w, piece_h, piece_valign, halign))
     else:
-        natural_px = min(row_w_px / count, row_h_px * 16 / 9)
+        row_x_px = _even(x * out_w)
+        natural_px = _even(min(row_w_px / count, row_h_px * 16 / 9))
         total_px = natural_px * count
         avail_px = row_w_px
-        offset_px = 0 if halign == "left" else (avail_px - total_px if halign == "right" else (avail_px - total_px) / 2)
+        offset_px = _even(0 if halign == "left" else (avail_px - total_px if halign == "right" else (avail_px - total_px) / 2))
         piece_w = natural_px / out_w
         for i in range(count):
             piece_halign = "center" if count == 1 else ("right" if i == 0 else "left" if i == count - 1 else "center")
-            piece_x = x + (offset_px + i * natural_px) / out_w
-            pieces.append((piece_x, y, piece_w, h, valign, piece_halign))
+            piece_x_px = row_x_px + offset_px + i * natural_px
+            pieces.append((piece_x_px / out_w, y, piece_w, h, valign, piece_halign))
     return pieces
 
 

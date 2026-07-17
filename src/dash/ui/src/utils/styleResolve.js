@@ -11,33 +11,49 @@
 const PREVIEW_OUT_W = 1920;
 const PREVIEW_OUT_H = 1080;
 
+// Mirrors _even in src/layouts.py -- rounds (not truncates) to the nearest
+// even integer. Rounding matters here because row pieces go fraction ->
+// pixel -> fraction -> pixel; truncating a value that's a hair below an
+// integer due to float error turns otherwise-touching tiles into ones with
+// a systematic 1-2px gap.
+function evenRound(v) {
+  const r = Math.round(v);
+  return r - (r % 2);
+}
+
 export function splitRow(el, count, outW = PREVIEW_OUT_W, outH = PREVIEW_OUT_H) {
   const { x, y, w, h, valign = 'center', halign = 'center' } = el;
   const vertical = el.direction === 'vertical';
   const rowWPx = w * outW;
   const rowHPx = h * outH;
+  // Round the row's own origin, the natural tile size, and the block offset
+  // to even pixels once, then step by that same integer for every piece --
+  // see evenRound's comment for why this must happen before the fraction
+  // round-trip, not after.
   const pieces = [];
   if (vertical) {
-    const naturalPx = Math.min(rowHPx / count, (rowWPx * 9) / 16);
+    const rowYPx = evenRound(y * outH);
+    const naturalPx = evenRound(Math.min(rowHPx / count, (rowWPx * 9) / 16));
     const totalPx = naturalPx * count;
     const availPx = rowHPx;
-    const offsetPx = valign === 'top' ? 0 : valign === 'bottom' ? availPx - totalPx : (availPx - totalPx) / 2;
+    const offsetPx = evenRound(valign === 'top' ? 0 : valign === 'bottom' ? availPx - totalPx : (availPx - totalPx) / 2);
     const pieceH = naturalPx / outH;
     for (let i = 0; i < count; i++) {
       const pieceValign = count === 1 ? 'center' : i === 0 ? 'bottom' : i === count - 1 ? 'top' : 'center';
-      const pieceY = y + (offsetPx + i * naturalPx) / outH;
-      pieces.push([x, pieceY, w, pieceH, pieceValign, halign]);
+      const pieceYPx = rowYPx + offsetPx + i * naturalPx;
+      pieces.push([x, pieceYPx / outH, w, pieceH, pieceValign, halign]);
     }
   } else {
-    const naturalPx = Math.min(rowWPx / count, (rowHPx * 16) / 9);
+    const rowXPx = evenRound(x * outW);
+    const naturalPx = evenRound(Math.min(rowWPx / count, (rowHPx * 16) / 9));
     const totalPx = naturalPx * count;
     const availPx = rowWPx;
-    const offsetPx = halign === 'left' ? 0 : halign === 'right' ? availPx - totalPx : (availPx - totalPx) / 2;
+    const offsetPx = evenRound(halign === 'left' ? 0 : halign === 'right' ? availPx - totalPx : (availPx - totalPx) / 2);
     const pieceW = naturalPx / outW;
     for (let i = 0; i < count; i++) {
       const pieceHalign = count === 1 ? 'center' : i === 0 ? 'right' : i === count - 1 ? 'left' : 'center';
-      const pieceX = x + (offsetPx + i * naturalPx) / outW;
-      pieces.push([pieceX, y, pieceW, h, valign, pieceHalign]);
+      const pieceXPx = rowXPx + offsetPx + i * naturalPx;
+      pieces.push([pieceXPx / outW, y, pieceW, h, valign, pieceHalign]);
     }
   }
   return pieces;
