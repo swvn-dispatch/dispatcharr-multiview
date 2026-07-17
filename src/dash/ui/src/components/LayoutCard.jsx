@@ -12,9 +12,7 @@ function ChannelSelect({ label, description, data, value, onChange }) {
   });
   const [search, setSearch] = useState('');
   const selected = data.find((o) => o.value === value);
-  const filtered = data
-    .filter((o) => o.label.toLowerCase().includes(search.trim().toLowerCase()))
-    .slice(0, 50);
+  const filtered = data.filter((o) => o.label.toLowerCase().includes(search.trim().toLowerCase()));
 
   return (
     <Combobox
