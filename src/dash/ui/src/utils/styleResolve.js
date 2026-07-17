@@ -4,15 +4,41 @@
 // channel-selection logic, so drift risk is low, but any change to the
 // split/assignment rule must be made in both places.
 
-export function splitRow(el, count) {
+// Preview canvas is always treated as 1920x1080 for pixel/aspect-ratio math
+// (matches the "of 1920"/"of 1080" element-size inputs elsewhere in the
+// Style Builder) -- only the aspect ratio matters here, not real output
+// resolution, so a fixed 16:9 pair is fine for the live preview.
+const PREVIEW_OUT_W = 1920;
+const PREVIEW_OUT_H = 1080;
+
+export function splitRow(el, count, outW = PREVIEW_OUT_W, outH = PREVIEW_OUT_H) {
   const { x, y, w, h, valign = 'center', halign = 'center' } = el;
+  const vertical = el.direction === 'vertical';
+  const rowWPx = w * outW;
+  const rowHPx = h * outH;
   const pieces = [];
-  if (el.direction === 'vertical') {
-    const pieceH = h / count;
-    for (let i = 0; i < count; i++) pieces.push([x, y + i * pieceH, w, pieceH, valign, halign]);
+  if (vertical) {
+    const naturalPx = Math.min(rowHPx / count, (rowWPx * 9) / 16);
+    const totalPx = naturalPx * count;
+    const availPx = rowHPx;
+    const offsetPx = valign === 'top' ? 0 : valign === 'bottom' ? availPx - totalPx : (availPx - totalPx) / 2;
+    const pieceH = naturalPx / outH;
+    for (let i = 0; i < count; i++) {
+      const pieceValign = count === 1 ? 'center' : i === 0 ? 'bottom' : i === count - 1 ? 'top' : 'center';
+      const pieceY = y + (offsetPx + i * naturalPx) / outH;
+      pieces.push([x, pieceY, w, pieceH, pieceValign, halign]);
+    }
   } else {
-    const pieceW = w / count;
-    for (let i = 0; i < count; i++) pieces.push([x + i * pieceW, y, pieceW, h, valign, halign]);
+    const naturalPx = Math.min(rowWPx / count, (rowHPx * 16) / 9);
+    const totalPx = naturalPx * count;
+    const availPx = rowWPx;
+    const offsetPx = halign === 'left' ? 0 : halign === 'right' ? availPx - totalPx : (availPx - totalPx) / 2;
+    const pieceW = naturalPx / outW;
+    for (let i = 0; i < count; i++) {
+      const pieceHalign = count === 1 ? 'center' : i === 0 ? 'right' : i === count - 1 ? 'left' : 'center';
+      const pieceX = x + (offsetPx + i * naturalPx) / outW;
+      pieces.push([pieceX, y, pieceW, h, valign, pieceHalign]);
+    }
   }
   return pieces;
 }
@@ -78,7 +104,7 @@ export function distributeDynamicCounts(remaining, dynamics) {
 // Returns an array of [x, y, w, h, valign, halign] fractions, or null if the
 // elements can't cover n channels (no dynamic elements and n exceeds the
 // static count, or the dynamic elements' caps can't absorb the remainder).
-export function resolveElements(elements, n) {
+export function resolveElements(elements, n, outW = PREVIEW_OUT_W, outH = PREVIEW_OUT_H) {
   const statics = elements.filter((e) => e.type === 'static');
   const dynamics = elements.filter((e) => e.type === 'row' || e.type === 'grid');
   const remaining = Math.max(0, n - statics.length);
@@ -98,7 +124,7 @@ export function resolveElements(elements, n) {
       const count = counts[dynI];
       dynI += 1;
       if (count <= 0) continue;
-      result.push(...(el.type === 'row' ? splitRow(el, count) : splitGrid(el, count)));
+      result.push(...(el.type === 'row' ? splitRow(el, count, outW, outH) : splitGrid(el, count)));
       channelIdx += count;
     }
   }

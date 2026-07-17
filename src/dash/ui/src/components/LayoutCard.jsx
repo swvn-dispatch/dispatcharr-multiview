@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Group, Text, Button, Modal, Divider, ActionIcon, Stack } from '@mantine/core';
+import { Group, Text, Button, Modal, Divider, ActionIcon, Stack, Select } from '@mantine/core';
 import { IconTrash, IconPlus, IconMinus, IconGripVertical } from '@tabler/icons-react';
 import { notifications } from '@mantine/notifications';
 import { CollapsiblePanel, FieldRenderer, useDebouncedFieldSave } from '@swvn-dispatch/dispatch-ui-kit';
@@ -28,6 +28,35 @@ export function LayoutCard({ id, position, fields, settings, canRemove, hasActiv
         {fs.map((f) => (
           <FieldRenderer key={f.id} field={f} value={settings[f.id]} onChange={(v) => handleChange(f.id, v, f.type !== 'string')} />
         ))}
+      </div>
+    );
+  }
+
+  function renderChannelGrid(fs) {
+    if (!fs.length) return null;
+    return (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 'var(--mantine-spacing-sm)' }}>
+        {fs.map((f) => {
+          const seen = new Set();
+          const data = (f.options ?? []).reduce((acc, o) => {
+            const v = String(o.value);
+            if (!seen.has(v)) { seen.add(v); acc.push({ value: v, label: o.label }); }
+            return acc;
+          }, []);
+          return (
+            <Select
+              key={f.id}
+              label={f.label}
+              description={f.description}
+              data={data}
+              value={String(settings[f.id] ?? f.default ?? '')}
+              onChange={(v) => handleChange(f.id, v, true)}
+              allowDeselect={false}
+              searchable
+              limit={50}
+            />
+          );
+        })}
       </div>
     );
   }
@@ -82,7 +111,7 @@ export function LayoutCard({ id, position, fields, settings, canRemove, hasActiv
                 }
                 labelPosition="left"
               />
-              {renderGrid(channels)}
+              {renderChannelGrid(channels)}
             </>
           )}
           {audioSource && (

@@ -34,7 +34,7 @@ def tile_rects(layout: str, n: int, out_w: int, out_h: int, custom_registry: dic
     if isinstance(layout, str) and layout.startswith("custom:"):
         style = (custom_registry or {}).get(layout[len("custom:"):])
         elements = (style or {}).get("elements") if style else None
-        fractions = _resolve_elements(elements, n) if elements else None
+        fractions = _resolve_elements(elements, n, out_w, out_h) if elements else None
         if fractions:
             rects = [
                 (x * out_w, y * out_h, w * out_w, h * out_h, valign, halign)
@@ -144,24 +144,44 @@ def _top_featured_rects(n: int, out_w: int, out_h: int) -> list:
     return rects[:n]
 
 
-def _split_row(el: dict, count: int) -> list:
-    """Split a "row" element's rect into `count` equal pieces along its direction.
+def _split_row(el: dict, count: int, out_w: int, out_h: int) -> list:
+    """Split a row element into `count` naturally-sized, touching tiles,
+    centered as a block per the row's halign/valign -- same approach as
+    _top_featured_rects's bottom row, generalized to any rect/direction.
 
-    Returns fractional (x, y, w, h, valign, halign) tuples, all inheriting
-    the row's own valign/halign.
+    Returns fractional (x, y, w, h, valign, halign) tuples. Tile size is
+    capped by both the row's own thickness and a 16:9 assumption, so tiles
+    never stretch to fill the whole row -- the block is anchored within
+    the row's rect per its own halign/valign, and edge tiles push their
+    content toward the interior (touching, no gap) just like the built-in
+    featured layouts, leaving any leftover space in the row untouched.
     """
     x, y, w, h = el["x"], el["y"], el["w"], el["h"]
     valign = el.get("valign", "center")
     halign = el.get("halign", "center")
+    vertical = el.get("direction") == "vertical"
+    row_w_px, row_h_px = w * out_w, h * out_h
     pieces = []
-    if el.get("direction") == "vertical":
-        piece_h = h / count
+    if vertical:
+        natural_px = min(row_h_px / count, row_w_px * 9 / 16)
+        total_px = natural_px * count
+        avail_px = row_h_px
+        offset_px = 0 if valign == "top" else (avail_px - total_px if valign == "bottom" else (avail_px - total_px) / 2)
+        piece_h = natural_px / out_h
         for i in range(count):
-            pieces.append((x, y + i * piece_h, w, piece_h, valign, halign))
+            piece_valign = "center" if count == 1 else ("bottom" if i == 0 else "top" if i == count - 1 else "center")
+            piece_y = y + (offset_px + i * natural_px) / out_h
+            pieces.append((x, piece_y, w, piece_h, piece_valign, halign))
     else:
-        piece_w = w / count
+        natural_px = min(row_w_px / count, row_h_px * 16 / 9)
+        total_px = natural_px * count
+        avail_px = row_w_px
+        offset_px = 0 if halign == "left" else (avail_px - total_px if halign == "right" else (avail_px - total_px) / 2)
+        piece_w = natural_px / out_w
         for i in range(count):
-            pieces.append((x + i * piece_w, y, piece_w, h, valign, halign))
+            piece_halign = "center" if count == 1 else ("right" if i == 0 else "left" if i == count - 1 else "center")
+            piece_x = x + (offset_px + i * natural_px) / out_w
+            pieces.append((piece_x, y, piece_w, h, valign, piece_halign))
     return pieces
 
 
@@ -235,7 +255,7 @@ def _distribute_dynamic_counts(remaining: int, dynamics: list) -> list:
     return counts
 
 
-def _resolve_elements(elements: list, n: int) -> "list | None":
+def _resolve_elements(elements: list, n: int, out_w: int, out_h: int) -> "list | None":
     """Resolve a custom style's element list into n fractional tile rects.
 
     Mirrors src/dash/ui/src/utils/styleResolve.js -- keep both in sync; that
@@ -275,7 +295,7 @@ def _resolve_elements(elements: list, n: int) -> "list | None":
             dyn_i += 1
             if count <= 0:
                 continue
-            result.extend(_split_row(el, count) if el_type == "row" else _split_grid(el, count))
+            result.extend(_split_row(el, count, out_w, out_h) if el_type == "row" else _split_grid(el, count))
             channel_idx += count
 
     if channel_idx < n:

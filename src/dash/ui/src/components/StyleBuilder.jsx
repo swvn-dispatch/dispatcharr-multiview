@@ -276,7 +276,7 @@ function ElementCanvas({ elements, selectedIdx, onSelect, onElementChange, backg
             position={{ x: base.x, y: base.y }}
             minWidth={20}
             minHeight={20}
-            lockAspectRatio={el.lockAspect ? el.w / el.h : false}
+            lockAspectRatio={el.lockAspect ? (el.w * canvasW) / (el.h * canvasH) : false}
             resizeHandleStyles={isSelected && isMobile && !readOnly ? RESIZE_HANDLE_STYLES_MOBILE : undefined}
             disableDragging={readOnly}
             enableResizing={!readOnly}
@@ -602,7 +602,16 @@ function StyleEditor({ style, styleId, onUpdate, readOnly = false }) {
                           disabled={!selected || readOnly}
                           min={1}
                           value={selected ? Math.round(selected.w * 1920) : ''}
-                          onChange={(v) => v && selectedIdx != null && updateElementField(selectedIdx, { w: v / 1920 })}
+                          onChange={(v) => {
+                            if (!v || selectedIdx == null) return;
+                            const w = v / 1920;
+                            if (selected.lockAspect) {
+                              const ratio = (selected.w * 1920) / (selected.h * 1080);
+                              updateElementField(selectedIdx, { w, h: (v / ratio) / 1080 });
+                            } else {
+                              updateElementField(selectedIdx, { w });
+                            }
+                          }}
                         />
                         <NumberInput
                           size="xs"
@@ -611,7 +620,16 @@ function StyleEditor({ style, styleId, onUpdate, readOnly = false }) {
                           disabled={!selected || readOnly}
                           min={1}
                           value={selected ? Math.round(selected.h * 1080) : ''}
-                          onChange={(v) => v && selectedIdx != null && updateElementField(selectedIdx, { h: v / 1080 })}
+                          onChange={(v) => {
+                            if (!v || selectedIdx == null) return;
+                            const h = v / 1080;
+                            if (selected.lockAspect) {
+                              const ratio = (selected.w * 1920) / (selected.h * 1080);
+                              updateElementField(selectedIdx, { w: (v * ratio) / 1920, h });
+                            } else {
+                              updateElementField(selectedIdx, { h });
+                            }
+                          }}
                         />
                       </Group>
                     </Table.Td>
