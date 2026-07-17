@@ -13,6 +13,7 @@ export function groupFields(fields, layoutId) {
     else if (key === 'channel_count') channelCountField = f;
     else if (key === 'audio_source') audioSource = f;
     else if (key.startsWith('epg_')) epg.push(f);
+    else if (f.type === 'info') continue; // cosmetic section divider from backend, not a real field
     else channels.push(f);
   }
   return { base, channels, epg, audioSource, channelCountField };

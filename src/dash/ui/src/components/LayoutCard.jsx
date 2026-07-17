@@ -1,10 +1,64 @@
 import { useState } from 'react';
-import { Group, Text, Button, Modal, Divider, ActionIcon, Stack, Select } from '@mantine/core';
+import { Group, Text, Button, Modal, Divider, ActionIcon, Stack, Combobox, InputBase, useCombobox } from '@mantine/core';
 import { IconTrash, IconPlus, IconMinus, IconGripVertical } from '@tabler/icons-react';
 import { notifications } from '@mantine/notifications';
 import { CollapsiblePanel, FieldRenderer, useDebouncedFieldSave } from '@swvn-dispatch/dispatch-ui-kit';
 import { patchConfig } from '../api.js';
 import { groupFields, stripPrefix, isTrigger } from '../utils/fields.js';
+
+function ChannelSelect({ label, description, data, value, onChange }) {
+  const combobox = useCombobox({
+    onDropdownClose: () => combobox.resetSelectedOption(),
+  });
+  const [search, setSearch] = useState('');
+  const selected = data.find((o) => o.value === value);
+  const filtered = data
+    .filter((o) => o.label.toLowerCase().includes(search.trim().toLowerCase()))
+    .slice(0, 50);
+
+  return (
+    <Combobox
+      store={combobox}
+      onOptionSubmit={(v) => {
+        onChange(v);
+        setSearch('');
+        combobox.closeDropdown();
+      }}
+    >
+      <Combobox.Target>
+        <InputBase
+          label={label}
+          description={description}
+          component="button"
+          type="button"
+          pointer
+          rightSection={<Combobox.Chevron />}
+          onClick={() => combobox.toggleDropdown()}
+        >
+          {selected?.label ?? <Text component="span" c="dimmed">Select channel</Text>}
+        </InputBase>
+      </Combobox.Target>
+      <Combobox.Dropdown>
+        <Combobox.Search
+          value={search}
+          onChange={(e) => setSearch(e.currentTarget.value)}
+          placeholder="Search channels..."
+        />
+        <Combobox.Options mah={260} style={{ overflowY: 'auto' }}>
+          {filtered.length === 0 ? (
+            <Combobox.Empty>No channels found</Combobox.Empty>
+          ) : (
+            filtered.map((o) => (
+              <Combobox.Option value={o.value} key={o.value} active={o.value === value}>
+                {o.label}
+              </Combobox.Option>
+            ))
+          )}
+        </Combobox.Options>
+      </Combobox.Dropdown>
+    </Combobox>
+  );
+}
 
 export function LayoutCard({ id, position, fields, settings, canRemove, hasActiveStream, dragHandleProps, onSettingsChange, onFieldsReload, onRemove, onChannelCountChange }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -44,16 +98,13 @@ export function LayoutCard({ id, position, fields, settings, canRemove, hasActiv
             return acc;
           }, []);
           return (
-            <Select
+            <ChannelSelect
               key={f.id}
               label={f.label}
               description={f.description}
               data={data}
               value={String(settings[f.id] ?? f.default ?? '')}
               onChange={(v) => handleChange(f.id, v, true)}
-              allowDeselect={false}
-              searchable
-              limit={50}
             />
           );
         })}
