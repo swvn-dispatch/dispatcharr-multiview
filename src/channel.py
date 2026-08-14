@@ -155,6 +155,10 @@ class Channel:
         # video PTS clock anchor — updated by run(), read by audio_pts_now()
         self.clk_pts: "float | None" = None
         self.clk_wall: "float | None" = None
+        # EMA of inter-frame PTS delta (estimated source frame duration, s),
+        # used by the compositor to hold frames for a deterministic pulldown.
+        self.est_frame_dur: "float | None" = None
+        self._last_frame_pts: "float | None" = None
         # PTS of the audio content most recently handed to the caller by take() —
         # used by audio_feeder() to detect drift against the video clock and
         # periodically re-sync via _align_to_pts(), without waiting for a full
@@ -223,6 +227,8 @@ class Channel:
                 self.last_taken_pts = None
             self.clk_pts = None
             self.clk_wall = None
+            self.est_frame_dur = None
+            self._last_frame_pts = None
             vcount_before = self.vcount
             try:
                 cont = av.open(self.url, options=DECODE_OPTS)
@@ -273,6 +279,15 @@ class Channel:
                                             time.sleep(gap)
                                         elif gap <= -2.0:
                                             self.clk_pts, self.clk_wall = pts_s, time.monotonic()
+                                    if self._last_frame_pts is not None:
+                                        delta = pts_s - self._last_frame_pts
+                                        # Reject <=0 (dup/out-of-order pts) and >0.5s (~2fps
+                                        # floor, treated as a stall/discontinuity rather than
+                                        # a real rate) so one bad sample can't corrupt the estimate.
+                                        if 0 < delta <= 0.5:
+                                            self.est_frame_dur = delta if self.est_frame_dur is None else (
+                                                0.8 * self.est_frame_dur + 0.2 * delta)
+                                    self._last_frame_pts = pts_s
                                 self.latest = fit_into_tile(frame, self.w, self.h, self.valign, self.halign)
                                 self.fresh_until = time.monotonic() + TILE_STALE_SECS
                                 self.vcount += 1

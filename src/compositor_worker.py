@@ -32,6 +32,10 @@ from parameters import fps_fraction, build_encoder_cmd, validate_encoder  # noqa
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                          # FIFO forward to re-sync (see audio_feeder())
 
+MAX_HOLD_TICKS = 6  # safety clamp on estimated tile frame-hold length (output ticks);
+                     # protects against a corrupted/outlier est_frame_dur and keeps hold
+                     # windows well under TILE_STALE_SECS so stale->fallback isn't delayed.
+
 
 # ---------------------------------------------------------------- compositing helpers
 
@@ -230,11 +234,28 @@ def main():
     log_at = start + 30.0
     prev_t = start
     prev_counts = [0] * len(channels)
+    held = [None] * len(channels)        # last captured (Y,U,V,ox,oy,tw,th) tuple per tile
+    next_switch = [0.0] * len(channels)  # tick index at which to re-sample this tile
     log(f"started: {len(channels)} tiles, {len(audio_chs)} audio, {out_w}x{out_h}@{cfg['fps']}")
     try:
         while not stop.is_set():
-            for t in channels:
-                Yt, Ut, Vt, ox, oy, tw, th = t.current()
+            for i, t in enumerate(channels):
+                if held[i] is None or n >= next_switch[i]:
+                    # Accumulate onto the prior ideal switch point rather than
+                    # re-basing to n: re-basing to the actual (integer) refresh
+                    # tick discards the fractional remainder every time, so a 2.5
+                    # ratio would always round up to 3 instead of alternating 2/3,
+                    # drifting to the wrong average cadence instead of tracking
+                    # the source rate.
+                    # If we've fallen far behind (e.g. the tile stalled), resync
+                    # to n instead of accumulating from a stale switch point,
+                    # otherwise a long stall would leave a slow-catch-up drift.
+                    base = next_switch[i] if held[i] is not None and n - next_switch[i] < MAX_HOLD_TICKS else n
+                    held[i] = t.current()
+                    dur = t.est_frame_dur
+                    step = 1.0 if not dur or dur <= 0 else max(1.0, min(dur * fps_f, MAX_HOLD_TICKS))
+                    next_switch[i] = base + step
+                Yt, Ut, Vt, ox, oy, tw, th = held[i]
                 x, y, w, h = t.x, t.y, t.w, t.h
                 Yc[y:y + h, x:x + w] = bg_Y[y:y + h, x:x + w]
                 Uc[y // 2:(y + h) // 2, x // 2:(x + w) // 2] = bg_U[y // 2:(y + h) // 2, x // 2:(x + w) // 2]
