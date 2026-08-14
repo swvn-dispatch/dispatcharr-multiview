@@ -34,6 +34,10 @@ DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
 AUDIO_GATE_RECOVERY_SECS = 0.5
 AUDIO_TICK_SECS = 0.005
 
+MAX_HOLD_TICKS = 6  # safety clamp on estimated tile frame-hold length (output ticks);
+                     # protects against a corrupted/outlier est_frame_dur and keeps hold
+                     # windows well under TILE_STALE_SECS so stale->fallback isn't delayed.
+
 
 # ---------------------------------------------------------------- compositing helpers
 
