@@ -162,10 +162,6 @@ class Channel:
         # video PTS clock anchor — updated by run(), read by audio_pts_now()
         self.clk_pts: "float | None" = None
         self.clk_wall: "float | None" = None
-        # EMA of inter-frame PTS delta (estimated source frame duration, s),
-        # used by the compositor to hold frames for a deterministic pulldown.
-        self.est_frame_dur: "float | None" = None
-        self._last_frame_pts: "float | None" = None
         # PTS of the audio content most recently handed to the caller by take() —
         # used by audio_feeder() to detect drift against the video clock and
         # periodically re-sync via _align_to_pts(), without waiting for a full
