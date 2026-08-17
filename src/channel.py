@@ -241,13 +241,10 @@ class Channel:
                 # rate (single-threaded PyAV decode runs ~22-27fps -> slow motion).
                 vs.thread_type = "AUTO"
                 vs.codec_context.thread_count = 3
-                # Sources are 1080p60 but we output 30fps; skip non-reference
-                # (B) frames at decode to cut decode CPU on the box, which
-                # otherwise saturates (3x 1080p60 decode + encode).
-                try:
-                    vs.codec_context.skip_frame = "NONREF"
-                except Exception:
-                    pass
+                log(f"channel {self.name}: video codec={getattr(vs.codec_context, 'name', None)} "
+                    f"size={vs.width}x{vs.height} avg_rate={getattr(vs, 'average_rate', None)} "
+                    f"base_rate={getattr(vs, 'base_rate', None)} "
+                    f"field_order={getattr(vs.codec_context, 'field_order', None)}")
                 # Lower-effort decode for non-featured tiles: skip the deblocking
                 # loop filter. Big decode-CPU saving; the minor blockiness is
                 # hidden by downscaling small tiles. The featured tile keeps full
