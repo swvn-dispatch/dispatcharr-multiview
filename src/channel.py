@@ -167,6 +167,7 @@ class Channel:
         # periodically re-sync via _align_to_pts(), without waiting for a full
         # clk_pts reset. Protected by self.alock (same as aframes/abuffered).
         self.last_taken_pts: "float | None" = None
+        self.audio_resyncs = 0
         self._reconnect_requested = False
 
     def _make_fallback(self, logo):
@@ -365,6 +366,11 @@ class Channel:
                 else:
                     break
 
+    def audio_status(self):
+        """Return a consistent snapshot for compositor A/V diagnostics."""
+        with self.alock:
+            return self.last_taken_pts, self.abuffered, self.audio_resyncs
+
     def take(self, nsamples: int) -> np.ndarray:
         """Return exactly nsamples of int16 (nsamples, 2), silence-padded."""
         out = np.zeros((nsamples, 2), np.int16)
@@ -382,7 +388,11 @@ class Channel:
                         self.last_taken_pts = pts_s + chunk.shape[0] / AUDIO_RATE
                 else:
                     out[filled:] = chunk[:need]
-                    self.aframes[0] = (pts_s, chunk[need:])
+                    # A buffered chunk's PTS always identifies its first retained
+                    # sample. Without this adjustment, each partial read makes
+                    # drift detection measure from the chunk's original start.
+                    next_pts = pts_s + need / AUDIO_RATE if pts_s is not None else None
+                    self.aframes[0] = (next_pts, chunk[need:])
                     self.abuffered -= need
                     filled = nsamples
                     if pts_s is not None:
