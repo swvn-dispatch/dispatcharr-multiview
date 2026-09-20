@@ -260,6 +260,8 @@ def main():
     log_at = start + 30.0
     prev_t = start
     prev_counts = [0] * len(channels)
+    prev_scaled_counts = [0] * len(channels)
+    prev_reduced_counts = [0] * len(channels)
     prev_audio_resyncs = [0] * len(audio_chs)
     log(f"started: {len(channels)} tiles, {len(audio_chs)} audio, {out_w}x{out_h}@{cfg['fps']}")
     try:
@@ -293,8 +295,10 @@ def main():
             now = time.monotonic()
             if now >= log_at:   # heartbeat: per-channel decode fps (CPU health)
                 dt = now - prev_t
-                rates = " ".join(f"{c.name[:7]}={(c.vcount - prev_counts[i]) / dt:.0f}fps/q{c.video_queue_depth()}"
-                                 for i, c in enumerate(channels))
+                rates = " ".join(f"{c.name[:7]}=d{(c.vcount - prev_counts[i]) / dt:.0f}/"
+                                  f"s{(c.scaled_vcount - prev_scaled_counts[i]) / dt:.0f}/"
+                                  f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}"
+                                  for i, c in enumerate(channels))
                 audio = []
                 for i, c in enumerate(audio_chs):
                     last_pts, buffered, resyncs = c.audio_status()
@@ -308,6 +312,8 @@ def main():
                 log(f"out {n / (now - start):.1f}fps; decode {rates}; "
                     f"audio {' '.join(audio) or 'none'}; rss={rss_mb}MB")
                 prev_counts = [c.vcount for c in channels]
+                prev_scaled_counts = [c.scaled_vcount for c in channels]
+                prev_reduced_counts = [c.reduced_vcount for c in channels]
                 prev_audio_resyncs = [c.audio_status()[2] for c in audio_chs]
                 prev_t = now
                 log_at = now + 30.0

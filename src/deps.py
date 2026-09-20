@@ -20,7 +20,7 @@ import zipfile
 
 logger = logging.getLogger(__name__)
 
-PYAV_VERSION = "14.2.0"
+PYAV_VERSION = "18.1.0"
 PY_TAG = "cp313"
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))

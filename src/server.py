@@ -338,6 +338,7 @@ class MultiviewServer:
 
     def _worker_config(self, tiles, layout, audio_source, settings) -> dict:
         out_w, out_h = _parse_resolution(settings)
+        output_fps = fps_string(settings)
         custom_registry = settings.get("multiview_custom_layouts", {})
         rects = _layouts.tile_rects(layout, len(tiles), out_w, out_h, custom_registry)
         names = [t["name"] for t in tiles]
@@ -365,6 +366,7 @@ class MultiviewServer:
         # decode); every other tile (whole auto grid, or the small side/bottom
         # tiles) decodes at lower effort to save CPU.
         featured_layout = layout in ("featured", "top_featured")
+        encoder = settings.get("video_encoder") or "libx264"
         tile_cfg = []
         for i, (t, (x, y, w, h, valign, halign)) in enumerate(zip(tiles, rects)):
             tile_cfg.append({
@@ -374,13 +376,15 @@ class MultiviewServer:
                 "audio": i in audio_idx,
                 "lang": langs.get(i, "und"),
                 "featured": featured_layout and i == 0,
+                "output_fps": output_fps,
+                "hwaccel": {"h264_nvenc": "cuda", "h264_vaapi": "vaapi", "h264_qsv": "qsv"}.get(encoder),
+                "hwaccel_device": (settings.get("render_device") if settings.get("render_device") not in (None, "", "auto") and encoder in ("h264_vaapi", "h264_qsv") else None),
                 "valign": valign, "halign": halign,
             })
 
-        encoder = settings.get("video_encoder") or "libx264"
         preset = resolve_preset(encoder, settings.get("encoder_preset"))
         return {
-            "out_w": out_w, "out_h": out_h, "fps": fps_string(settings),
+            "out_w": out_w, "out_h": out_h, "fps": output_fps,
             "bitrate": int(settings.get("output_bitrate") or 8000),
             "preset": preset,
             "video_encoder": encoder,

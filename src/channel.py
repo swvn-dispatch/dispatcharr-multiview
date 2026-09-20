@@ -12,6 +12,11 @@ import sys
 import threading
 import time
 
+try:
+    from .frame_policy import FrameReduction
+except ImportError:
+    from frame_policy import FrameReduction
+
 # Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
 # matching this machine and put it on the path before importing av.
 _VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
@@ -140,6 +145,9 @@ class Channel:
         self.provides_audio = bool(spec.get("audio", False))
         self.lang = spec.get("lang", "und")
         self.featured = bool(spec.get("featured", False))
+        self.frame_reduction = FrameReduction(spec.get("output_fps", "30"))
+        self.hwaccel = spec.get("hwaccel")
+        self.hwaccel_device = spec.get("hwaccel_device")
         self.valign = spec.get("valign", "center")
         self.halign = spec.get("halign", "center")
         self.fallback = (*black_planes(self.w, self.h), 0, 0, self.w, self.h)
@@ -150,6 +158,8 @@ class Channel:
             threading.Thread(target=self._load_logo, args=(logo,), daemon=True).start()
         self.running = True
         self.vcount = 0          # decoded video frames (for rate diagnostics)
+        self.scaled_vcount = 0
+        self.reduced_vcount = 0
         # The compositor selects frames by source PTS. Keeping a short queue
         # decouples that deterministic choice from decoder-thread wake timing.
         self.vlock = threading.Lock()
@@ -169,6 +179,22 @@ class Channel:
         self.last_taken_pts: "float | None" = None
         self.audio_resyncs = 0
         self._reconnect_requested = False
+
+    def _open_container(self):
+        if self.hwaccel:
+            try:
+                from av.codec.hwaccel import HWAccel, hwdevices_available
+                if self.hwaccel not in hwdevices_available():
+                    raise RuntimeError(f"PyAV has no {self.hwaccel} device support")
+                accel = HWAccel(self.hwaccel, device=self.hwaccel_device,
+                                allow_software_fallback=False)
+                cont = av.open(self.url, options=DECODE_OPTS, hwaccel=accel)
+                log(f"channel {self.name}: hardware decode={self.hwaccel}")
+                return cont
+            except Exception as e:  # noqa: BLE001
+                log(f"channel {self.name}: hardware decode unavailable ({e}); using software")
+                self.hwaccel = None
+        return av.open(self.url, options=DECODE_OPTS)
 
     def _make_fallback(self, logo):
         Y, U, V = black_planes(self.w, self.h)
@@ -231,12 +257,13 @@ class Channel:
                 self.last_taken_pts = None
             self.clk_pts = None
             self.clk_wall = None
+            self.frame_reduction.reset()
             with self.vlock:
                 self.vframes.clear()
                 self.display = self.fallback
             vcount_before = self.vcount
             try:
-                cont = av.open(self.url, options=DECODE_OPTS)
+                cont = self._open_container()
                 vs = cont.streams.video[0]
                 # Multi-threaded decode so 1080p sources keep up with the output
                 # rate (single-threaded PyAV decode runs ~22-27fps -> slow motion).
@@ -270,6 +297,8 @@ class Channel:
                             continue
                         if packet.stream.type == "video":
                             for frame in packet.decode():
+                                self.vcount += 1
+                                pts_s = None
                                 if frame.pts is not None:
                                     pts_s = float(frame.pts * vs.time_base)
                                     now = time.monotonic()
@@ -284,13 +313,16 @@ class Channel:
                                             with self.vlock:
                                                 self.vframes.clear()
                                                 self.display = self.fallback
+                                if not self.frame_reduction.keep(pts_s):
+                                    self.reduced_vcount += 1
+                                    continue
                                 tile = fit_into_tile(frame, self.w, self.h, self.valign, self.halign)
                                 with self.vlock:
                                     self.latest = tile
                                     self.fresh_until = time.monotonic() + TILE_STALE_SECS
                                     if frame.pts is not None:
                                         self.vframes.append((pts_s, tile))
-                                self.vcount += 1
+                                self.scaled_vcount += 1
                         elif res is not None and packet.stream.type == "audio":
                             for frame in packet.decode():
                                 pts_s = (float(frame.pts * aus.time_base)
