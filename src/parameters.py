@@ -194,13 +194,18 @@ def build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs=None, composit
     if encoder == "h264_nvenc":
         # NVENC CBR via -rc cbr (pads with filler NAL units, same guarantee as
         # x264 CBR). -minrate, -keyint_min, -sc_threshold are x264-only.
-        cmd += ["-c:v", "h264_nvenc", "-preset", preset,
-                "-rc", "cbr",
-                "-pix_fmt", "yuv420p",
-                "-b:v", f"{bitrate}k",
-                "-maxrate", f"{bitrate}k",
-                "-bufsize", f"{bitrate // 2}k",
-                "-g", str(gop)]
+        video_args = ["-c:v", "h264_nvenc", "-preset", preset,
+                      "-rc", "cbr"]
+        # A CUDA filtergraph already produces CUDA frames. Forcing yuv420p
+        # here makes ffmpeg insert a software download between overlay_cuda
+        # and NVENC, which the graph cannot negotiate. CPU composition still
+        # needs the encoder's software input format selected explicitly.
+        if not compositor:
+            video_args += ["-pix_fmt", "yuv420p"]
+        cmd += video_args + ["-b:v", f"{bitrate}k",
+                             "-maxrate", f"{bitrate}k",
+                             "-bufsize", f"{bitrate // 2}k",
+                             "-g", str(gop)]
     elif encoder == "h264_vaapi":
         # VAAPI CBR: yuv420p input must be converted to nv12 before hwupload.
         # -rc_mode CBR enforces constant rate; driver pads output to hold bitrate.

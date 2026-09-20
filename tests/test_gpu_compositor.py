@@ -53,6 +53,17 @@ class GPUCompositorTests(unittest.TestCase):
         )
         self.assertIn("xstack_vaapi=inputs=2:layout=14_22|700_444", graph)
 
+    def test_cuda_compositor_does_not_force_a_software_encoder_format(self):
+        cfg = {
+            "fps": "30", "bitrate": 8000, "video_encoder": "h264_nvenc",
+            "preset": "p4", "tiles": [{"x": 0, "y": 0}],
+        }
+        cmd = parameters.build_encoder_cmd(
+            cfg, 1280, 720, [], [(3, 1280, 720)], {"name": "cuda", "init": []},
+        )
+        encoder_args = cmd[cmd.index("-c:v"):]
+        self.assertNotIn("-pix_fmt", encoder_args)
+
 
 if __name__ == "__main__":
     unittest.main()
