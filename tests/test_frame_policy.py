@@ -2,6 +2,7 @@
 
 import unittest
 
+from src import deps
 from src.frame_policy import FrameReduction
 
 
@@ -31,6 +32,18 @@ class FrameReductionTests(unittest.TestCase):
         policy.reset()
         self.assertTrue(policy.keep(0))
         self.assertFalse(policy.active)
+
+
+class PyAVWheelTests(unittest.TestCase):
+    def test_accepts_cp311_abi3_wheel_for_cp313_runtime(self):
+        self.assertTrue(deps._matches_wheel(
+            "av-18.1.0-cp311-abi3-manylinux_2_28_x86_64.whl", "linux-x86_64",
+        ))
+
+    def test_rejects_wheel_for_other_architecture(self):
+        self.assertFalse(deps._matches_wheel(
+            "av-18.1.0-cp311-abi3-manylinux_2_28_aarch64.whl", "linux-x86_64",
+        ))
 
 
 if __name__ == "__main__":
