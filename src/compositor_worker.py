@@ -27,7 +27,7 @@ from channel import Channel, AUDIO_RATE, AUDIO_LAYOUT, log, _yuv_planes, yuv_pla
 import av  # noqa: E402  (vendored, already on sys.path via the channel import above)
 import numpy as np  # noqa: E402
 
-from parameters import fps_fraction, build_encoder_cmd, validate_encoder  # noqa: E402
+from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_compositor_failure, validate_encoder  # noqa: E402
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                          # FIFO forward to re-sync (see audio_feeder())
@@ -168,20 +168,35 @@ def main():
         threading.Thread(target=c.run, name=f"chan-{c.name}", daemon=True).start()
     threading.Thread(target=stdin_listener, args=(channels, stop), name="stdin-ctrl", daemon=True).start()
 
-    # ffmpeg encodes (libx264, multi-core C) + muxes; we feed it the composited
-    # yuv420p canvas on stdin and one PCM track per audio channel on inherited fds.
-    video_r, video_w = os.pipe()
+    # Hardware profiles can place the already-letterboxed tiles in ffmpeg's
+    # GPU filters. Unsupported filters/devices deliberately retain the proven
+    # CPU canvas path rather than making a playable stream fail to start.
+    compositor = gpu_compositor(cfg)
+    gpu_composition = compositor is not None
+    if gpu_composition:
+        log(f"compositor={compositor['name']} (hardware profile selected)")
+        video_pipes = [os.pipe() for _ in channels]
+        video_read = [r for r, _w in video_pipes]
+        video_write = [w for _r, w in video_pipes]
+    else:
+        log(f"compositor=cpu ({gpu_compositor_failure(cfg)})")
+        video_r, video_w = os.pipe()
+        video_read = [video_r]
+        video_write = [video_w]
     audio_pipes = [os.pipe() for _ in audio_chs]
     audio_read = [r for (r, _w) in audio_pipes]
     enc_out_r, enc_out_w = os.pipe()
     validate_encoder(cfg.get("video_encoder", "libx264"))
-    cmd = build_encoder_cmd(cfg, out_w, out_h, audio_read)
+    video_inputs = ([(fd, c.w, c.h) for fd, c in zip(video_read, channels)]
+                    if gpu_composition else None)
+    cmd = build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs, compositor)
     for i, a in enumerate(audio_chs):
         cmd[-1:-1] = [f"-metadata:s:a:{i}", f"title={a.name}",
                       f"-metadata:s:a:{i}", f"language={a.lang}"]
-    enc = subprocess.Popen(cmd, stdin=video_r, stdout=enc_out_w,
-                           stderr=sys.stderr, pass_fds=audio_read)
-    os.close(video_r)
+    enc = subprocess.Popen(cmd, stdin=None if gpu_composition else video_read[0], stdout=enc_out_w,
+                           stderr=sys.stderr, pass_fds=[*video_read, *audio_read])
+    for fd in video_read:
+        os.close(fd)
     os.close(enc_out_w)
     for r in audio_read:
         os.close(r)
@@ -205,32 +220,40 @@ def main():
     for a, fd in zip(audio_chs, audio_w):
         threading.Thread(target=audio_feeder, args=(a, fd, stop), daemon=True).start()
 
-    # yuv420p canvas as one flat buffer (Y|U|V) with plane views; writing the
-    # whole buffer is exactly the planar byte order ffmpeg's rawvideo wants.
-    ysize = out_w * out_h
-    csize = (out_w // 2) * (out_h // 2)
-    cbuf = np.zeros(ysize + 2 * csize, np.uint8)
-    Yc, Uc, Vc = _yuv_planes(cbuf, out_w, out_h)
-    Uc[:] = 128
-    Vc[:] = 128
+    if gpu_composition:
+        # One reusable fixed-size yuv420p buffer per ffmpeg tile input. PyAV
+        # already scaled the content for the tile; ffmpeg owns only placement.
+        tile_bufs = []
+        for c in channels:
+            size = c.w * c.h * 3 // 2
+            buf = np.empty(size, np.uint8)
+            Y, U, V = _yuv_planes(buf, c.w, c.h)
+            tile_bufs.append((buf, Y, U, V))
+    else:
+        # yuv420p canvas as one flat buffer (Y|U|V) with plane views; writing the
+        # whole buffer is exactly the planar byte order ffmpeg's rawvideo wants.
+        ysize = out_w * out_h
+        csize = (out_w // 2) * (out_h // 2)
+        cbuf = np.zeros(ysize + 2 * csize, np.uint8)
+        Yc, Uc, Vc = _yuv_planes(cbuf, out_w, out_h)
+        Uc[:] = 128
+        Vc[:] = 128
 
-    # Seed the canvas with a background image once, if configured. Kept as
-    # an immutable reference copy (bg_buf) alongside the live canvas: each
-    # frame, every tile's rect is restored from this copy before its actual
-    # content is blitted on top, so letterbox/pillarbox padding (and any
-    # gap a layout leaves uncovered) shows the background instead of a
-    # stale opaque-black bar painted over it by a previous frame.
-    bg_path = cfg.get("background")
-    if bg_path:
-        try:
-            bg = _load_background(bg_path, out_w, out_h)
-            if bg:
-                Yc[:], Uc[:], Vc[:] = bg
-        except Exception as e:  # noqa: BLE001
-            log(f"background image load failed ({bg_path}): {e}")
+        # Seed the canvas with a background image once, if configured. Kept as
+        # an immutable reference copy (bg_buf) alongside the live canvas: each
+        # frame, every tile's rect is restored from this copy before its actual
+        # content is blitted on top.
+        bg_path = cfg.get("background")
+        if bg_path:
+            try:
+                bg = _load_background(bg_path, out_w, out_h)
+                if bg:
+                    Yc[:], Uc[:], Vc[:] = bg
+            except Exception as e:  # noqa: BLE001
+                log(f"background image load failed ({bg_path}): {e}")
 
-    bg_buf = cbuf.copy()
-    bg_Y, bg_U, bg_V = _yuv_planes(bg_buf, out_w, out_h)
+        bg_buf = cbuf.copy()
+        bg_Y, bg_U, bg_V = _yuv_planes(bg_buf, out_w, out_h)
 
     start = time.monotonic()
     n = 0
@@ -242,17 +265,29 @@ def main():
     try:
         while not stop.is_set():
             frame_time = start + n / fps_f
-            for t in channels:
+            for i, t in enumerate(channels):
                 Yt, Ut, Vt, ox, oy, tw, th = t.current_at(frame_time)
                 x, y, w, h = t.x, t.y, t.w, t.h
-                Yc[y:y + h, x:x + w] = bg_Y[y:y + h, x:x + w]
-                Uc[y // 2:(y + h) // 2, x // 2:(x + w) // 2] = bg_U[y // 2:(y + h) // 2, x // 2:(x + w) // 2]
-                Vc[y // 2:(y + h) // 2, x // 2:(x + w) // 2] = bg_V[y // 2:(y + h) // 2, x // 2:(x + w) // 2]
-                px, py = x + ox, y + oy
-                Yc[py:py + th, px:px + tw] = Yt
-                Uc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Ut
-                Vc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Vt
-            if not _write_all(video_w, memoryview(cbuf)):
+                if gpu_composition:
+                    buf, Yb, Ub, Vb = tile_bufs[i]
+                    Yb[:] = 0
+                    Ub[:] = 128
+                    Vb[:] = 128
+                    Yb[oy:oy + th, ox:ox + tw] = Yt
+                    Ub[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Ut
+                    Vb[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Vt
+                    if not _write_all(video_write[i], memoryview(buf)):
+                        stop.set()
+                        break
+                else:
+                    Yc[y:y + h, x:x + w] = bg_Y[y:y + h, x:x + w]
+                    Uc[y // 2:(y + h) // 2, x // 2:(x + w) // 2] = bg_U[y // 2:(y + h) // 2, x // 2:(x + w) // 2]
+                    Vc[y // 2:(y + h) // 2, x // 2:(x + w) // 2] = bg_V[y // 2:(y + h) // 2, x // 2:(x + w) // 2]
+                    px, py = x + ox, y + oy
+                    Yc[py:py + th, px:px + tw] = Yt
+                    Uc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Ut
+                    Vc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Vt
+            if not gpu_composition and not _write_all(video_write[0], memoryview(cbuf)):
                 break
             n += 1
             now = time.monotonic()
@@ -291,7 +326,8 @@ def main():
             except OSError:
                 pass
         try:
-            os.close(video_w)
+            for fd in video_write:
+                os.close(fd)
         except OSError:
             pass
         try:

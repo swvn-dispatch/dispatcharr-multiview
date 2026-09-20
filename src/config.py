@@ -115,7 +115,7 @@ _VIDEO_ENCODER_FIELD = {
     "type": "select",
     "default": "libx264",
     "options": [],  # populated from _ENCODER_OPTIONS in build_plugin_fields
-    "description": "Software encoder (libx264) or hardware GPU encoder. NVENC requires NVIDIA GPU; QSV/VAAPI require Intel/AMD GPU with /dev/dri support.",
+    "description": "Software encoder or hardware GPU encoder. Hardware profiles automatically use GPU tile composition when this FFmpeg build supports it; otherwise streams retain CPU composition. NVENC requires NVIDIA GPU; QSV/VAAPI require Intel/AMD GPU with /dev/dri support.",
 }
 
 # Per-encoder quality / preset fields
