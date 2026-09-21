@@ -15,8 +15,6 @@ AUDIO_RATE = 48000
 
 _COMPOSITOR_PROBES = {}
 _COMPOSITOR_FAILURES = {}
-_SCALER_PROBES = {}
-_SCALER_FAILURES = {}
 
 
 def fps_fraction(fps: str) -> Fraction:
@@ -140,73 +138,6 @@ def gpu_compositor_failure(cfg: dict) -> str:
     )
 
 
-def gpu_scaler(cfg: dict, compositor: dict | None) -> dict | None:
-    """Return a GPU scaler compatible with *compositor*, if one is usable.
-
-    The encoder compositor can accept already-sized CPU tiles. Scaling source
-    frames on-device needs backend-specific filters, so probe them separately
-    and retain that established path when a device only supports composition.
-    """
-    if compositor is None:
-        return None
-    key = (cfg.get("video_encoder", "libx264"), cfg.get("render_device", ""))
-    if key in _SCALER_PROBES:
-        return _SCALER_PROBES[key]
-    try:
-        filters = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-filters"], capture_output=True,
-            text=True, timeout=5,
-        ).stdout
-        requirements = {
-            "cuda": ("scale_cuda", "pad_cuda"),
-            "vaapi": ("scale_vaapi", "pad_vaapi"),
-            "qsv": ("scale_qsv", "overlay_qsv"),
-        }
-        missing = [name for name in requirements[compositor["name"]] if name not in filters]
-        if missing:
-            result = None
-            reason = f"missing FFmpeg filter(s): {', '.join(missing)}"
-        else:
-            probe = _gpu_scaler_probe(compositor)
-            check = subprocess.run(probe, capture_output=True, text=True, timeout=10)
-            result = compositor if check.returncode == 0 else None
-            reason = "GPU scale/pad filter graph probe failed" if result is None else None
-    except Exception as e:
-        result = None
-        reason = f"GPU scaler probe failed: {e}"
-    _SCALER_PROBES[key] = result
-    if result is None:
-        _SCALER_FAILURES[key] = reason
-    return result
-
-
-def gpu_scaler_failure(cfg: dict) -> str:
-    return _SCALER_FAILURES.get(
-        (cfg.get("video_encoder", "libx264"), cfg.get("render_device", "")),
-        "GPU scale/pad filters or device unavailable",
-    )
-
-
-def _gpu_scaler_probe(compositor: dict) -> list:
-    """Build a minimal scale-plus-letterbox graph for a backend capability test."""
-    name = compositor["name"]
-    prefix = ["ffmpeg", "-hide_banner", "-loglevel", "error", *compositor["init"],
-              "-f", "lavfi", "-i", "color=black:s=16x16:r=1",
-              "-f", "lavfi", "-i", "color=black:s=32x32:r=1"]
-    if name == "cuda":
-        graph = ("[0:v]hwupload_cuda,scale_cuda=w=8:h=8,pad_cuda=w=16:h=16:x=4:y=4[t];"
-                 "[1:v]hwupload_cuda[base];[base][t]overlay_cuda=x=0:y=0[mvout]")
-    elif name == "vaapi":
-        graph = ("[0:v]format=nv12,hwupload,scale_vaapi=w=8:h=8,pad_vaapi=w=16:h=16:x=4:y=4[t];"
-                 "[1:v]format=nv12,hwupload[base];[base][t]overlay_vaapi=x=0:y=0[mvout]")
-    else:
-        graph = ("[0:v]format=nv12,hwupload=extra_hw_frames=2,scale_qsv=w=8:h=8[t];"
-                 "[1:v]format=nv12,hwupload=extra_hw_frames=2[base];"
-                 "[base][t]overlay_qsv=x=4:y=4[mvout]")
-    return [*prefix, "-filter_complex", graph, "-map", "[mvout]",
-            "-frames:v", "1", "-f", "null", "-"]
-
-
 def build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs=None, compositor=None) -> list:
     bitrate = int(cfg.get("bitrate", 8000))
     gop = max(2, round(float(fps_fraction(cfg["fps"])) * 2))
@@ -236,9 +167,6 @@ def build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs=None, composit
             # CUDA has overlay but no xstack equivalent. A generated black
             # canvas is the base for ordered tile overlays.
             cmd += ["-f", "lavfi", "-i", f"color=black:s={out_w}x{out_h}:r={cfg['fps']}"]
-        elif compositor.get("scale_tiles") and compositor["name"] == "qsv":
-            for tile in cfg["tiles"]:
-                cmd += ["-f", "lavfi", "-i", f"color=black:s={tile['w']}x{tile['h']}:r={cfg['fps']}"]
     else:
         cmd += ["-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{out_w}x{out_h}",
                 "-r", cfg["fps"], "-thread_queue_size", "512", "-i", "pipe:0"]
@@ -248,10 +176,7 @@ def build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs=None, composit
     if video_inputs:
         graph = _gpu_filtergraph(video_inputs, cfg["tiles"], out_w, out_h, compositor)
         cmd += ["-filter_complex", graph, "-map", "[mvout]"]
-        canvas_inputs = 1 if compositor["name"] == "cuda" else (
-            len(video_inputs) if compositor.get("scale_tiles") and compositor["name"] == "qsv" else 0
-        )
-        audio_offset = len(video_inputs) + canvas_inputs
+        audio_offset = len(video_inputs) + (1 if compositor["name"] == "cuda" else 0)
     else:
         cmd += ["-map", "0:v:0"]
         audio_offset = 1
@@ -321,23 +246,13 @@ def build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs=None, composit
 
 
 def _gpu_filtergraph(video_inputs, tiles, out_w, out_h, compositor) -> str:
-    """Build the vendor graph for fixed-size or native source tile frames."""
+    """Build the vendor graph for fixed-size, already letterboxed tile frames."""
     name = compositor["name"]
     if name == "cuda":
         chains = [f"[{len(video_inputs)}:v]hwupload_cuda[base]"]
         previous = "base"
         for i, tile in enumerate(tiles):
-            _fd, source_w, source_h = video_inputs[i]
-            if compositor.get("scale_tiles"):
-                content_w, content_h, offset_x, offset_y = tile_content_rect(
-                    source_w, source_h, tile,
-                )
-                chains.append(
-                    f"[{i}:v]hwupload_cuda,scale_cuda=w={content_w}:h={content_h},"
-                    f"pad_cuda=w={tile['w']}:h={tile['h']}:x={offset_x}:y={offset_y}:color=black[t{i}]"
-                )
-            else:
-                chains.append(f"[{i}:v]hwupload_cuda[t{i}]")
+            chains.append(f"[{i}:v]hwupload_cuda[t{i}]")
             out = "mvout" if i == len(tiles) - 1 else f"o{i}"
             chains.append(f"[{previous}][t{i}]overlay_cuda=x={tile['x']}:y={tile['y']}[{out}]")
             previous = out
@@ -347,24 +262,7 @@ def _gpu_filtergraph(video_inputs, tiles, out_w, out_h, compositor) -> str:
     for i in range(len(video_inputs)):
         label = f"t{i}"
         upload = "format=nv12,hwupload=extra_hw_frames=64" if name == "qsv" else "format=nv12,hwupload"
-        if compositor.get("scale_tiles"):
-            _fd, source_w, source_h = video_inputs[i]
-            content_w, content_h, offset_x, offset_y = tile_content_rect(source_w, source_h, tiles[i])
-            if name == "vaapi":
-                chains = [
-                    f"[{i}:v]{upload},scale_vaapi=w={content_w}:h={content_h},"
-                    f"pad_vaapi=w={tiles[i]['w']}:h={tiles[i]['h']}:x={offset_x}:y={offset_y}:color=black[{label}]"
-                ]
-            else:
-                base = f"q{i}"
-                canvas = len(video_inputs) + i
-                chains = [
-                    f"[{i}:v]{upload},scale_qsv=w={content_w}:h={content_h}[s{i}]",
-                    f"[{canvas}:v]{upload}[{base}]",
-                    f"[{base}][s{i}]overlay_qsv=x={offset_x}:y={offset_y}[{label}]",
-                ]
-        else:
-            chains = [f"[{i}:v]{upload}[{label}]"]
+        chains = [f"[{i}:v]{upload}[{label}]"]
         uploaded.append(f"[{label}]")
         if i == 0:
             all_chains = chains
@@ -373,23 +271,3 @@ def _gpu_filtergraph(video_inputs, tiles, out_w, out_h, compositor) -> str:
     layout = "|".join(f"{tile['x']}_{tile['y']}" for tile in tiles)
     all_chains.append(f"{''.join(uploaded)}xstack_{name}=inputs={len(video_inputs)}:layout={layout}:fill=black[mvout]")
     return ";".join(all_chains)
-
-
-def tile_content_rect(source_w: int, source_h: int, tile: dict) -> tuple[int, int, int, int]:
-    """Return the even content size and aligned offset for a contain-fit tile."""
-    scale = min(tile["w"] / source_w, tile["h"] / source_h)
-    width = max(2, min(tile["w"], int(source_w * scale) // 2 * 2))
-    height = max(2, min(tile["h"], int(source_h * scale) // 2 * 2))
-    if tile.get("halign") == "left":
-        x = 0
-    elif tile.get("halign") == "right":
-        x = (tile["w"] - width) & ~1
-    else:
-        x = ((tile["w"] - width) // 2) & ~1
-    if tile.get("valign") == "top":
-        y = 0
-    elif tile.get("valign") == "bottom":
-        y = (tile["h"] - height) & ~1
-    else:
-        y = ((tile["h"] - height) // 2) & ~1
-    return width, height, x, y

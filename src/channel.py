@@ -153,16 +153,11 @@ class Channel:
         self.valign = spec.get("valign", "center")
         self.halign = spec.get("halign", "center")
         self.fallback = (*black_planes(self.w, self.h), 0, 0, self.w, self.h)
-        self.gpu_scaling = False
-        self.gpu_fallback = None
-        self.video_dimensions = None
-        self.gpu_dimensions_changed = False
-        self._video_ready = threading.Event()
         self.latest = self.fallback
         self.fresh_until = 0.0
-        self.logo = spec.get("logo")
-        if self.logo:
-            threading.Thread(target=self._load_logo, args=(self.logo,), daemon=True).start()
+        logo = spec.get("logo")
+        if logo:
+            threading.Thread(target=self._load_logo, args=(logo,), daemon=True).start()
         self.running = True
         self.vcount = 0          # decoded video frames (for rate diagnostics)
         self.scaled_vcount = 0
@@ -203,17 +198,15 @@ class Channel:
                 self.hwaccel = None
         return av.open(self.url, options=DECODE_OPTS)
 
-    def _make_fallback(self, logo, w=None, h=None):
-        w = self.w if w is None else w
-        h = self.h if h is None else h
-        Y, U, V = black_planes(w, h)
+    def _make_fallback(self, logo):
+        Y, U, V = black_planes(self.w, self.h)
         if logo:
             try:
                 with av.open(logo) as c:
                     for frame in c.decode(video=0):
                         # Scale to fit within one-third of the tile, preserving aspect ratio.
-                        max_w = (w // 3) & ~1
-                        max_h = (h // 3) & ~1
+                        max_w = (self.w // 3) & ~1
+                        max_h = (self.h // 3) & ~1
                         scale = min(max_w / frame.width, max_h / frame.height)
                         lw = _even(frame.width * scale)
                         lh = _even(frame.height * scale)
@@ -227,44 +220,22 @@ class Channel:
                         rgb_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
                         lf = rgb_frame.reformat(format="yuv420p")
                         ly, lu, lv = yuv_planes_from_frame(lf, lw, lh)
-                        oy = ((h - lh) // 2) & ~1
-                        ox = ((w - lw) // 2) & ~1
+                        oy = ((self.h - lh) // 2) & ~1
+                        ox = ((self.w - lw) // 2) & ~1
                         Y[oy:oy + lh, ox:ox + lw] = ly
                         U[oy // 2:(oy + lh) // 2, ox // 2:(ox + lw) // 2] = lu
                         V[oy // 2:(oy + lh) // 2, ox // 2:(ox + lw) // 2] = lv
                         break
             except Exception as e:  # noqa: BLE001
                 log(f"logo decode failed for {self.name}: {e}")
-        return (Y, U, V, 0, 0, w, h)
+        return (Y, U, V, 0, 0, self.w, self.h)
 
     def _load_logo(self, logo):
         """Load logo in background and swap self.fallback when ready."""
         fb = self._make_fallback(logo)
         self.fallback = fb                  # CPython GIL makes tuple attr swap atomic
-        if self.video_dimensions is not None:
-            self.gpu_fallback = self._make_fallback(logo, *self.video_dimensions)
         if self.fresh_until == 0.0:         # no real video yet; update latest too
-            self.latest = self.gpu_fallback if self.gpu_scaling else fb
-
-    def wait_for_video(self, timeout):
-        """Wait for stream dimensions needed by a fixed-size GPU rawvideo pipe."""
-        if self._video_ready.wait(timeout):
-            return self.video_dimensions
-        return None
-
-    def enable_gpu_scaling(self):
-        """Publish native source frames for FFmpeg's GPU scale/pad graph."""
-        dimensions = self.video_dimensions
-        if dimensions is None:
-            return False
-        self.gpu_fallback = (*black_planes(*dimensions), 0, 0, *dimensions)
-        with self.vlock:
-            self.gpu_scaling = True
-            self.vframes.clear()
-            self.latest = self.gpu_fallback
-            self.display = self.gpu_fallback
-            self.fresh_until = 0.0
-        return True
+            self.latest = fb
 
     def reconnect(self):
         """Signal run() to drop and reconnect; checked inside the demux loop."""
@@ -300,8 +271,6 @@ class Channel:
                 # rate (single-threaded PyAV decode runs ~22-27fps -> slow motion).
                 vs.thread_type = "AUTO"
                 vs.codec_context.thread_count = 3
-                self.video_dimensions = (vs.width, vs.height)
-                self._video_ready.set()
                 log(f"channel {self.name}: video codec={getattr(vs.codec_context, 'name', None)} "
                     f"size={vs.width}x{vs.height} avg_rate={getattr(vs, 'average_rate', None)} "
                     f"base_rate={getattr(vs, 'base_rate', None)} "
@@ -349,17 +318,7 @@ class Channel:
                                 if not self.frame_reduction.keep(pts_s):
                                     self.reduced_vcount += 1
                                     continue
-                                if self.gpu_scaling:
-                                    if (frame.width, frame.height) != self.video_dimensions:
-                                        self.gpu_dimensions_changed = True
-                                        log(f"channel {self.name}: source dimensions changed to "
-                                            f"{frame.width}x{frame.height}")
-                                        continue
-                                    sf = frame.reformat(format="yuv420p")
-                                    sy, su, sv = yuv_planes_from_frame(sf, frame.width, frame.height)
-                                    tile = (sy, su, sv, 0, 0, frame.width, frame.height)
-                                else:
-                                    tile = fit_into_tile(frame, self.w, self.h, self.valign, self.halign)
+                                tile = fit_into_tile(frame, self.w, self.h, self.valign, self.halign)
                                 with self.vlock:
                                     self.latest = tile
                                     self.fresh_until = time.monotonic() + TILE_STALE_SECS
@@ -404,7 +363,7 @@ class Channel:
         """Return the newest decoded frame due at *wall_time* by source PTS."""
         with self.vlock:
             if time.monotonic() >= self.fresh_until:
-                return self.gpu_fallback if self.gpu_scaling else self.fallback
+                return self.fallback
             if self.clk_pts is None or self.clk_wall is None:
                 return self.latest
             target_pts = self.clk_pts + wall_time - self.clk_wall
