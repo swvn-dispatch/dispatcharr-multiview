@@ -13,8 +13,10 @@ import threading
 import time
 
 try:
+    from .audio_policy import samples_before_pts
     from .frame_policy import FrameReduction
 except ImportError:
+    from audio_policy import samples_before_pts
     from frame_policy import FrameReduction
 
 # Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
@@ -403,14 +405,17 @@ class Channel:
         with self.alock:
             return self.last_taken_pts, self.abuffered, self.audio_resyncs
 
-    def take(self, nsamples: int) -> np.ndarray:
-        """Return exactly nsamples of int16 (nsamples, 2), silence-padded."""
+    def take(self, nsamples: int, pts_limit=None) -> np.ndarray:
+        """Return PCM through *pts_limit*, silence-padding future samples."""
         out = np.zeros((nsamples, 2), np.int16)
         filled = 0
         with self.alock:
             while filled < nsamples and self.aframes:
                 pts_s, chunk = self.aframes[0]
-                need = nsamples - filled
+                available = samples_before_pts(pts_s, chunk.shape[0], pts_limit, AUDIO_RATE)
+                if available == 0:
+                    break
+                need = min(nsamples - filled, available)
                 if chunk.shape[0] <= need:
                     out[filled:filled + chunk.shape[0]] = chunk
                     self.aframes.pop(0)
@@ -429,4 +434,6 @@ class Channel:
                     filled = nsamples
                     if pts_s is not None:
                         self.last_taken_pts = pts_s + need / AUDIO_RATE
+                if available < chunk.shape[0]:
+                    break
         return out

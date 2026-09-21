@@ -106,11 +106,9 @@ def audio_feeder(track, fd, stop):
 
         was_valid = True
 
-        # Only correct audio-behind-video (silent underruns falling further
-        # back over time); a transient audio-ahead-of-video reading is
-        # self-limiting (FIFO capped by _trim(), audio never paced faster
-        # than real time) and left uncorrected, matching the pre-existing
-        # one-shot snap behavior which is also catch-up-only.
+        # Catch audio that has fallen behind the video clock by skipping stale
+        # FIFO data. Future audio is retained below and silence is emitted
+        # until video reaches it, preventing audio from leading video.
         last_pts, _, _ = track.audio_status()
         if last_pts is not None and (pts_now - last_pts) > DRIFT_THRESHOLD:
             delta = pts_now - last_pts
@@ -122,7 +120,7 @@ def audio_feeder(track, fd, stop):
         target = int((time.monotonic() - start) * AUDIO_RATE)
         need = target - written
         if need > 0:
-            pcm = track.take(need)
+            pcm = track.take(need, pts_now + AUDIO_LEAD_SECS)
             if not _write_all(fd, pcm.tobytes()):
                 break
             written += need
