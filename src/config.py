@@ -708,19 +708,6 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
     if is_regex:
         fields.append(
             {
-                "id": f"multiview_{layout_id}_regex_pattern",
-                "label": f"Layout {n} Channel Pattern",
-                "type": "string",
-                "default": "",
-                "placeholder": r"e.g. TSN\s*\d or ^CA \|",
-                "description": (
-                    "Case-insensitive regex matched against channel names. "
-                    "Choose how matching channels are sorted before tiling."
-                ),
-            }
-        )
-        fields.append(
-            {
                 "id": f"multiview_{layout_id}_regex_sort",
                 "label": f"Layout {n} Regex Sort",
                 "type": "select",
@@ -733,6 +720,19 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
                 "description": (
                     "Top-level regex alternatives uses | alternatives from left to right. "
                     "For example, event-a|event-b|event-c puts matching channels in that order."
+                ),
+            }
+        )
+        fields.append(
+            {
+                "id": f"multiview_{layout_id}_regex_pattern",
+                "label": f"Layout {n} Channel Pattern",
+                "type": "textarea",
+                "default": "",
+                "placeholder": r"e.g. ^Event \| (Alpha|Beta)$",
+                "description": (
+                    "Case-insensitive regex matched against channel names. "
+                    "The field wraps long patterns for easier editing."
                 ),
             }
         )

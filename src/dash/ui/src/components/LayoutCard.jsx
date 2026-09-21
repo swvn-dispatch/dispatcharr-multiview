@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Group, Text, Button, Modal, Divider, ActionIcon, Stack, Combobox, InputBase, useCombobox } from '@mantine/core';
+import { Group, Text, Button, Modal, Divider, ActionIcon, Stack, Combobox, InputBase, Textarea, useCombobox } from '@mantine/core';
 import { IconTrash, IconPlus, IconMinus, IconGripVertical } from '@tabler/icons-react';
 import { notifications } from '@mantine/notifications';
 import { CollapsiblePanel, FieldRenderer, useDebouncedFieldSave } from '@swvn-dispatch/dispatch-ui-kit';
@@ -58,6 +58,22 @@ function ChannelSelect({ label, description, data, value, onChange }) {
   );
 }
 
+function RegexPatternField({ field, value, onChange }) {
+  return (
+    <Textarea
+      label={field.label}
+      description={field.description}
+      placeholder={field.placeholder}
+      value={value ?? field.default ?? ''}
+      autosize
+      minRows={3}
+      maxRows={8}
+      onChange={(event) => onChange(event.currentTarget.value)}
+      styles={{ input: { fontFamily: 'var(--mantine-font-family-monospace)', overflowWrap: 'anywhere' } }}
+    />
+  );
+}
+
 export function LayoutCard({ id, position, fields, settings, canRemove, hasActiveStream, dragHandleProps, onSettingsChange, onFieldsReload, onRemove, onChannelCountChange }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const handleChange = useDebouncedFieldSave(patchConfig, {
@@ -78,7 +94,13 @@ export function LayoutCard({ id, position, fields, settings, canRemove, hasActiv
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 'var(--mantine-spacing-sm)' }}>
         {fs.map((f) => (
-          <FieldRenderer key={f.id} field={f} value={settings[f.id]} onChange={(v) => handleChange(f.id, v, f.type !== 'string')} />
+          f.type === 'textarea' ? (
+            <div key={f.id} style={{ gridColumn: '1 / -1' }}>
+              <RegexPatternField field={f} value={settings[f.id]} onChange={(v) => handleChange(f.id, v, false)} />
+            </div>
+          ) : (
+            <FieldRenderer key={f.id} field={f} value={settings[f.id]} onChange={(v) => handleChange(f.id, v, f.type !== 'string')} />
+          )
         ))}
       </div>
     );
