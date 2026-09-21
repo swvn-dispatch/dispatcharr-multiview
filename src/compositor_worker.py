@@ -31,6 +31,8 @@ from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_comp
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                          # FIFO forward to re-sync (see audio_feeder())
+AUDIO_TICK_SECS = 0.005
+AUDIO_DELAY_SECS = 0.005  # keep raw PCM just behind the rendered video clock
 
 
 # ---------------------------------------------------------------- compositing helpers
@@ -70,7 +72,7 @@ def stdin_listener(channels, stop):
 
 
 def audio_feeder(track, fd, stop):
-    CHUNK = int(AUDIO_RATE * 0.02)  # 960 samples = 20ms per tick
+    CHUNK = int(AUDIO_RATE * AUDIO_TICK_SECS)  # 240 samples = 5ms per tick
     SILENCE = np.zeros((CHUNK, 2), dtype=np.int16)
 
     start = None
@@ -91,13 +93,15 @@ def audio_feeder(track, fd, stop):
                 written = 0
             was_valid = False
             _write_all(fd, SILENCE.tobytes())
-            time.sleep(0.02)
+            time.sleep(AUDIO_TICK_SECS)
             continue
+
+        audio_target_pts = pts_now - AUDIO_DELAY_SECS
 
         if not snapped:
             # New clock available (startup or post-reconnect): snap audio buffer
             # to current video PTS and reset wall-clock counters.
-            track._align_to_pts(pts_now)
+            track._align_to_pts(audio_target_pts)
             log(f"channel {track.name}: audio clock anchor video_pts={pts_now:.3f}")
             start = time.monotonic()
             written = 0
@@ -111,7 +115,7 @@ def audio_feeder(track, fd, stop):
         last_pts, _, _ = track.audio_status()
         if last_pts is not None and (pts_now - last_pts) > DRIFT_THRESHOLD:
             delta = pts_now - last_pts
-            track._align_to_pts(pts_now)
+            track._align_to_pts(audio_target_pts)
             with track.alock:
                 track.audio_resyncs += 1
             log(f"channel {track.name}: audio catch-up delta={delta:.3f}s")
@@ -119,11 +123,11 @@ def audio_feeder(track, fd, stop):
         target = int((time.monotonic() - start) * AUDIO_RATE)
         need = target - written
         if need > 0:
-            pcm = track.take(need, pts_now)
+            pcm = track.take(need, audio_target_pts)
             if not _write_all(fd, pcm.tobytes()):
                 break
             written += need
-        time.sleep(0.02)
+        time.sleep(AUDIO_TICK_SECS)
 
 
 # ---------------------------------------------------------------- background image
