@@ -94,7 +94,7 @@ export function LayoutCard({ id, position, fields, settings, canRemove, hasActiv
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 'var(--mantine-spacing-sm)' }}>
         {fs.map((f) => (
-          f.type === 'textarea' ? (
+          f.type === 'text' ? (
             <div key={f.id} style={{ gridColumn: '1 / -1' }}>
               <RegexPatternField field={f} value={settings[f.id]} onChange={(v) => handleChange(f.id, v, false)} />
             </div>

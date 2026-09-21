@@ -30,7 +30,7 @@ class RegexOrderTests(unittest.TestCase):
             regex_sort_key("first|second", "second", 2, "channel_number_reverse"),
         )
 
-    def test_regex_pattern_follows_sort_as_a_textarea(self):
+    def test_regex_pattern_follows_sort_as_a_text_field(self):
         fields = _build_multiview_block("test0001", 1, 4, selector_type="regex")
         regex_fields = [field for field in fields if "regex_" in field["id"]]
 
@@ -38,4 +38,4 @@ class RegexOrderTests(unittest.TestCase):
             [field["id"] for field in regex_fields],
             ["multiview_test0001_regex_sort", "multiview_test0001_regex_pattern"],
         )
-        self.assertEqual(regex_fields[1]["type"], "textarea")
+        self.assertEqual(regex_fields[1]["type"], "text")

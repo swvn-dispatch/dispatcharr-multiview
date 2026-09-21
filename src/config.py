@@ -727,7 +727,7 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
             {
                 "id": f"multiview_{layout_id}_regex_pattern",
                 "label": f"Layout {n} Channel Pattern",
-                "type": "textarea",
+                "type": "text",
                 "default": "",
                 "placeholder": r"e.g. ^Event \| (Alpha|Beta)$",
                 "description": (
