@@ -465,14 +465,14 @@ class Channel:
                     if pts_s is not None:
                         self.last_taken_pts = pts_s + chunk.shape[0] / AUDIO_RATE
                 else:
-                    out[filled:] = chunk[:need]
+                    out[filled:filled + need] = chunk[:need]
                     # A buffered chunk's PTS always identifies its first retained
                     # sample. Without this adjustment, each partial read makes
                     # drift detection measure from the chunk's original start.
                     next_pts = pts_s + need / AUDIO_RATE if pts_s is not None else None
                     self.aframes[0] = (next_pts, chunk[need:])
                     self.abuffered -= need
-                    filled = nsamples
+                    filled += need
                     if pts_s is not None:
                         self.last_taken_pts = pts_s + need / AUDIO_RATE
                 if available < chunk.shape[0]:
