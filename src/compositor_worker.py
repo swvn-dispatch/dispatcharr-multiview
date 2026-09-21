@@ -182,10 +182,25 @@ def main():
     threading.Thread(target=stdin_listener, args=(channels, stop), name="stdin-ctrl", daemon=True).start()
 
     # Hardware profiles can place the already-letterboxed tiles in ffmpeg's
-    # GPU filters. Unsupported filters/devices deliberately retain the proven
-    # CPU canvas path rather than making a playable stream fail to start.
+    # GPU filters. Where the backend scale graph is also available, wait for
+    # stable source dimensions and send native frames so scaling moves off CPU.
+    # Unsupported filters/devices deliberately retain the proven CPU paths.
     compositor = gpu_compositor(cfg)
     gpu_composition = compositor is not None
+    gpu_scaling = False
+    if gpu_composition and gpu_scaler(cfg, compositor):
+        deadline = time.monotonic() + 5.0
+        dimensions = []
+        for c in channels:
+            dimensions.append(c.wait_for_video(max(0.0, deadline - time.monotonic())))
+        if all(dimensions) and all(c.enable_gpu_scaling() for c in channels):
+            compositor = {**compositor, "scale_tiles": True}
+            gpu_scaling = True
+            log(f"scaler={compositor['name']} (native source frames)")
+        else:
+            log("scaler=cpu (source dimensions unavailable at startup)")
+    elif gpu_composition:
+        log(f"scaler=cpu ({gpu_scaler_failure(cfg)})")
     if gpu_composition:
         log(f"compositor={compositor['name']} (hardware profile selected)")
         video_pipes = [os.pipe() for _ in channels]
@@ -200,7 +215,8 @@ def main():
     audio_read = [r for (r, _w) in audio_pipes]
     enc_out_r, enc_out_w = os.pipe()
     validate_encoder(cfg.get("video_encoder", "libx264"))
-    video_inputs = ([(fd, c.w, c.h) for fd, c in zip(video_read, channels)]
+    video_inputs = ([(fd, *(c.video_dimensions if gpu_scaling else (c.w, c.h)))
+                     for fd, c in zip(video_read, channels)]
                     if gpu_composition else None)
     cmd = build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs, compositor)
     cmd[-1:-1] = generated_audio_metadata_args(
@@ -236,13 +252,15 @@ def main():
         threading.Thread(target=audio_feeder, args=(a, fd, stop, presentation_clock), daemon=True).start()
 
     if gpu_composition:
-        # One reusable fixed-size yuv420p buffer per ffmpeg tile input. PyAV
-        # already scaled the content for the tile; ffmpeg owns only placement.
+        # One reusable fixed-size yuv420p buffer per ffmpeg input. GPU scalers
+        # receive native frames; the compatibility path receives
+        # already-letterboxed tiles.
         tile_bufs = []
         for c in channels:
-            size = c.w * c.h * 3 // 2
+            w, h = c.video_dimensions if gpu_scaling else (c.w, c.h)
+            size = w * h * 3 // 2
             buf = np.empty(size, np.uint8)
-            Y, U, V = _yuv_planes(buf, c.w, c.h)
+            Y, U, V = _yuv_planes(buf, w, h)
             tile_bufs.append((buf, Y, U, V))
     else:
         # yuv420p canvas as one flat buffer (Y|U|V) with plane views; writing the
@@ -286,12 +304,19 @@ def main():
                 x, y, w, h = t.x, t.y, t.w, t.h
                 if gpu_composition:
                     buf, Yb, Ub, Vb = tile_bufs[i]
-                    Yb[:] = 0
-                    Ub[:] = 128
-                    Vb[:] = 128
-                    Yb[oy:oy + th, ox:ox + tw] = Yt
-                    Ub[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Ut
-                    Vb[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Vt
+                    if gpu_scaling:
+                        if t.gpu_dimensions_changed:
+                            log(f"channel {t.name}: stopping GPU scaler after source resolution change")
+                            stop.set()
+                            break
+                        Yb[:], Ub[:], Vb[:] = Yt, Ut, Vt
+                    else:
+                        Yb[:] = 0
+                        Ub[:] = 128
+                        Vb[:] = 128
+                        Yb[oy:oy + th, ox:ox + tw] = Yt
+                        Ub[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Ut
+                        Vb[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Vt
                     if not _write_all(video_write[i], memoryview(buf)):
                         stop.set()
                         break
