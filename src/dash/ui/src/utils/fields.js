@@ -9,7 +9,7 @@ export function groupFields(fields, layoutId) {
   let audioSource = null, channelCountField = null;
   for (const f of fields) {
     const key = f.id.replace(`multiview_${layoutId}_`, '');
-    if (['name', 'layout', 'selector_type', 'regex_pattern'].includes(key)) base.push(f);
+    if (['name', 'layout', 'selector_type', 'regex_pattern', 'regex_sort'].includes(key)) base.push(f);
     else if (key === 'channel_count') channelCountField = f;
     else if (key === 'audio_source') audioSource = f;
     else if (key.startsWith('epg_')) epg.push(f);
