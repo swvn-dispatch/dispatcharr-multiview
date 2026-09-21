@@ -6,7 +6,10 @@ import json
 import os
 import secrets
 
-from .regex_order import regex_sort_key
+try:
+    from .regex_order import regex_sort_key
+except ImportError:
+    from regex_order import regex_sort_key  # script context (compositor_worker.py)
 
 
 def _load_plugin_config() -> dict:

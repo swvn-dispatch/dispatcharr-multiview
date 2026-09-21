@@ -464,12 +464,15 @@ class MultiviewServer:
             logger.debug(f"{label} ended, worker killed")
 
     def _drain_stderr(self, proc, label: str):
+        traceback_active = False
         try:
             for raw in proc.stderr:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
                     message = f"{label}: {line}"
-                    if any(marker in line.lower() for marker in (
+                    lower = line.lower()
+                    traceback_active = traceback_active or "traceback" in lower or "exception in thread" in lower
+                    if traceback_active or any(marker in lower for marker in (
                         "fatal", "traceback", "exception", " error", " failed", "giving up", " ended:",
                     )):
                         logger.warning(message)
