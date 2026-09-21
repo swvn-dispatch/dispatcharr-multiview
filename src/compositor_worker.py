@@ -99,12 +99,10 @@ def audio_feeder(track, fd, stop):
             time.sleep(AUDIO_TICK_SECS)
             continue
 
-        audio_target_pts = pts_now - AUDIO_DELAY_SECS
-
         if not snapped:
             # New clock available (startup or post-reconnect): snap audio buffer
             # to current video PTS and reset wall-clock counters.
-            track._align_to_pts(audio_target_pts)
+            track._align_to_pts(pts_now)
             log(f"channel {track.name}: audio clock anchor video_pts={pts_now:.3f}")
             start = time.monotonic()
             written = 0
