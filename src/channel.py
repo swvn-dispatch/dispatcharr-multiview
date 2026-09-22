@@ -388,15 +388,20 @@ class Channel:
         return self.clk_pts + (time.monotonic() - self.clk_wall)
 
     def _align_to_pts(self, pts_limit: float):
-        """Discard buffered audio chunks that end before pts_limit."""
+        """Discard audio samples before pts_limit."""
         with self.alock:
             while self.aframes:
                 pts_s, chunk = self.aframes[0]
                 if pts_s is None:
                     break
-                if pts_s + chunk.shape[0] / AUDIO_RATE < pts_limit:
+                stale = samples_before_pts(pts_s, chunk.shape[0], pts_limit, AUDIO_RATE)
+                if stale == chunk.shape[0]:
                     self.aframes.pop(0)
                     self.abuffered -= chunk.shape[0]
+                elif stale:
+                    self.aframes[0] = (pts_s + stale / AUDIO_RATE, chunk[stale:])
+                    self.abuffered -= stale
+                    break
                 else:
                     break
 

@@ -40,6 +40,19 @@ class AudioPolicyTests(unittest.TestCase):
         self.assertEqual(track.aframes[0][1].shape, (15, 2))
         self.assertEqual(track.abuffered, 15)
 
+    @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
+    def test_align_trims_the_stale_front_of_a_chunk(self):
+        track = Channel.__new__(Channel)
+        track.alock = threading.Lock()
+        track.aframes = [(5.0, np.ones((100, 2), np.int16))]
+        track.abuffered = 100
+
+        track._align_to_pts(5.0 + 85 / AUDIO_RATE)
+
+        self.assertEqual(track.aframes[0][0], 5.0 + 85 / AUDIO_RATE)
+        self.assertEqual(track.aframes[0][1].shape, (15, 2))
+        self.assertEqual(track.abuffered, 15)
+
 
 if __name__ == "__main__":
     unittest.main()
