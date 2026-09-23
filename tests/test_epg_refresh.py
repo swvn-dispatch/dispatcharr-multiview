@@ -5,7 +5,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-from src import Plugin
+from src import Plugin, _m3u_content
 from src import epg
 
 
@@ -28,6 +28,19 @@ class EPGDataCleanupTests(unittest.TestCase):
         rows.exclude.assert_called_once_with(tvg_id__in={"mv-current"})
         stale_rows.delete.assert_called_once_with()
         self.assertEqual(deleted, 3)
+
+
+class M3UOrderTests(unittest.TestCase):
+    def test_layout_order_sets_playlist_order_and_channel_numbers(self):
+        content = _m3u_content(
+            {
+                "multiview_second_name": "Second",
+                "multiview_first_name": "First",
+            },
+            ["second", "first"],
+        )
+
+        self.assertLess(content.index('tvg-id="mv-second" tvg-chno="1"'), content.index('tvg-id="mv-first" tvg-chno="2"'))
 
 
 class RefreshOrderTests(unittest.TestCase):
