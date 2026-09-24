@@ -31,6 +31,7 @@ from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_comp
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                          # FIFO forward to re-sync (see audio_feeder())
+AUDIO_GATE_RECOVERY_SECS = 0.5
 AUDIO_TICK_SECS = 0.005
 
 
@@ -90,6 +91,9 @@ def audio_feeder(track, fd, stop):
                 snapped = False
                 start = None
                 written = 0
+                with track.alock:
+                    track.audio_gate_since = None
+                    track.audio_pts_offset = 0.0
             was_valid = False
             _write_all(fd, SILENCE.tobytes())
             time.sleep(AUDIO_TICK_SECS)
@@ -106,13 +110,32 @@ def audio_feeder(track, fd, stop):
 
         was_valid = True
 
+        with track.alock:
+            pts_limit = pts_now + track.audio_pts_offset
+            first_pts = track.aframes[0][0] if track.aframes else None
+            if first_pts is not None and first_pts > pts_limit:
+                if track.audio_gate_since is None:
+                    track.audio_gate_since = time.monotonic()
+                gate_duration = time.monotonic() - track.audio_gate_since
+                if gate_duration >= AUDIO_GATE_RECOVERY_SECS:
+                    lead = first_pts - pts_limit
+                    track.audio_pts_offset = first_pts - pts_now
+                    track.audio_gate_since = None
+                    track.audio_gate_recoveries += 1
+                    pts_limit = first_pts
+                    log(f"channel {track.name}: audio PTS recovery "
+                        f"video_pts={pts_now:.3f} audio_pts={first_pts:.3f} "
+                        f"lead={lead:.3f}s")
+            else:
+                track.audio_gate_since = None
+
         # Catch audio that has fallen behind the video clock by skipping stale
         # FIFO data. Future audio is retained below and silence is emitted
         # until video reaches it, preventing audio from leading video.
-        last_pts, _, _ = track.audio_status()
-        if last_pts is not None and (pts_now - last_pts) > DRIFT_THRESHOLD:
-            delta = pts_now - last_pts
-            track._align_to_pts(pts_now)
+        last_pts, _, _, _, _, _, _ = track.audio_status()
+        if last_pts is not None and (pts_limit - last_pts) > DRIFT_THRESHOLD:
+            delta = pts_limit - last_pts
+            track._align_to_pts(pts_limit)
             with track.alock:
                 track.audio_resyncs += 1
             log(f"channel {track.name}: audio catch-up delta={delta:.3f}s")
@@ -120,7 +143,7 @@ def audio_feeder(track, fd, stop):
         target = int((time.monotonic() - start) * AUDIO_RATE)
         need = target - written
         if need > 0:
-            pcm = track.take(need, pts_now)
+            pcm = track.take(need, pts_limit)
             if not _write_all(fd, pcm.tobytes()):
                 break
             written += need
@@ -299,12 +322,18 @@ def main():
                                   for i, c in enumerate(channels))
                 audio = []
                 for i, c in enumerate(audio_chs):
-                    last_pts, buffered, resyncs = c.audio_status()
+                    (last_pts, buffered, resyncs, first_pts, gate_since,
+                     pts_offset, recoveries) = c.audio_status()
                     video_pts = c.audio_pts_now()
-                    delta = video_pts - last_pts if video_pts is not None and last_pts is not None else None
+                    pts_limit = video_pts + pts_offset if video_pts is not None else None
+                    delta = pts_limit - last_pts if pts_limit is not None and last_pts is not None else None
                     delta_text = f"{delta:+.3f}s" if delta is not None else "n/a"
+                    lead = first_pts - pts_limit if first_pts is not None and pts_limit is not None else None
+                    lead_text = f"{lead:+.3f}s" if lead is not None else "n/a"
+                    blocked = now - gate_since if gate_since is not None else 0.0
                     audio.append(f"{c.name[:7]}=d{delta_text}/q{buffered / AUDIO_RATE:.2f}s/"
-                                 f"r{resyncs - prev_audio_resyncs[i]}")
+                                 f"lead{lead_text}/block{blocked:.2f}s/"
+                                 f"r{resyncs - prev_audio_resyncs[i]}/g{recoveries}")
                 import resource as _res
                 rss_mb = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss // 1024
                 log(f"out {n / (now - start):.1f}fps; decode {rates}; "

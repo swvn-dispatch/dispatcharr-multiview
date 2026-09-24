@@ -24,6 +24,13 @@ class AudioPolicyTests(unittest.TestCase):
     def test_limits_chunk_at_video_boundary(self):
         self.assertEqual(samples_before_pts(5.0, 960, 5.01, 48000), 480)
 
+    def test_audio_pts_offset_allows_a_persistently_ahead_chunk(self):
+        video_pts = 5.0
+        audio_pts = 5.6
+        offset = audio_pts - video_pts
+        self.assertEqual(samples_before_pts(audio_pts, 960, video_pts + offset, 48000), 0)
+        self.assertEqual(samples_before_pts(audio_pts, 960, video_pts + offset + 0.01, 48000), 480)
+
     @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
     def test_take_limits_partial_chunk_without_overfilling_output(self):
         track = Channel.__new__(Channel)
@@ -39,6 +46,19 @@ class AudioPolicyTests(unittest.TestCase):
         self.assertEqual(track.aframes[0][0], 5.0 + 85 / AUDIO_RATE)
         self.assertEqual(track.aframes[0][1].shape, (15, 2))
         self.assertEqual(track.abuffered, 15)
+
+    @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
+    def test_take_resumes_from_a_rebased_audio_pts_limit(self):
+        track = Channel.__new__(Channel)
+        track.alock = threading.Lock()
+        track.aframes = [(5.6, np.ones((100, 2), np.int16))]
+        track.abuffered = 100
+        track.last_taken_pts = None
+
+        pcm = track.take(100, 5.6 + 100 / AUDIO_RATE)
+
+        self.assertTrue(np.all(pcm == 1))
+        self.assertEqual(track.abuffered, 0)
 
     @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
     def test_align_trims_the_stale_front_of_a_chunk(self):
