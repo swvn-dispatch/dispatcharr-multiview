@@ -41,8 +41,8 @@ npm run dev
 
 Each `/stream/{n}` request spawns a dedicated Python worker process with no gevent overhead, giving the compositor real OS threads and full CPU parallelism:
 
-- Each source channel is decoded in its own thread using PyAV (bundled). Frames are scaled and composited onto a numpy YUV420p canvas at the configured frame rate.
-- The canvas is piped to a libx264 subprocess for CBR encoding to MPEG-TS, which the plugin's gevent server streams to the player.
+- Each source channel is decoded in its own thread using PyAV (bundled). Frames are scaled and selected against a source-PTS clock at the configured output frame rate.
+- Software profiles composite tile frames onto a numpy YUV420p canvas. Hardware profiles automatically use matching FFmpeg CUDA, QSV, or VAAPI composition filters when available, then encode CBR MPEG-TS for the plugin's gevent server to stream.
 - Source channels are fetched through Dispatcharr's internal live proxy so they appear in stream stats and respect stream profiles.
 - A per-channel PTS rate limiter ensures playback stays at realtime regardless of how fast the host machine or source proxy delivers packets. Audio is aligned to the video PTS clock at startup and the audio buffer is flushed on reconnect to keep lip-sync stable.
 
@@ -87,9 +87,11 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create or update the M3U account, and rebuild EPG data. The Auto-Refresh Interval controls how often this happens automatically.
 
-## Hardware encoding (coming soon)
+## Hardware acceleration
 
-NVIDIA NVENC, Intel QSV, and AMD/Intel VAAPI encode support are in progress. Only software encoding (libx264) is available today. The encoder preset setting already applies; hardware paths will add a video encoder dropdown when ready.
+Selecting NVIDIA NVENC, Intel QSV, or Intel/AMD VAAPI automatically attempts GPU tile composition as well as GPU encoding. There is no extra setting. The worker validates the selected device and FFmpeg's required hardware filters at startup. If either is unavailable, it logs the reason and keeps the stream running with the CPU compositor.
+
+PyAV source decode, source reconnect handling, PTS scheduling, and audio processing remain on the CPU. A custom layout background image also uses the CPU compositor for now, so its letterbox padding remains correct. Check the worker log for `compositor=cuda`, `compositor=qsv`, `compositor=vaapi`, or a CPU fallback reason.
 
 ## Notes
 
