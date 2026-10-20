@@ -180,9 +180,6 @@ class Channel:
         # clk_pts reset. Protected by self.alock (same as aframes/abuffered).
         self.last_taken_pts: "float | None" = None
         self.audio_resyncs = 0
-        self.audio_gate_since: "float | None" = None
-        self.audio_pts_offset = 0.0
-        self.audio_gate_recoveries = 0
         self._reconnect_requested = False
 
     def _open_container(self):
@@ -260,8 +257,6 @@ class Channel:
                 self.aframes.clear()
                 self.abuffered = 0
                 self.last_taken_pts = None
-                self.audio_gate_since = None
-                self.audio_pts_offset = 0.0
             self.clk_pts = None
             self.clk_wall = None
             self.frame_reduction.reset()
@@ -414,9 +409,7 @@ class Channel:
         """Return a consistent snapshot for compositor A/V diagnostics."""
         with self.alock:
             first_pts = self.aframes[0][0] if self.aframes else None
-            return (self.last_taken_pts, self.abuffered, self.audio_resyncs,
-                    first_pts, self.audio_gate_since, self.audio_pts_offset,
-                    self.audio_gate_recoveries)
+            return self.last_taken_pts, self.abuffered, self.audio_resyncs, first_pts
 
     def take(self, nsamples: int, pts_limit=None) -> np.ndarray:
         """Return PCM through *pts_limit*, silence-padding future samples."""

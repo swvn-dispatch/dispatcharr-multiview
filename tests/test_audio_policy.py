@@ -24,12 +24,14 @@ class AudioPolicyTests(unittest.TestCase):
     def test_limits_chunk_at_video_boundary(self):
         self.assertEqual(samples_before_pts(5.0, 960, 5.01, 48000), 480)
 
-    def test_audio_pts_offset_allows_a_persistently_ahead_chunk(self):
+    def test_holds_ahead_audio_until_video_reaches_its_pts(self):
         video_pts = 5.0
-        audio_pts = 5.6
-        offset = audio_pts - video_pts
-        self.assertEqual(samples_before_pts(audio_pts, 960, video_pts + offset, 48000), 0)
-        self.assertEqual(samples_before_pts(audio_pts, 960, video_pts + offset + 0.01, 48000), 480)
+        for lead in (0.25, 0.5):
+            with self.subTest(lead=lead):
+                audio_pts = video_pts + lead
+                self.assertEqual(samples_before_pts(audio_pts, 960, video_pts, 48000), 0)
+                self.assertEqual(samples_before_pts(audio_pts, 960, audio_pts, 48000), 0)
+                self.assertEqual(samples_before_pts(audio_pts, 960, audio_pts + 0.01, 48000), 480)
 
     @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
     def test_take_limits_partial_chunk_without_overfilling_output(self):
