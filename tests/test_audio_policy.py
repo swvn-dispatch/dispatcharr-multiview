@@ -97,6 +97,14 @@ class AudioPolicyTests(unittest.TestCase):
 
         self.assertEqual(track.audio_pts_now(10.125), 100.125)
 
+    @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
+    def test_audio_pts_now_accepts_the_video_presentation_time(self):
+        track = Channel.__new__(Channel)
+        track.clk_pts = 100.0
+        track.clk_wall = 10.0
+
+        self.assertEqual(track.audio_pts_now(10.125), 100.125)
+
 
 if __name__ == "__main__":
     unittest.main()
