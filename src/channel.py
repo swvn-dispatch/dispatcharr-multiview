@@ -381,11 +381,13 @@ class Channel:
             _, drop = self.aframes.pop(0)
             self.abuffered -= drop.shape[0]
 
-    def audio_pts_now(self) -> "float | None":
-        """Current source PTS (seconds) implied by the video clock anchor."""
+    def audio_pts_now(self, wall_time=None) -> "float | None":
+        """Source PTS implied by the video clock anchor at ``wall_time``."""
         if self.clk_pts is None or self.clk_wall is None:
             return None
-        return self.clk_pts + (time.monotonic() - self.clk_wall)
+        if wall_time is None:
+            wall_time = time.monotonic()
+        return self.clk_pts + (wall_time - self.clk_wall)
 
     def _align_to_pts(self, pts_limit: float):
         """Discard audio samples before pts_limit."""

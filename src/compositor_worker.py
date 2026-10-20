@@ -32,6 +32,7 @@ from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_comp
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                           # FIFO forward to re-sync (see audio_feeder())
 AUDIO_TICK_SECS = 0.005
+AUDIO_PRESENTATION_SAFETY_SECS = 0.02
 
 
 # ---------------------------------------------------------------- compositing helpers
@@ -70,7 +71,7 @@ def stdin_listener(channels, stop):
                 c.reconnect()
 
 
-def audio_feeder(track, fd, stop):
+def audio_feeder(track, fd, stop, presentation_clock):
     CHUNK = int(AUDIO_RATE * AUDIO_TICK_SECS)  # 240 samples = 5ms per tick
     SILENCE = np.zeros((CHUNK, 2), dtype=np.int16)
 
@@ -80,7 +81,11 @@ def audio_feeder(track, fd, stop):
     was_valid = False
 
     while not stop.is_set():
-        pts_now = track.audio_pts_now()
+        # Video is selected against the compositor's scheduled frame time,
+        # which can lag the wall clock under load. Gate audio against the end
+        # of that same presented frame instead of against time.monotonic().
+        presentation_time = presentation_clock[0] - AUDIO_PRESENTATION_SAFETY_SECS
+        pts_now = track.audio_pts_now(presentation_time)
 
         if pts_now is None:
             if was_valid:
@@ -220,8 +225,10 @@ def main():
         stop.set()
     threading.Thread(target=pump_out, name="pump-out", daemon=True).start()
 
+    start = time.monotonic()
+    presentation_clock = [start]
     for a, fd in zip(audio_chs, audio_w):
-        threading.Thread(target=audio_feeder, args=(a, fd, stop), daemon=True).start()
+        threading.Thread(target=audio_feeder, args=(a, fd, stop, presentation_clock), daemon=True).start()
 
     if gpu_composition:
         # One reusable fixed-size yuv420p buffer per ffmpeg tile input. PyAV
@@ -258,7 +265,6 @@ def main():
         bg_buf = cbuf.copy()
         bg_Y, bg_U, bg_V = _yuv_planes(bg_buf, out_w, out_h)
 
-    start = time.monotonic()
     n = 0
     log_at = start + 30.0
     prev_t = start
@@ -270,6 +276,10 @@ def main():
     try:
         while not stop.is_set():
             frame_time = start + n / fps_f
+            # The frame selected at frame_time remains on screen through the
+            # next scheduled tick. Audio may fill that interval, but never
+            # pass it, and keeps a small safety margin for pipe/encoder delay.
+            presentation_clock[0] = frame_time + 1 / fps_f
             for i, t in enumerate(channels):
                 Yt, Ut, Vt, ox, oy, tw, th = t.current_at(frame_time)
                 x, y, w, h = t.x, t.y, t.w, t.h
@@ -305,7 +315,8 @@ def main():
                 audio = []
                 for i, c in enumerate(audio_chs):
                     last_pts, buffered, resyncs, first_pts = c.audio_status()
-                    video_pts = c.audio_pts_now()
+                    video_pts = c.audio_pts_now(
+                        presentation_clock[0] - AUDIO_PRESENTATION_SAFETY_SECS)
                     pts_limit = video_pts
                     delta = pts_limit - last_pts if pts_limit is not None and last_pts is not None else None
                     delta_text = f"{delta:+.3f}s" if delta is not None else "n/a"
