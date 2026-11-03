@@ -404,6 +404,7 @@ class MultiviewServer:
             "preset": preset,
             "video_encoder": encoder,
             "render_device": settings.get("render_device") or "auto",
+            "audio_track_labels": settings.get("audio_track_labels", "enabled"),
             "background": background,
             "tiles": tile_cfg,
         }

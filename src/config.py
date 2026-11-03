@@ -92,6 +92,21 @@ _GLOBAL_SETTINGS_FIELDS = [
             "disconnects players while Dispatcharr reconnects. Manual disables checks."
         ),
     },
+    {
+        "id": "audio_track_labels",
+        "label": "Audio Track Labels",
+        "type": "select",
+        "default": "enabled",
+        "options": [
+            {"value": "enabled", "label": "Generated from channel names"},
+            {"value": "disabled", "label": "No generated labels"},
+        ],
+        "description": (
+            "Generates title and language metadata for multiview audio tracks. "
+            "Disabling this omits generated labels; source metadata cannot be "
+            "preserved because audio is decoded to raw PCM before output."
+        ),
+    },
 ]
 
 _VIDEO_OUTPUT_FIELDS = [

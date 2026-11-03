@@ -28,6 +28,7 @@ import av  # noqa: E402  (vendored, already on sys.path via the channel import a
 import numpy as np  # noqa: E402
 
 from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_compositor_failure, validate_encoder  # noqa: E402
+from audio_metadata import generated_audio_metadata_args  # noqa: E402
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                           # FIFO forward to re-sync (see audio_feeder())
@@ -198,9 +199,9 @@ def main():
     video_inputs = ([(fd, c.w, c.h) for fd, c in zip(video_read, channels)]
                     if gpu_composition else None)
     cmd = build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs, compositor)
-    for i, a in enumerate(audio_chs):
-        cmd[-1:-1] = [f"-metadata:s:a:{i}", f"title={a.name}",
-                      f"-metadata:s:a:{i}", f"language={a.lang}"]
+    cmd[-1:-1] = generated_audio_metadata_args(
+        audio_chs, cfg.get("audio_track_labels", "enabled") == "enabled",
+    )
     enc = subprocess.Popen(cmd, stdin=None if gpu_composition else video_read[0], stdout=enc_out_w,
                            stderr=sys.stderr, pass_fds=[*video_read, *audio_read])
     for fd in video_read:

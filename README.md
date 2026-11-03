@@ -86,6 +86,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 - **Single channel:** one AC3 audio track from the selected tile.
 - **All channels:** one AC3 track per tile. Players that support multi-track audio (VLC, Infuse, mpv) can switch between them via the Audio Track menu. Duplicate track labels (e.g. three TSN channels) are auto-numbered: `ts1`, `ts2`, `ts3`.
+- **Audio Track Labels:** enabled by default. Generated title and language labels identify multiview audio tracks in compatible players. Disabling them omits generated labels; source metadata cannot be preserved because audio is decoded to raw PCM before it is re-encoded for output.
 
 After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create or update the M3U account, and rebuild EPG data. The Auto-Refresh Interval controls how often this happens automatically.
 
