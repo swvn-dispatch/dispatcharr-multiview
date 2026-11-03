@@ -22,6 +22,7 @@ A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your 
 
 - **Settings** auto-save as you change them.
 - **Active Multiviews** button (top bar) shows running streams; per-layout reload and per-channel reconnect are available.
+- The plugin settings pane includes **Reload All Active Multiviews** for reloading every running compositor without opening the dashboard.
 - **Refresh** regenerates the M3U and EPG and triggers a Dispatcharr sync.
 - Click the logo (top-left) for links to this repo and Ko-fi support.
 
@@ -57,6 +58,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 | Output Bitrate (kbps) | CBR target. 8000 is a good baseline for 1080p; 12000-16000 for noticeably sharper tiles. |
 | Encoder Preset | ultrafast (lowest CPU) through slow (highest quality). Ultrafast recommended for live use. |
 | Auto-Refresh Interval | Hours between automatic M3U and EPG regeneration. 0 = manual only. |
+| Live Multiview Reload | Manual by default. Poll active multiviews every 15s, 30s, 60s, 2m, or 5m and reload only those whose regex matches or stream-affecting settings changed. Reloads briefly interrupt players while Dispatcharr reconnects. |
 
 **Per-layout settings:**
 

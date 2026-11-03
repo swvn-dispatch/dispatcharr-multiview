@@ -73,6 +73,25 @@ _GLOBAL_SETTINGS_FIELDS = [
         "placeholder": "24",
         "description": "How often to automatically regenerate M3U and EPG. 0 = manual only (Regenerate M3U button).",
     },
+    {
+        "id": "live_reload_interval",
+        "label": "Live Multiview Reload",
+        "type": "select",
+        "default": "manual",
+        "options": [
+            {"value": "manual", "label": "Manual"},
+            {"value": "15", "label": "Every 15 seconds"},
+            {"value": "30", "label": "Every 30 seconds"},
+            {"value": "60", "label": "Every 60 seconds"},
+            {"value": "120", "label": "Every 2 minutes"},
+            {"value": "300", "label": "Every 5 minutes"},
+        ],
+        "description": (
+            "Checks each active multiview for changed regex matches or stream-affecting "
+            "layout settings, then reloads only affected streams. Reloading briefly "
+            "disconnects players while Dispatcharr reconnects. Manual disables checks."
+        ),
+    },
 ]
 
 _VIDEO_OUTPUT_FIELDS = [

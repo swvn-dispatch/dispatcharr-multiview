@@ -53,6 +53,7 @@ _BACKGROUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sty
 
 _server_instance = None
 _dash_api = None
+_LIVE_RELOAD_INTERVALS = {"15": 15, "30": 30, "60": 60, "120": 120, "300": 300}
 
 
 def _load_dash_api():
@@ -120,6 +121,20 @@ def _settings() -> dict:
         cfg.settings = settings
         cfg.save()
     return settings
+
+
+def _close_db_connections():
+    """Release ORM connections opened by this standalone WSGI server."""
+    try:
+        from django.db import close_old_connections
+        close_old_connections()
+    except Exception:
+        pass
+
+
+def _live_reload_interval_secs(settings: dict) -> int | None:
+    """Return the configured active-stream reload interval, or None for manual."""
+    return _LIVE_RELOAD_INTERVALS.get(str(settings.get("live_reload_interval", "manual")))
 
 
 def _normalized_dash_path() -> str:
@@ -215,11 +230,7 @@ class MultiviewServer:
             # lookups, plugin config) outside of Django's own request cycle,
             # which never runs Django's usual request_finished cleanup. Do it
             # ourselves so connections don't accumulate and eventually go stale.
-            try:
-                from django.db import close_old_connections
-                close_old_connections()
-            except Exception:
-                pass
+            _close_db_connections()
 
     def _route(self, path, loopback, environ, start_response):
         # Checked first, unconditionally, so a dash_path that happens to
@@ -329,6 +340,9 @@ class MultiviewServer:
         proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE)
         stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{layout_id}")
         self._active_procs[proc] = {"n": layout_id, "cfg": cfg}
+        self._active_procs[proc]["reload_monitor"] = gevent.spawn(
+            self._monitor_live_reload, proc, layout_id,
+        )
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -405,6 +419,59 @@ class MultiviewServer:
         order_rank = {layout_id: i for i, layout_id in enumerate(order)}
         return sorted(seen.values(), key=lambda s: order_rank.get(s["n"], len(order)))
 
+    def _monitor_live_reload(self, proc, layout_id: str):
+        """Watch one active worker until it exits or its desired config changes."""
+        import gevent
+
+        while proc in self._active_procs:
+            interval = _live_reload_interval_secs(_settings())
+            if interval is None:
+                return
+            gevent.sleep(interval)
+            if proc not in self._active_procs:
+                return
+            if self._check_live_reload(proc, layout_id):
+                return
+
+    def _check_live_reload(self, proc, layout_id: str) -> bool:
+        """Reload *proc* when its currently-resolved worker config changed.
+
+        Returns True when the monitor should stop. The exact process is killed
+        instead of looking up the layout again, so an old monitor can never
+        terminate a replacement worker for the same layout id.
+        """
+        try:
+            info = self._active_procs.get(proc)
+            if info is None or info.get("n") != layout_id:
+                return True
+
+            settings = _settings()
+            if layout_id not in settings.get("multiview_order", []):
+                logger.info("Live reload stopping removed layout %s", layout_id)
+                proc.kill()
+                return True
+
+            try:
+                tiles, layout, audio_source = self._resolve_layout(layout_id)
+                desired_cfg = self._worker_config(tiles, layout, audio_source, settings)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Live reload skipped layout %s because its new configuration is invalid: %s",
+                    layout_id, e,
+                )
+                return False
+
+            if desired_cfg != info["cfg"]:
+                logger.info("Live reload restarting changed layout %s", layout_id)
+                proc.kill()
+                return True
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Live reload check failed for layout %s: %s", layout_id, e)
+            return False
+        finally:
+            _close_db_connections()
+
     def kill_active_streams(self) -> int:
         procs = list(self._active_procs)
         for proc in procs:
@@ -446,7 +513,13 @@ class MultiviewServer:
         except GeneratorExit:
             pass
         finally:
-            self._active_procs.pop(proc, None)
+            info = self._active_procs.pop(proc, None)
+            reload_monitor = info.get("reload_monitor") if info else None
+            if reload_monitor is not None:
+                try:
+                    reload_monitor.kill(block=False)
+                except Exception:
+                    pass
             try:
                 proc.stdin.close()
             except Exception:

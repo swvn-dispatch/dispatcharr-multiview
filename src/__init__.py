@@ -103,6 +103,18 @@ class Plugin:
             "button_color": "green",
         },
         {
+            "id": "reload_active_multiviews",
+            "label": "Reload All Active Multiviews",
+            "description": (
+                "Stop every active multiview compositor so Dispatcharr reconnects each "
+                "stream with its current configuration. Players may briefly buffer or "
+                "need to reconnect."
+            ),
+            "button_label": "Reload All Active Multiviews",
+            "button_variant": "filled",
+            "button_color": "orange",
+        },
+        {
             "id": "install_pyav_amd64",
             "label": "Install / Update PyAV (amd64 / x86_64)",
             "description": (
@@ -201,6 +213,12 @@ class Plugin:
     def run(self, action: str, params: dict, context: dict):
         if action == "generate_m3u":
             return self._generate_m3u()
+        if action == "reload_active_multiviews":
+            server = _server().get_server()
+            if server is None or not server.is_running():
+                return {"status": "success", "message": "No running multiview server found (0 streams reloaded)"}
+            count = server.kill_active_streams()
+            return {"status": "success", "message": f"Reloading {count} active multiview(s)"}
         if action == "install_pyav_amd64":
             return self._deps().install_pyav("linux-x86_64")
         if action == "install_pyav_arm64":
