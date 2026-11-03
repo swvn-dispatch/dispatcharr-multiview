@@ -82,11 +82,12 @@ _VIDEO_OUTPUT_FIELDS = [
         "type": "select",
         "default": "1920x1080",
         "options": [
+            {"value": "3840x2160", "label": "4K (3840×2160)"},
             {"value": "1920x1080", "label": "1080p (1920×1080)"},
             {"value": "1280x720",  "label": "720p (1280×720)"},
             {"value": "854x480",   "label": "480p (854×480)"},
         ],
-        "description": "Resolution of the tiled output. Lower resolutions reduce CPU and bandwidth.",
+        "description": "Resolution of the tiled output. 4K requires substantially more CPU/GPU power and bandwidth; lower resolutions reduce both.",
     },
     {
         "id": "output_fps",
@@ -110,7 +111,7 @@ _VIDEO_OUTPUT_FIELDS = [
         "min": 1000,
         "max": 40000,
         "placeholder": "8000",
-        "description": "Target output video bitrate in kbps (CBR). Higher values improve quality at the cost of bandwidth. 8000 is a good baseline for 1080p multiview; 12000-16000 for noticeably sharper tiles.",
+        "description": "Target output video bitrate in kbps (CBR). Higher values improve quality at the cost of bandwidth. 8000 is a good baseline for 1080p multiview; 12000-16000 for noticeably sharper tiles. 4K needs substantially more bitrate.",
     },
 ]
 

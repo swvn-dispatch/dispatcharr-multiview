@@ -52,7 +52,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 | Setting | Description |
 |---|---|
-| Output Resolution | 480p / 720p / 1080p |
+| Output Resolution | 480p / 720p / 1080p / 4K (3840×2160) |
 | Output Frame Rate | 24 / 25 / 30 / 50 / 60 fps |
 | Output Bitrate (kbps) | CBR target. 8000 is a good baseline for 1080p; 12000-16000 for noticeably sharper tiles. |
 | Encoder Preset | ultrafast (lowest CPU) through slow (highest quality). Ultrafast recommended for live use. |
@@ -92,6 +92,8 @@ After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create
 Selecting NVIDIA NVENC, Intel QSV, or Intel/AMD VAAPI automatically attempts GPU tile composition as well as GPU encoding. There is no extra setting. The worker validates the selected device and FFmpeg's required hardware filters at startup. If either is unavailable, it logs the reason and keeps the stream running with the CPU compositor.
 
 PyAV source decode, source reconnect handling, PTS scheduling, and audio processing remain on the CPU. A custom layout background image also uses the CPU compositor for now, so its letterbox padding remains correct. Check the worker log for `compositor=cuda`, `compositor=qsv`, `compositor=vaapi`, or a CPU fallback reason.
+
+4K output has four times the pixel workload of 1080p. In a four-tile grid, each tile receives a 1920×1080 region. Use capable hardware, hardware encoding/composition where available, and enough output bitrate for the source material.
 
 ## Notes
 
