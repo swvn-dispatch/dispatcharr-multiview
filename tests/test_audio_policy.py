@@ -68,12 +68,19 @@ class AudioPolicyTests(unittest.TestCase):
         track.alock = threading.Lock()
         track.aframes = [(5.0, np.ones((100, 2), np.int16))]
         track.abuffered = 100
+        track.last_taken_pts = 4.7
 
         track._align_to_pts(5.0 + 85 / AUDIO_RATE)
 
         self.assertEqual(track.aframes[0][0], 5.0 + 85 / AUDIO_RATE)
         self.assertEqual(track.aframes[0][1].shape, (15, 2))
         self.assertEqual(track.abuffered, 15)
+        self.assertIsNone(track.last_taken_pts)
+
+        pcm = track.take(15, 5.0 + 100 / AUDIO_RATE)
+
+        self.assertTrue(np.all(pcm == 1))
+        self.assertEqual(track.last_taken_pts, 5.0 + 100 / AUDIO_RATE)
 
     @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
     def test_audio_pts_now_accepts_the_video_presentation_time(self):

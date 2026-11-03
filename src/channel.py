@@ -392,6 +392,9 @@ class Channel:
     def _align_to_pts(self, pts_limit: float):
         """Discard audio samples before pts_limit."""
         with self.alock:
+            # The prior emitted PTS no longer represents the FIFO after this
+            # discard. Let the next take() establish a fresh drift baseline.
+            self.last_taken_pts = None
             while self.aframes:
                 pts_s, chunk = self.aframes[0]
                 if pts_s is None:
