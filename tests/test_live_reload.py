@@ -18,6 +18,29 @@ class LiveReloadFieldTests(unittest.TestCase):
             ["manual", "15", "30", "60", "120", "300"],
         )
 
+    def test_child_buffer_defaults_to_five_seconds(self):
+        fields = config.build_plugin_fields({})
+        field = next(field for field in fields if field["id"] == "child_buffer_seconds")
+
+        self.assertEqual(field["default"], 5)
+        self.assertEqual(server.child_buffer_seconds({}), 5)
+        self.assertEqual(server.child_buffer_seconds({"child_buffer_seconds": "0"}), 0)
+        self.assertEqual(server.child_buffer_seconds({"child_buffer_seconds": 99}), 30)
+
+    def test_worker_config_passes_child_buffer_to_each_tile(self):
+        cfg = server.MultiviewServer("127.0.0.1", 9292)._worker_config(
+            [{"id": 1, "name": "One", "logo": None}, {"id": 2, "name": "Two", "logo": None}],
+            "auto", "0", {"child_buffer_seconds": 5},
+        )
+
+        self.assertEqual(
+            [tile["url"] for tile in cfg["tiles"]],
+            [
+                "http://127.0.0.1:9292/internal/realsrc/1?buffer_seconds=5",
+                "http://127.0.0.1:9292/internal/realsrc/2?buffer_seconds=5",
+            ],
+        )
+
 
 class ActiveWorkerReloadTests(unittest.TestCase):
     def setUp(self):

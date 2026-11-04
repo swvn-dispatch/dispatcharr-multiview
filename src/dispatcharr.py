@@ -42,7 +42,7 @@ def resolve_channel_uuid(value) -> "str | None":
         return None
 
 
-def live_stream(channel_id):
+def live_stream(channel_id, child_buffer_seconds=None):
     """Yield MPEG-TS chunks for a real Dispatcharr channel.
 
     Generator. Initializes the channel if needed, registers a client, and
@@ -59,6 +59,26 @@ def live_stream(channel_id):
     from apps.proxy.live_proxy.services.channel_service import ChannelService
     from apps.proxy.live_proxy.url_utils import get_stream_info_for_switch
     from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
+
+    class MultiviewStreamGenerator(StreamGenerator):
+        """Use a multiview-specific delay instead of the global client delay."""
+        def _setup_streaming(self):
+            if not super()._setup_streaming():
+                return False
+            if child_buffer_seconds is None:
+                return True
+            try:
+                seconds = max(0, min(30, int(child_buffer_seconds)))
+                index = (self.buffer.find_chunk_index_by_time(seconds)
+                         if seconds else self.buffer.index)
+                self.local_index = max(0, index if index is not None else self.buffer.index)
+                logger.info(
+                    f"multiview: channel {self.channel_id} starts {seconds}s behind live "
+                    f"at buffer index {self.local_index}"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"multiview: cannot apply child buffer for {self.channel_id}: {e}")
+            return True
 
     proxy = ProxyServer.get_instance()
     client_manager = proxy.client_managers.get(channel_id)
@@ -104,7 +124,7 @@ def live_stream(channel_id):
         return
 
     logger.info(f"multiview: streaming channel {channel_id} as client {client_id}")
-    gen = StreamGenerator(
+    gen = MultiviewStreamGenerator(
         channel_id, client_id, CLIENT_IP, USER_AGENT,
         channel_initializing=True, user=None, buffer=buffer,
     ).generate()
