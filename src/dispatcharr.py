@@ -42,7 +42,7 @@ def resolve_channel_uuid(value) -> "str | None":
         return None
 
 
-def live_stream(channel_id, child_buffer_seconds=None):
+def live_stream(channel_id):
     """Yield MPEG-TS chunks for a real Dispatcharr channel.
 
     Generator. Initializes the channel if needed, registers a client, and
@@ -61,23 +61,15 @@ def live_stream(channel_id, child_buffer_seconds=None):
     from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
 
     class MultiviewStreamGenerator(StreamGenerator):
-        """Use a multiview-specific delay instead of the global client delay."""
+        """Always start multiview inputs at Dispatcharr's live edge."""
         def _setup_streaming(self):
             if not super()._setup_streaming():
                 return False
-            if child_buffer_seconds is None:
-                return True
-            try:
-                seconds = max(0, min(30, int(child_buffer_seconds)))
-                index = (self.buffer.find_chunk_index_by_time(seconds)
-                         if seconds else self.buffer.index)
-                self.local_index = max(0, index if index is not None else self.buffer.index)
-                logger.info(
-                    f"multiview: channel {self.channel_id} starts {seconds}s behind live "
-                    f"at buffer index {self.local_index}"
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"multiview: cannot apply child buffer for {self.channel_id}: {e}")
+            self.local_index = max(0, self.buffer.index)
+            logger.info(
+                f"multiview: channel {self.channel_id} starts at live "
+                f"at buffer index {self.local_index}"
+            )
             return True
 
     proxy = ProxyServer.get_instance()

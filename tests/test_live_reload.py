@@ -18,29 +18,25 @@ class LiveReloadFieldTests(unittest.TestCase):
             ["manual", "15", "30", "60", "120", "300"],
         )
 
-    def test_child_streams_default_to_live_edge_with_independent_tile_hold(self):
+    def test_tiles_hold_last_good_frame_for_fifteen_seconds(self):
         fields = config.build_plugin_fields({})
-        buffer = next(field for field in fields if field["id"] == "child_buffer_seconds")
         hold = next(field for field in fields if field["id"] == "tile_hold_seconds")
 
-        self.assertEqual(buffer["default"], 0)
         self.assertEqual(hold["default"], 15)
-        self.assertEqual(server.child_buffer_seconds({}), 0)
         self.assertEqual(server.tile_hold_seconds({}), 15)
-        self.assertEqual(server.child_buffer_seconds({"child_buffer_seconds": 99}), 30)
         self.assertEqual(server.tile_hold_seconds({"tile_hold_seconds": 99}), 60)
 
-    def test_worker_config_passes_child_buffer_to_each_tile(self):
+    def test_worker_config_uses_live_edge_child_urls(self):
         cfg = server.MultiviewServer("127.0.0.1", 9292)._worker_config(
             [{"id": 1, "name": "One", "logo": None}, {"id": 2, "name": "Two", "logo": None}],
-            "auto", "0", {"child_buffer_seconds": 0, "tile_hold_seconds": 15},
+            "auto", "0", {"tile_hold_seconds": 15},
         )
 
         self.assertEqual(
             [tile["url"] for tile in cfg["tiles"]],
             [
-                "http://127.0.0.1:9292/internal/realsrc/1?buffer_seconds=0",
-                "http://127.0.0.1:9292/internal/realsrc/2?buffer_seconds=0",
+                "http://127.0.0.1:9292/internal/realsrc/1",
+                "http://127.0.0.1:9292/internal/realsrc/2",
             ],
         )
         self.assertEqual([tile["tile_hold_secs"] for tile in cfg["tiles"]], [15, 15])
