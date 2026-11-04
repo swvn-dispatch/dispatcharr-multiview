@@ -51,6 +51,7 @@ except ImportError:
 
 TILE_STALE_SECS = 1.5
 VIDEO_PTS_STALL_SECS = 10.0
+PTS_DISCONTINUITY_SECS = 2.0
 RECONNECT_BASE    = 2.0   # first retry delay (seconds)
 RECONNECT_MAX     = 60.0  # cap on per-retry delay
 RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
@@ -126,6 +127,11 @@ def decode_audio_packet(packet, channel_name):
         # video or subsequent audio.
         log(f"channel {channel_name}: dropping bad audio packet: {e}")
         return ()
+
+
+def is_pts_discontinuity(gap):
+    """Whether a source PTS jump invalidates the current presentation clock."""
+    return abs(gap) >= PTS_DISCONTINUITY_SECS
 
 
 def _yuv_planes(buf, w, h):

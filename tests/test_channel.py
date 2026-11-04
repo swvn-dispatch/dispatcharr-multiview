@@ -62,3 +62,8 @@ class AudioResamplerRecoveryTests(unittest.TestCase):
             channel.decode_audio_packet(_Packet(ValueError("corrupt")), "Test"),
             (),
         )
+
+    def test_large_pts_jump_is_a_discontinuity_in_either_direction(self):
+        self.assertTrue(channel.is_pts_discontinuity(3.0))
+        self.assertTrue(channel.is_pts_discontinuity(-3.0))
+        self.assertFalse(channel.is_pts_discontinuity(1.0))
