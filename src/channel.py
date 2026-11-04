@@ -82,6 +82,41 @@ def black_planes(w, h):
             np.full((h // 2, w // 2), 128, np.uint8))
 
 
+def resample_audio_frame(resampler, frame, channel_name):
+    """Resample one frame, recreating state when an upstream format changes.
+
+    A live-proxy stream can switch providers with a different audio layout or
+    sample rate. PyAV resamplers are tied to their first input format, so that
+    transition must not tear down the tile's video connection.
+    """
+    try:
+        return resampler.resample(frame), resampler
+    except Exception as e:  # noqa: BLE001
+        log(f"channel {channel_name}: audio format changed; resetting resampler: {e}")
+        try:
+            resampler.close()
+        except Exception:
+            pass
+        replacement = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
+        try:
+            return replacement.resample(frame), replacement
+        except Exception as retry_error:  # noqa: BLE001
+            log(f"channel {channel_name}: dropping incompatible audio frame: {retry_error}")
+            return (), replacement
+
+
+def decode_audio_packet(packet, channel_name):
+    """Decode an audio packet without letting a transition end the tile."""
+    try:
+        return packet.decode()
+    except Exception as e:  # noqa: BLE001
+        # Provider switches can leave one corrupt or format-transition audio
+        # packet in flight. Skip it without interrupting the selected tile's
+        # video or subsequent audio.
+        log(f"channel {channel_name}: dropping bad audio packet: {e}")
+        return ()
+
+
 def _yuv_planes(buf, w, h):
     """(Y, U, V) plane views into a flat yuv420p buffer (Y|U|V byte order)."""
     ysize = w * h
@@ -153,6 +188,7 @@ class Channel:
         self.hwaccel_device = spec.get("hwaccel_device")
         self.valign = spec.get("valign", "center")
         self.halign = spec.get("halign", "center")
+        self.tile_stale_secs = max(TILE_STALE_SECS, float(spec.get("tile_hold_secs", TILE_STALE_SECS)))
         self.fallback = (*black_planes(self.w, self.h), 0, 0, self.w, self.h)
         self.latest = self.fallback
         self.fresh_until = 0.0
@@ -346,15 +382,16 @@ class Channel:
                                 tile = fit_into_tile(frame, self.w, self.h, self.valign, self.halign)
                                 with self.vlock:
                                     self.latest = tile
-                                    self.fresh_until = time.monotonic() + TILE_STALE_SECS
+                                    self.fresh_until = time.monotonic() + self.tile_stale_secs
                                     if frame.pts is not None:
                                         self.vframes.append((pts_s, tile))
                                 self.scaled_vcount += 1
                         elif res is not None and packet.stream.type == "audio":
-                            for frame in packet.decode():
+                            for frame in decode_audio_packet(packet, self.name):
                                 pts_s = (float(frame.pts * aus.time_base)
                                          if frame.pts is not None else None)
-                                for rf in res.resample(frame):
+                                resampled, res = resample_audio_frame(res, frame, self.name)
+                                for rf in resampled:
                                     a = rf.to_ndarray()
                                     a = a.reshape(-1, 2) if a.shape[0] == 1 else a.T
                                     with self.alock:

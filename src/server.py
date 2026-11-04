@@ -422,6 +422,7 @@ class MultiviewServer:
                 "lang": langs.get(i, "und"),
                 "featured": featured_layout and i == 0,
                 "output_fps": output_fps,
+                "tile_hold_secs": buffer_seconds,
                 "hwaccel": {"h264_nvenc": "cuda", "h264_vaapi": "vaapi", "h264_qsv": "qsv"}.get(encoder),
                 "hwaccel_device": (settings.get("render_device") if settings.get("render_device") not in (None, "", "auto") and encoder in ("h264_vaapi", "h264_qsv") else None),
                 "valign": valign, "halign": halign,

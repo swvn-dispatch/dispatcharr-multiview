@@ -40,6 +40,7 @@ class LiveReloadFieldTests(unittest.TestCase):
                 "http://127.0.0.1:9292/internal/realsrc/2?buffer_seconds=5",
             ],
         )
+        self.assertEqual([tile["tile_hold_secs"] for tile in cfg["tiles"]], [5, 5])
 
 
 class ActiveWorkerReloadTests(unittest.TestCase):
