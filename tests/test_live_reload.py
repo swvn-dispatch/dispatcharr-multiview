@@ -1,6 +1,7 @@
 """Regression coverage for automatic active-multiview reloads."""
 
 import unittest
+from io import BytesIO
 from unittest.mock import Mock, patch
 
 from src import Plugin, config, server
@@ -97,6 +98,30 @@ class ActiveWorkerReloadTests(unittest.TestCase):
 
         self.assertTrue(stopped)
         replacement.kill.assert_not_called()
+
+
+class StreamLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.server = server.MultiviewServer("127.0.0.1", 9292)
+        self.proc = Mock()
+        self.proc.stdout = BytesIO(b"transport-stream")
+        self.proc.poll.return_value = None
+        self.server._active_procs[self.proc] = {"n": "layout", "cfg": {}}
+
+    def test_worker_eof_is_logged(self):
+        with self.assertLogs(server.logger, "INFO") as logs:
+            self.assertEqual(list(self.server._pump_stdout(self.proc, "worker layout")), [b"transport-stream"])
+
+        self.assertIn("worker output ended", logs.output[0])
+
+    def test_downstream_disconnect_is_logged(self):
+        stream = self.server._pump_stdout(self.proc, "worker layout")
+        self.assertEqual(next(stream), b"transport-stream")
+
+        with self.assertLogs(server.logger, "INFO") as logs:
+            stream.close()
+
+        self.assertIn("downstream consumer disconnected", logs.output[0])
 
 
 class PluginReloadActionTests(unittest.TestCase):

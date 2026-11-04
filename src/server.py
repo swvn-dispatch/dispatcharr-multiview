@@ -502,6 +502,8 @@ class MultiviewServer:
 
     def kill_active_streams(self) -> int:
         procs = list(self._active_procs)
+        if procs:
+            logger.info("Multiview: stopping %d active stream worker(s) on request", len(procs))
         for proc in procs:
             try:
                 proc.kill()
@@ -511,6 +513,8 @@ class MultiviewServer:
 
     def kill_stream(self, n: str) -> int:
         to_kill = [p for p, info in list(self._active_procs.items()) if info["n"] == n]
+        if to_kill:
+            logger.info("Multiview: stopping %d active worker(s) for layout %s on request", len(to_kill), n)
         for proc in to_kill:
             try:
                 proc.kill()
@@ -532,6 +536,7 @@ class MultiviewServer:
         return False
 
     def _pump_stdout(self, proc, label: str, stderr_gl=None):
+        end_reason = "worker output ended"
         try:
             while True:
                 chunk = proc.stdout.read(CHUNK_SIZE)
@@ -539,8 +544,14 @@ class MultiviewServer:
                     break
                 yield chunk
         except GeneratorExit:
-            pass
+            end_reason = "downstream consumer disconnected"
+            raise
+        except Exception as e:  # noqa: BLE001
+            end_reason = f"output read failed: {e}"
+            raise
         finally:
+            logger.info("Multiview %s ended: %s (worker returncode=%s)",
+                        label, end_reason, proc.poll())
             info = self._active_procs.pop(proc, None)
             reload_monitor = info.get("reload_monitor") if info else None
             if reload_monitor is not None:

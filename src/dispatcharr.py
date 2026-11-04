@@ -109,17 +109,24 @@ def live_stream(channel_id):
         channel_initializing=True, user=None, buffer=buffer,
     ).generate()
 
+    end_reason = "source stream ended"
     try:
         for chunk in gen:
             if chunk:
                 yield chunk
+    except GeneratorExit:
+        end_reason = "multiview tile consumer disconnected"
+        raise
+    except Exception as e:  # noqa: BLE001
+        end_reason = f"source stream failed: {e}"
+        raise
     finally:
         try:
             gen.close()
         except Exception:
             pass
         _safe_remove(client_manager, client_id)
-        logger.info(f"multiview: channel {channel_id} client {client_id} closed")
+        logger.info(f"multiview: channel {channel_id} client {client_id} closed: {end_reason}")
 
 
 def _safe_remove(client_manager, client_id) -> None:
