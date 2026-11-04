@@ -51,7 +51,6 @@ except ImportError:
 
 TILE_STALE_SECS = 1.5
 VIDEO_PTS_STALL_SECS = 10.0
-PTS_DISCONTINUITY_SECS = 2.0
 RECONNECT_BASE    = 2.0   # first retry delay (seconds)
 RECONNECT_MAX     = 60.0  # cap on per-retry delay
 RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
@@ -92,46 +91,6 @@ def black_planes(w, h):
     return (np.zeros((h, w), np.uint8),
             np.full((h // 2, w // 2), 128, np.uint8),
             np.full((h // 2, w // 2), 128, np.uint8))
-
-
-def resample_audio_frame(resampler, frame, channel_name):
-    """Resample one frame, recreating state when an upstream format changes.
-
-    A live-proxy stream can switch providers with a different audio layout or
-    sample rate. PyAV resamplers are tied to their first input format, so that
-    transition must not tear down the tile's video connection.
-    """
-    try:
-        return resampler.resample(frame), resampler
-    except Exception as e:  # noqa: BLE001
-        log(f"channel {channel_name}: audio format changed; resetting resampler: {e}")
-        try:
-            resampler.close()
-        except Exception:
-            pass
-        replacement = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
-        try:
-            return replacement.resample(frame), replacement
-        except Exception as retry_error:  # noqa: BLE001
-            log(f"channel {channel_name}: dropping incompatible audio frame: {retry_error}")
-            return (), replacement
-
-
-def decode_audio_packet(packet, channel_name):
-    """Decode an audio packet without letting a transition end the tile."""
-    try:
-        return packet.decode()
-    except Exception as e:  # noqa: BLE001
-        # Provider switches can leave one corrupt or format-transition audio
-        # packet in flight. Skip it without interrupting the selected tile's
-        # video or subsequent audio.
-        log(f"channel {channel_name}: dropping bad audio packet: {e}")
-        return ()
-
-
-def is_pts_discontinuity(gap):
-    """Whether a source PTS jump invalidates the current presentation clock."""
-    return abs(gap) >= PTS_DISCONTINUITY_SECS
 
 
 def _yuv_planes(buf, w, h):
