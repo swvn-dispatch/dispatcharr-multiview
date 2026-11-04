@@ -2,7 +2,7 @@
 
 import unittest
 
-from src.dispatcharr import _LiveEdgeRecoveryBuffer
+from src.dispatcharr import RECOVERY_BEHIND_CHUNKS, _LiveEdgeRecoveryBuffer
 
 
 class _Buffer:
@@ -16,14 +16,22 @@ class _Buffer:
 
 
 class LiveEdgeRecoveryBufferTests(unittest.TestCase):
-    def test_expired_multiview_cursor_rebases_to_live_head(self):
+    def test_expired_multiview_cursor_rebases_behind_live_head(self):
         buffer = _Buffer(index=100)
 
         with self.assertLogs("src.dispatcharr", level="WARNING"):
             index = _LiveEdgeRecoveryBuffer(buffer, "channel").find_oldest_available_chunk(42)
 
-        self.assertEqual(index, 100)
+        self.assertEqual(index, 100 - RECOVERY_BEHIND_CHUNKS)
         self.assertEqual(buffer.oldest_calls, [])
+
+    def test_recovery_index_does_not_become_negative(self):
+        buffer = _Buffer(index=2)
+
+        with self.assertLogs("src.dispatcharr", level="WARNING"):
+            index = _LiveEdgeRecoveryBuffer(buffer, "channel").find_oldest_available_chunk(1)
+
+        self.assertEqual(index, 0)
 
     def test_nonexpired_cursor_delegates_to_dispatcharr(self):
         buffer = _Buffer(index=42)
