@@ -137,6 +137,21 @@ def _live_reload_interval_secs(settings: dict) -> int | None:
     return _LIVE_RELOAD_INTERVALS.get(str(settings.get("live_reload_interval", "manual")))
 
 
+def _live_reload_signature(cfg: dict) -> dict:
+    """Return the worker settings that require a compositor restart to apply.
+
+    Tile names, language labels, and logos are metadata for the current worker.
+    They may be supplied by storage backends with changing URLs or labels, but
+    do not change which stream is decoded or how the canvas is rendered.
+    """
+    signature = dict(cfg)
+    signature["tiles"] = [
+        {key: value for key, value in tile.items() if key not in {"logo", "name", "lang"}}
+        for tile in cfg.get("tiles", [])
+    ]
+    return signature
+
+
 def _normalized_dash_path() -> str:
     """Return the configured mount path, normalized to e.g. '/dash' (no trailing slash).
 
@@ -462,11 +477,23 @@ class MultiviewServer:
                 )
                 return False
 
-            if desired_cfg != info["cfg"]:
+            desired_signature = _live_reload_signature(desired_cfg)
+            current_signature = _live_reload_signature(info["cfg"])
+            if desired_signature == current_signature:
+                info.pop("pending_reload_signature", None)
+                return False
+
+            # A single inconsistent observation should not interrupt playback.
+            # Require the same desired configuration on two consecutive polls.
+            if info.get("pending_reload_signature") != desired_signature:
+                info["pending_reload_signature"] = desired_signature
+                logger.info("Live reload detected a change for layout %s; awaiting confirmation", layout_id)
+                return False
+
+            if desired_signature != current_signature:
                 logger.info("Live reload restarting changed layout %s", layout_id)
                 proc.kill()
                 return True
-            return False
         except Exception as e:  # noqa: BLE001
             logger.warning("Live reload check failed for layout %s: %s", layout_id, e)
             return False

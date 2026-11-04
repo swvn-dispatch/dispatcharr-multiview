@@ -22,7 +22,7 @@ class ActiveWorkerReloadTests(unittest.TestCase):
     def setUp(self):
         self.server = server.MultiviewServer("127.0.0.1", 9292)
         self.proc = Mock()
-        self.server._active_procs[self.proc] = {"n": "layout", "cfg": {"tiles": ["old"]}}
+        self.server._active_procs[self.proc] = {"n": "layout", "cfg": {"tiles": [{"url": "old"}]}}
 
     def test_manual_interval_has_no_seconds_value(self):
         self.assertIsNone(server._live_reload_interval_secs({"live_reload_interval": "manual"}))
@@ -32,7 +32,7 @@ class ActiveWorkerReloadTests(unittest.TestCase):
         with (
             patch.object(server, "_settings", return_value={"multiview_order": ["layout"]}),
             patch.object(self.server, "_resolve_layout", return_value=([], "auto", "0")),
-            patch.object(self.server, "_worker_config", return_value={"tiles": ["old"]}),
+            patch.object(self.server, "_worker_config", return_value={"tiles": [{"url": "old"}]}),
         ):
             stopped = self.server._check_live_reload(self.proc, "layout")
 
@@ -41,17 +41,35 @@ class ActiveWorkerReloadTests(unittest.TestCase):
 
     def test_changed_regex_result_reloads_only_its_worker(self):
         other_proc = Mock()
-        self.server._active_procs[other_proc] = {"n": "other", "cfg": {"tiles": ["other"]}}
+        self.server._active_procs[other_proc] = {"n": "other", "cfg": {"tiles": [{"url": "other"}]}}
         with (
             patch.object(server, "_settings", return_value={"multiview_order": ["layout", "other"]}),
             patch.object(self.server, "_resolve_layout", return_value=([], "auto", "0")),
-            patch.object(self.server, "_worker_config", return_value={"tiles": ["new-regex-match"]}),
+            patch.object(self.server, "_worker_config", return_value={"tiles": [{"url": "new-regex-match"}]}),
         ):
+            first_check = self.server._check_live_reload(self.proc, "layout")
             stopped = self.server._check_live_reload(self.proc, "layout")
 
+        self.assertFalse(first_check)
         self.assertTrue(stopped)
         self.proc.kill.assert_called_once_with()
         other_proc.kill.assert_not_called()
+
+    def test_cosmetic_tile_metadata_does_not_reload_worker(self):
+        self.server._active_procs[self.proc]["cfg"] = {
+            "tiles": [{"url": "source", "name": "Old", "logo": "old-logo", "lang": "old"}],
+        }
+        with (
+            patch.object(server, "_settings", return_value={"multiview_order": ["layout"]}),
+            patch.object(self.server, "_resolve_layout", return_value=([], "auto", "0")),
+            patch.object(self.server, "_worker_config", return_value={
+                "tiles": [{"url": "source", "name": "New", "logo": "new-logo", "lang": "new"}],
+            }),
+        ):
+            stopped = self.server._check_live_reload(self.proc, "layout")
+
+        self.assertFalse(stopped)
+        self.proc.kill.assert_not_called()
 
     def test_removed_layout_stops_its_worker(self):
         with patch.object(server, "_settings", return_value={"multiview_order": []}):
@@ -73,7 +91,7 @@ class ActiveWorkerReloadTests(unittest.TestCase):
     def test_old_monitor_cannot_kill_replacement_worker(self):
         replacement = Mock()
         self.server._active_procs.clear()
-        self.server._active_procs[replacement] = {"n": "layout", "cfg": {"tiles": ["new"]}}
+        self.server._active_procs[replacement] = {"n": "layout", "cfg": {"tiles": [{"url": "new"}]}}
 
         stopped = self.server._check_live_reload(self.proc, "layout")
 
