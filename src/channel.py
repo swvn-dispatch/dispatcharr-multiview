@@ -263,6 +263,7 @@ class Channel:
             self.frame_reduction.reset()
             last_video_pts = None
             last_video_pts_progress = None
+            video_pts_stalled = False
             with self.vlock:
                 self.vframes.clear()
                 self.display = self.fallback
@@ -310,12 +311,24 @@ class Channel:
                                     if last_video_pts is None or pts_s > last_video_pts:
                                         last_video_pts = pts_s
                                         last_video_pts_progress = now
+                                        if video_pts_stalled:
+                                            log(f"channel {self.name}: video PTS resumed")
+                                            video_pts_stalled = False
                                     elif (last_video_pts_progress is not None
                                           and now - last_video_pts_progress >= VIDEO_PTS_STALL_SECS):
-                                        log(f"channel {self.name}: video PTS stalled for "
-                                            f"{now - last_video_pts_progress:.1f}s; reconnecting")
-                                        self._reconnect_requested = True
-                                        break
+                                        if not video_pts_stalled:
+                                            log(f"channel {self.name}: video PTS stalled for "
+                                                f"{now - last_video_pts_progress:.1f}s; using fallback")
+                                            video_pts_stalled = True
+                                            self.clk_pts = None
+                                            self.clk_wall = None
+                                            with self.vlock:
+                                                self.vframes.clear()
+                                                self.display = self.fallback
+                                                self.fresh_until = 0.0
+                                        continue
+                                    if video_pts_stalled:
+                                        continue
                                     if self.clk_pts is None:
                                         self.clk_pts, self.clk_wall = pts_s, now
                                     else:
