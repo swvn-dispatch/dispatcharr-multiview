@@ -279,7 +279,7 @@ def main():
         while not stop.is_set():
             frame_time = start + n / fps_f
             for i, t in enumerate(channels):
-                Yt, Ut, Vt, ox, oy, tw, th = t.current_at(frame_time)
+                Yt, Ut, Vt, ox, oy, tw, th = t.current()
                 x, y, w, h = t.x, t.y, t.w, t.h
                 if gpu_composition:
                     buf, Yb, Ub, Vb = tile_bufs[i]
@@ -313,7 +313,7 @@ def main():
                 dt = now - prev_t
                 rates = " ".join(f"{c.name[:7]}=d{(c.vcount - prev_counts[i]) / dt:.0f}/"
                                   f"s{(c.scaled_vcount - prev_scaled_counts[i]) / dt:.0f}/"
-                                  f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}"
+                                  f"drop{c.reduced_vcount - prev_reduced_counts[i]}"
                                   for i, c in enumerate(channels))
                 audio = []
                 for i, c in enumerate(audio_chs):
