@@ -5,7 +5,6 @@ the PyAV/numpy dependency and the YUV compositing utilities are co-located with
 the class that uses them, separate from the encoder and orchestration code.
 """
 
-import collections
 import os
 import platform
 import sys
@@ -216,8 +215,8 @@ class Channel:
         self.vcount = 0          # decoded video frames (for rate diagnostics)
         self.scaled_vcount = 0
         self.reduced_vcount = 0
-        # The compositor selects frames by source PTS. Keeping a short queue
-        # decouples that deterministic choice from decoder-thread wake timing.
+        # The decoder and compositor run independently, so guard the latest
+        # complete frame while the compositor reads it.
         self.vlock = threading.Lock()
         self.vframes = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
         self.display = self.fallback
@@ -514,8 +513,8 @@ class Channel:
                 log(f"channel {self.name}: retry {failures}/{RECONNECT_RETRIES} in {delay:.0f}s")
                 time.sleep(delay)
 
-    def current_at(self, wall_time):
-        """Return the newest decoded frame due at *wall_time* by source PTS."""
+    def current(self):
+        """Return the last good frame until its configured hold interval expires."""
         with self.vlock:
             if held_frame(self.latest, self.fallback, self.fresh_until, time.monotonic()) is self.fallback:
                 return self.fallback

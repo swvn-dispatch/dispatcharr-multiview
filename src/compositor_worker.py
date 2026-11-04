@@ -282,7 +282,7 @@ def main():
         while not stop.is_set():
             frame_time = start + n / fps_f
             for i, t in enumerate(channels):
-                Yt, Ut, Vt, ox, oy, tw, th = t.current_at(frame_time)
+                Yt, Ut, Vt, ox, oy, tw, th = t.current()
                 x, y, w, h = t.x, t.y, t.w, t.h
                 if gpu_composition:
                     buf, Yb, Ub, Vb = tile_bufs[i]
