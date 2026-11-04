@@ -40,6 +40,7 @@ except ImportError:
     raise
 
 TILE_STALE_SECS = 1.5
+VIDEO_PTS_STALL_SECS = 10.0
 RECONNECT_BASE    = 2.0   # first retry delay (seconds)
 RECONNECT_MAX     = 60.0  # cap on per-retry delay
 RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
@@ -260,6 +261,8 @@ class Channel:
             self.clk_pts = None
             self.clk_wall = None
             self.frame_reduction.reset()
+            last_video_pts = None
+            last_video_pts_progress = None
             with self.vlock:
                 self.vframes.clear()
                 self.display = self.fallback
@@ -304,6 +307,15 @@ class Channel:
                                 if frame.pts is not None:
                                     pts_s = float(frame.pts * vs.time_base)
                                     now = time.monotonic()
+                                    if last_video_pts is None or pts_s > last_video_pts:
+                                        last_video_pts = pts_s
+                                        last_video_pts_progress = now
+                                    elif (last_video_pts_progress is not None
+                                          and now - last_video_pts_progress >= VIDEO_PTS_STALL_SECS):
+                                        log(f"channel {self.name}: video PTS stalled for "
+                                            f"{now - last_video_pts_progress:.1f}s; reconnecting")
+                                        self._reconnect_requested = True
+                                        break
                                     if self.clk_pts is None:
                                         self.clk_pts, self.clk_wall = pts_s, now
                                     else:
