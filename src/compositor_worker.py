@@ -29,6 +29,7 @@ import numpy as np  # noqa: E402
 
 from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_compositor_failure, validate_encoder  # noqa: E402
 from audio_metadata import generated_audio_metadata_args  # noqa: E402
+from audio_policy import PresentationClock  # noqa: E402
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                           # FIFO forward to re-sync (see audio_feeder())
@@ -85,7 +86,7 @@ def audio_feeder(track, fd, stop, presentation_clock):
         # Video is selected against the compositor's scheduled frame time,
         # which can lag the wall clock under load. Gate audio against the end
         # of that same presented frame instead of against time.monotonic().
-        presentation_time = presentation_clock[0] - AUDIO_PRESENTATION_SAFETY_SECS
+        presentation_time = presentation_clock.presented_until() - AUDIO_PRESENTATION_SAFETY_SECS
         pts_now = track.audio_pts_now(presentation_time)
 
         if pts_now is None:
@@ -227,7 +228,7 @@ def main():
     threading.Thread(target=pump_out, name="pump-out", daemon=True).start()
 
     start = time.monotonic()
-    presentation_clock = [start]
+    presentation_clock = PresentationClock(start)
     for a, fd in zip(audio_chs, audio_w):
         threading.Thread(target=audio_feeder, args=(a, fd, stop, presentation_clock), daemon=True).start()
 
@@ -277,10 +278,6 @@ def main():
     try:
         while not stop.is_set():
             frame_time = start + n / fps_f
-            # The frame selected at frame_time remains on screen through the
-            # next scheduled tick. Audio may fill that interval, but never
-            # pass it, and keeps a small safety margin for pipe/encoder delay.
-            presentation_clock[0] = frame_time + 1 / fps_f
             for i, t in enumerate(channels):
                 Yt, Ut, Vt, ox, oy, tw, th = t.current_at(frame_time)
                 x, y, w, h = t.x, t.y, t.w, t.h
@@ -305,6 +302,11 @@ def main():
                     Vc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Vt
             if not gpu_composition and not _write_all(video_write[0], memoryview(cbuf)):
                 break
+            if stop.is_set():
+                break
+            # Audio must not advance while a video pipe write is blocked. Mark
+            # this interval available only after FFmpeg has accepted its frame.
+            presentation_clock.mark_presented(frame_time + 1 / fps_f)
             n += 1
             now = time.monotonic()
             if now >= log_at:   # heartbeat: per-channel decode fps (CPU health)
@@ -317,7 +319,7 @@ def main():
                 for i, c in enumerate(audio_chs):
                     last_pts, buffered, resyncs, first_pts = c.audio_status()
                     video_pts = c.audio_pts_now(
-                        presentation_clock[0] - AUDIO_PRESENTATION_SAFETY_SECS)
+                        presentation_clock.presented_until() - AUDIO_PRESENTATION_SAFETY_SECS)
                     pts_limit = video_pts
                     delta = pts_limit - last_pts if pts_limit is not None and last_pts is not None else None
                     delta_text = f"{delta:+.3f}s" if delta is not None else "n/a"

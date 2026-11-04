@@ -3,7 +3,7 @@
 import unittest
 import threading
 
-from src.audio_policy import samples_before_pts
+from src.audio_policy import PresentationClock, samples_before_pts
 
 try:
     import numpy as np
@@ -15,6 +15,13 @@ except ModuleNotFoundError:
 
 
 class AudioPolicyTests(unittest.TestCase):
+    def test_presentation_clock_does_not_advance_until_video_is_marked_presented(self):
+        clock = PresentationClock(10.0)
+
+        self.assertEqual(clock.presented_until(), 10.0)
+        clock.mark_presented(10.5)
+        self.assertEqual(clock.presented_until(), 10.5)
+
     def test_allows_samples_without_pts(self):
         self.assertEqual(samples_before_pts(None, 960, 5.0, 48000), 960)
 
