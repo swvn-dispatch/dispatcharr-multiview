@@ -327,11 +327,6 @@ class Channel:
             last_video_pts = None
             last_video_pts_progress = None
             video_pts_stalled = False
-            with self.vlock:
-                self.vframes.clear()
-                self.display = self.fallback
-                self.present_pts = None
-                self.present_wall = None
             vcount_before = self.vcount
             try:
                 cont = self._open_container()
