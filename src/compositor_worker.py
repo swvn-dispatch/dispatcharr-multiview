@@ -281,10 +281,6 @@ def main():
     try:
         while not stop.is_set():
             frame_time = start + n / fps_f
-            # The frame selected at frame_time remains on screen through the
-            # next scheduled tick. Audio may fill that interval, but never
-            # pass it, and keeps a small safety margin for pipe/encoder delay.
-            presentation_clock[0] = frame_time + 1 / fps_f
             for i, t in enumerate(channels):
                 Yt, Ut, Vt, ox, oy, tw, th = t.current_at(frame_time)
                 x, y, w, h = t.x, t.y, t.w, t.h
