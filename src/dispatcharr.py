@@ -20,6 +20,31 @@ USER_AGENT = "multiview-plugin"
 CLIENT_IP = "127.0.0.1"
 
 
+class _LiveEdgeRecoveryBuffer:
+    """Adapt expired multiview cursors to Dispatcharr's live buffer head.
+
+    StreamGenerator normally retries from the oldest retained chunk. That is
+    appropriate for catch-up clients, but a PTS-paced compositor can remain
+    behind and expire repeatedly. A tile holding its last frame should instead
+    resume from the newest available source data.
+    """
+    def __init__(self, buffer, channel_id):
+        self._buffer = buffer
+        self._channel_id = channel_id
+
+    def __getattr__(self, name):
+        return getattr(self._buffer, name)
+
+    def find_oldest_available_chunk(self, local_index):
+        if self._buffer.index > local_index:
+            logger.warning(
+                "multiview: channel %s child cursor expired at %s; rebasing to live index %s",
+                self._channel_id, local_index, self._buffer.index,
+            )
+            return self._buffer.index
+        return self._buffer.find_oldest_available_chunk(local_index)
+
+
 def resolve_channel_uuid(value) -> "str | None":
     """Accept a Dispatcharr channel id (int/str pk) or a channel uuid, return the
     canonical channel uuid string.
@@ -65,6 +90,7 @@ def live_stream(channel_id):
         def _setup_streaming(self):
             if not super()._setup_streaming():
                 return False
+            self.buffer = _LiveEdgeRecoveryBuffer(self.buffer, self.channel_id)
             self.local_index = max(0, self.buffer.index)
             logger.info(
                 f"multiview: channel {self.channel_id} starts at live "
