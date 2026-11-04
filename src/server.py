@@ -44,9 +44,17 @@ def fps_string(settings: dict) -> str:
 def child_buffer_seconds(settings: dict) -> int:
     """Return the per-tile live-proxy delay, bounded for the source buffer TTL."""
     try:
-        return max(0, min(30, int(settings.get("child_buffer_seconds", 5))))
+        return max(0, min(30, int(settings.get("child_buffer_seconds", 0))))
     except (TypeError, ValueError):
-        return 5
+        return 0
+
+
+def tile_hold_seconds(settings: dict) -> int:
+    """Return the last-good-frame hold interval, independent of source delay."""
+    try:
+        return max(1, min(60, int(settings.get("tile_hold_seconds", 15))))
+    except (TypeError, ValueError):
+        return 15
 
 
 def _parse_resolution(settings: dict) -> tuple:
@@ -411,6 +419,7 @@ class MultiviewServer:
         featured_layout = layout in ("featured", "top_featured")
         encoder = settings.get("video_encoder") or "libx264"
         buffer_seconds = child_buffer_seconds(settings)
+        hold_seconds = tile_hold_seconds(settings)
         tile_cfg = []
         for i, (t, (x, y, w, h, valign, halign)) in enumerate(zip(tiles, rects)):
             tile_cfg.append({
@@ -422,7 +431,7 @@ class MultiviewServer:
                 "lang": langs.get(i, "und"),
                 "featured": featured_layout and i == 0,
                 "output_fps": output_fps,
-                "tile_hold_secs": buffer_seconds,
+                "tile_hold_secs": hold_seconds,
                 "hwaccel": {"h264_nvenc": "cuda", "h264_vaapi": "vaapi", "h264_qsv": "qsv"}.get(encoder),
                 "hwaccel_device": (settings.get("render_device") if settings.get("render_device") not in (None, "", "auto") and encoder in ("h264_vaapi", "h264_qsv") else None),
                 "valign": valign, "halign": halign,
