@@ -107,6 +107,20 @@ _GLOBAL_SETTINGS_FIELDS = [
             "preserved because audio is decoded to raw PCM before output."
         ),
     },
+    {
+        "id": "child_buffer_seconds",
+        "label": "Child Stream Buffer (seconds)",
+        "type": "number",
+        "default": 5,
+        "min": 0,
+        "max": 30,
+        "placeholder": "5",
+        "description": (
+            "How far behind live each multiview tile starts. A small buffer absorbs "
+            "brief provider gaps without inheriting Dispatcharr's global client delay. "
+            "0 starts at the live edge."
+        ),
+    },
 ]
 
 _VIDEO_OUTPUT_FIELDS = [
