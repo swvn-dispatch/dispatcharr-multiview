@@ -87,7 +87,7 @@ def audio_feeder(track, fd, stop, presentation_clock):
         # which can lag the wall clock under load. Gate audio against the end
         # of that same presented frame instead of against time.monotonic().
         presentation_time = presentation_clock.presented_until() - AUDIO_PRESENTATION_SAFETY_SECS
-        pts_now = track.audio_pts_now(presentation_time)
+        pts_now = track.presentation_pts_now(presentation_time)
 
         if pts_now is None:
             if was_valid:
@@ -318,7 +318,7 @@ def main():
                 audio = []
                 for i, c in enumerate(audio_chs):
                     last_pts, buffered, resyncs, first_pts = c.audio_status()
-                    video_pts = c.audio_pts_now(
+                    video_pts = c.presentation_pts_now(
                         presentation_clock.presented_until() - AUDIO_PRESENTATION_SAFETY_SECS)
                     pts_limit = video_pts
                     delta = pts_limit - last_pts if pts_limit is not None and last_pts is not None else None

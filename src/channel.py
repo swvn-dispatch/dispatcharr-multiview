@@ -17,14 +17,14 @@ try:
     from .frame_policy import FrameReduction
     from .stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, presentation_target, resample_frame,
+        is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
     )
 except ImportError:
     from audio_policy import samples_before_pts
     from frame_policy import FrameReduction
     from stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, presentation_target, resample_frame,
+        is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
     )
 
 # Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
@@ -185,7 +185,7 @@ class Channel:
         self.alock = threading.Lock()
         self.aframes = []        # list of (pts_s: float|None, ndarray(n,2) int16)
         self.abuffered = 0
-        # video PTS clock anchor — updated by run(), read by audio_pts_now()
+        # Decoder PTS clock anchors source pacing and discontinuity detection.
         self.clk_pts: "float | None" = None
         self.clk_wall: "float | None" = None
         # PTS of the audio content most recently handed to the caller by take() —
@@ -444,19 +444,16 @@ class Channel:
         with self.vlock:
             return len(self.vframes)
 
+    def presentation_pts_now(self, wall_time):
+        """Source PTS of the video being presented at ``wall_time``."""
+        with self.vlock:
+            return anchored_pts(self.present_pts, self.present_wall, wall_time)
+
     def _trim(self):
         cap = AUDIO_RATE * 2  # ~2s
         while self.abuffered > cap and self.aframes:
             _, drop = self.aframes.pop(0)
             self.abuffered -= drop.shape[0]
-
-    def audio_pts_now(self, wall_time=None) -> "float | None":
-        """Source PTS implied by the video clock anchor at ``wall_time``."""
-        if self.clk_pts is None or self.clk_wall is None:
-            return None
-        if wall_time is None:
-            wall_time = time.monotonic()
-        return self.clk_pts + (wall_time - self.clk_wall)
 
     def _align_to_pts(self, pts_limit: float):
         """Discard audio samples before pts_limit."""

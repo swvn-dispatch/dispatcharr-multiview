@@ -27,6 +27,13 @@ def presentation_target(anchor_pts, anchor_wall, next_pts, wall_time):
     return anchor_pts, anchor_wall, anchor_pts + wall_time - anchor_wall
 
 
+def anchored_pts(anchor_pts, anchor_wall, wall_time):
+    """Return source PTS at wall_time for an established presentation anchor."""
+    if anchor_pts is None or anchor_wall is None:
+        return None
+    return anchor_pts + wall_time - anchor_wall
+
+
 def decode_packet(packet, on_error):
     """Return decoded frames, treating one bad transition packet as recoverable."""
     try:

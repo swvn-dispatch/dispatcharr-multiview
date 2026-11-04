@@ -48,6 +48,7 @@ class StreamTransitionTests(unittest.TestCase):
 
         pts, wall, target = stream_resilience.presentation_target(pts, wall, 501, 100.5)
         self.assertEqual((pts, wall, target), (500, 100, 500.5))
+        self.assertEqual(stream_resilience.anchored_pts(pts, wall, 100.5), 500.5)
 
     def test_bad_transition_packet_is_dropped_without_raising(self):
         errors = []
