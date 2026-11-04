@@ -20,6 +20,13 @@ def held_frame(latest, fallback, fresh_until, now):
     return latest if now < fresh_until else fallback
 
 
+def presentation_target(anchor_pts, anchor_wall, next_pts, wall_time):
+    """Return a video-only PTS anchor and the frame PTS due at wall_time."""
+    if anchor_pts is None or anchor_wall is None:
+        return next_pts, wall_time, next_pts
+    return anchor_pts, anchor_wall, anchor_pts + wall_time - anchor_wall
+
+
 def decode_packet(packet, on_error):
     """Return decoded frames, treating one bad transition packet as recoverable."""
     try:

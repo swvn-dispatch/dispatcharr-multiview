@@ -42,6 +42,13 @@ class StreamTransitionTests(unittest.TestCase):
         self.assertTrue(stream_resilience.is_pts_discontinuity(3))
         self.assertTrue(stream_resilience.is_pts_discontinuity(-3))
 
+    def test_recovered_video_gets_a_fresh_presentation_anchor(self):
+        pts, wall, target = stream_resilience.presentation_target(None, None, 500, 100)
+        self.assertEqual((pts, wall, target), (500, 100, 500))
+
+        pts, wall, target = stream_resilience.presentation_target(pts, wall, 501, 100.5)
+        self.assertEqual((pts, wall, target), (500, 100, 500.5))
+
     def test_bad_transition_packet_is_dropped_without_raising(self):
         errors = []
         frames = stream_resilience.decode_packet(

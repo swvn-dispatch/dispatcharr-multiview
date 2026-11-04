@@ -17,14 +17,14 @@ try:
     from .frame_policy import FrameReduction
     from .stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, resample_frame,
+        is_pts_discontinuity, is_pts_progress, presentation_target, resample_frame,
     )
 except ImportError:
     from audio_policy import samples_before_pts
     from frame_policy import FrameReduction
     from stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, resample_frame,
+        is_pts_discontinuity, is_pts_progress, presentation_target, resample_frame,
     )
 
 # Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
@@ -177,6 +177,10 @@ class Channel:
         self.vlock = threading.Lock()
         self.vframes = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
         self.display = self.fallback
+        # Video presentation has its own anchor. It must be reset after a
+        # source rebase without disturbing the decoder/audio PTS clock.
+        self.present_pts: "float | None" = None
+        self.present_wall: "float | None" = None
         # audio buffer (only used when provides_audio)
         self.alock = threading.Lock()
         self.aframes = []        # list of (pts_s: float|None, ndarray(n,2) int16)
@@ -276,6 +280,8 @@ class Channel:
             with self.vlock:
                 self.vframes.clear()
                 self.display = self.fallback
+                self.present_pts = None
+                self.present_wall = None
             vcount_before = self.vcount
             try:
                 cont = self._open_container()
@@ -341,6 +347,8 @@ class Channel:
                                                 self.vframes.clear()
                                                 self.display = self.fallback
                                                 self.fresh_until = 0.0
+                                                self.present_pts = None
+                                                self.present_wall = None
                                         continue
                                     if video_pts_stalled:
                                         continue
@@ -361,6 +369,8 @@ class Channel:
                                             self.clk_pts, self.clk_wall = pts_s, time.monotonic()
                                             with self.vlock:
                                                 self.vframes.clear()
+                                                self.present_pts = None
+                                                self.present_wall = None
                                 if not self.frame_reduction.keep(pts_s):
                                     self.reduced_vcount += 1
                                     continue
@@ -421,9 +431,11 @@ class Channel:
         with self.vlock:
             if held_frame(self.latest, self.fallback, self.fresh_until, time.monotonic()) is self.fallback:
                 return self.fallback
-            if self.clk_pts is None or self.clk_wall is None:
-                return self.latest
-            target_pts = self.clk_pts + wall_time - self.clk_wall
+            if not self.vframes:
+                return self.display
+            self.present_pts, self.present_wall, target_pts = presentation_target(
+                self.present_pts, self.present_wall, self.vframes[0][0], wall_time,
+            )
             while self.vframes and self.vframes[0][0] <= target_pts:
                 _, self.display = self.vframes.popleft()
             return self.display
