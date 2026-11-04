@@ -33,6 +33,12 @@ class FrameReductionTests(unittest.TestCase):
         self.assertTrue(policy.keep(0))
         self.assertFalse(policy.active)
 
+    def test_reports_observed_source_cadence(self):
+        policy = FrameReduction("30")
+        for i in range(10):
+            policy.keep(i / 25)
+        self.assertAlmostEqual(policy.source_fps(), 25, places=3)
+
 
 class PyAVWheelTests(unittest.TestCase):
     def test_accepts_cp311_abi3_wheel_for_cp313_runtime(self):

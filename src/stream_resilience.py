@@ -34,6 +34,16 @@ def anchored_pts(anchor_pts, anchor_wall, wall_time):
     return anchor_pts + wall_time - anchor_wall
 
 
+def source_format_changed(previous, current):
+    """Whether decoded source properties changed across a provider handoff."""
+    return previous is not None and current != previous
+
+
+def frame_can_resume(recovering, key_frame):
+    """A recovering decoder may resume presentation only on a key frame."""
+    return not recovering or key_frame
+
+
 def decode_packet(packet, on_error):
     """Return decoded frames, treating one bad transition packet as recoverable."""
     try:

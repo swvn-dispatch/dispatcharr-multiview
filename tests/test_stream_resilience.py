@@ -50,6 +50,15 @@ class StreamTransitionTests(unittest.TestCase):
         self.assertEqual((pts, wall, target), (500, 100, 500.5))
         self.assertEqual(stream_resilience.anchored_pts(pts, wall, 100.5), 500.5)
 
+    def test_provider_transition_waits_for_keyframe(self):
+        previous = (1280, 720, "yuv420p")
+        replacement = (1920, 1080, "yuv420p")
+        self.assertTrue(stream_resilience.source_format_changed(previous, replacement))
+        self.assertFalse(stream_resilience.source_format_changed(replacement, replacement))
+        self.assertFalse(stream_resilience.frame_can_resume(True, False))
+        self.assertTrue(stream_resilience.frame_can_resume(True, True))
+        self.assertTrue(stream_resilience.frame_can_resume(False, False))
+
     def test_bad_transition_packet_is_dropped_without_raising(self):
         errors = []
         frames = stream_resilience.decode_packet(

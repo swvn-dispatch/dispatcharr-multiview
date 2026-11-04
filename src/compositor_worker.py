@@ -133,6 +133,9 @@ def audio_feeder(track, fd, stop, presentation_clock):
         need = target - written
         if need > 0:
             pcm = track.take(need, pts_limit)
+            gain = track.audio_gain(time.monotonic())
+            if gain < 1.0:
+                pcm = (pcm.astype(np.float32) * gain).astype(np.int16)
             if not _write_all(fd, pcm.tobytes()):
                 break
             written += need
@@ -312,9 +315,10 @@ def main():
             if now >= log_at:   # heartbeat: per-channel decode fps (CPU health)
                 dt = now - prev_t
                 rates = " ".join(f"{c.name[:7]}=d{(c.vcount - prev_counts[i]) / dt:.0f}/"
-                                  f"s{(c.scaled_vcount - prev_scaled_counts[i]) / dt:.0f}/"
-                                  f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}"
-                                  for i, c in enumerate(channels))
+                                   f"s{(c.scaled_vcount - prev_scaled_counts[i]) / dt:.0f}/"
+                                   f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}/"
+                                   f"{c.recovery_status()}"
+                                   for i, c in enumerate(channels))
                 audio = []
                 for i, c in enumerate(audio_chs):
                     last_pts, buffered, resyncs, first_pts = c.audio_status()

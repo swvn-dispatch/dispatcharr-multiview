@@ -18,6 +18,7 @@ try:
     from .stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
         is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
+        frame_can_resume, source_format_changed,
     )
 except ImportError:
     from audio_policy import samples_before_pts
@@ -25,6 +26,7 @@ except ImportError:
     from stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
         is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
+        frame_can_resume, source_format_changed,
     )
 
 # Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
@@ -55,6 +57,7 @@ RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
 AUDIO_RATE = 48000
 AUDIO_LAYOUT = "stereo"
 VIDEO_QUEUE_FRAMES = 120
+AUDIO_RECOVERY_FADE_SECS = 0.15
 
 # Tolerate flaky IPTV (skip corrupt packets, ignore decode errors, generous
 # probe) and bound I/O so a dead child errors and retries instead of hanging.
@@ -195,6 +198,15 @@ class Channel:
         self.last_taken_pts: "float | None" = None
         self.audio_resyncs = 0
         self._reconnect_requested = False
+        # A provider may change coded size, pixel format, cadence, or PTS epoch
+        # without closing this HTTP child stream. Preserve the current tile
+        # through that handoff and resume only from a decoded key frame.
+        self.awaiting_keyframe = True
+        self.recovery_reason = "startup"
+        self.recovery_discarded_frames = 0
+        self.recovery_count = 0
+        self.input_format = None
+        self.audio_fade_started = None
 
     def _open_container(self):
         if self.hwaccel:
@@ -255,6 +267,50 @@ class Channel:
         """Signal run() to drop and reconnect; checked inside the demux loop."""
         self._reconnect_requested = True
 
+    def _begin_recovery(self, reason, retain_frame=True):
+        """Reset timing state while preserving a valid tile through warm-up."""
+        self.awaiting_keyframe = True
+        self.recovery_reason = reason
+        self.recovery_discarded_frames = 0
+        self.frame_reduction.reset()
+        self.clk_pts = None
+        self.clk_wall = None
+        with self.alock:
+            self.aframes.clear()
+            self.abuffered = 0
+            self.last_taken_pts = None
+        with self.vlock:
+            self.vframes.clear()
+            self.present_pts = None
+            self.present_wall = None
+            if not retain_frame:
+                self.display = self.fallback
+                self.latest = self.fallback
+                self.fresh_until = 0.0
+        self.audio_fade_started = None
+        log(f"channel {self.name}: recovering ({reason}); waiting for keyframe")
+
+    def _resume_on_keyframe(self, pts_s, now):
+        self.awaiting_keyframe = False
+        self.recovery_count += 1
+        self.clk_pts, self.clk_wall = (pts_s, now) if pts_s is not None else (None, None)
+        self.audio_fade_started = now
+        log(f"channel {self.name}: resumed on keyframe after {self.recovery_discarded_frames} "
+            f"frames ({self.recovery_reason})")
+
+    def audio_gain(self, now):
+        """Fade PCM in after recovered video replaces the held frame."""
+        started = self.audio_fade_started
+        if started is None:
+            return 1.0
+        return min(1.0, max(0.0, (now - started) / AUDIO_RECOVERY_FADE_SECS))
+
+    def recovery_status(self):
+        fps = self.frame_reduction.source_fps()
+        fmt = "?" if self.input_format is None else "x".join(map(str, self.input_format[:2]))
+        cadence = "?" if fps is None else f"{fps:.2f}"
+        return f"fmt{fmt}/src{cadence}/wait{int(self.awaiting_keyframe)}/r{self.recovery_count}"
+
     def run(self):
         failures = 0
         while self.running:
@@ -265,23 +321,12 @@ class Channel:
                 log(f"channel {self.name}: giving up after {RECONNECT_RETRIES} failed retries")
                 break
             cont = None
-            # Flush stale audio and reset the PTS clock before each new
-            # connection so old samples never bleed into the new stream.
-            with self.alock:
-                self.aframes.clear()
-                self.abuffered = 0
-                self.last_taken_pts = None
-            self.clk_pts = None
-            self.clk_wall = None
-            self.frame_reduction.reset()
+            # Keep an already displayed image while a replacement connection
+            # warms up. Initial startup has no frame to preserve.
+            self._begin_recovery("connection opened", retain_frame=self.vcount > 0)
             last_video_pts = None
             last_video_pts_progress = None
             video_pts_stalled = False
-            with self.vlock:
-                self.vframes.clear()
-                self.display = self.fallback
-                self.present_pts = None
-                self.present_wall = None
             vcount_before = self.vcount
             try:
                 cont = self._open_container()
@@ -321,10 +366,16 @@ class Channel:
                                     packet,
                                     lambda e: log(f"channel {self.name}: dropping bad video packet: {e}")):
                                 self.vcount += 1
+                                frame_format = (frame.width, frame.height,
+                                                getattr(frame.format, "name", None))
+                                if source_format_changed(self.input_format, frame_format):
+                                    self._begin_recovery(
+                                        f"format {self.input_format} -> {frame_format}")
+                                self.input_format = frame_format
                                 pts_s = None
+                                now = time.monotonic()
                                 if frame.pts is not None:
                                     pts_s = float(frame.pts * vs.time_base)
-                                    now = time.monotonic()
                                     if is_pts_progress(last_video_pts, pts_s):
                                         if (last_video_pts is not None
                                                 and pts_s <= last_video_pts - PTS_DISCONTINUITY_SECS):
@@ -352,25 +403,19 @@ class Channel:
                                         continue
                                     if video_pts_stalled:
                                         continue
-                                    if self.clk_pts is None:
-                                        self.clk_pts, self.clk_wall = pts_s, now
-                                    else:
+                                    if self.clk_pts is not None:
                                         gap = (self.clk_wall + pts_s - self.clk_pts) - now
                                         if 0 < gap < 2.0:
                                             time.sleep(gap)
                                         elif is_pts_discontinuity(gap):
-                                            # A provider switch can reset PTS or jump it
-                                            # forward. Either discontinuity makes the old
-                                            # presentation target invalid. Re-anchor to the
-                                            # recovered frame immediately instead of waiting
-                                            # for wall time to catch up behind a logo.
-                                            log(f"channel {self.name}: video PTS discontinuity "
-                                                f"({gap:+.1f}s); re-anchoring")
-                                            self.clk_pts, self.clk_wall = pts_s, time.monotonic()
-                                            with self.vlock:
-                                                self.vframes.clear()
-                                                self.present_pts = None
-                                                self.present_wall = None
+                                            self._begin_recovery(f"PTS discontinuity {gap:+.1f}s")
+                                if not frame_can_resume(self.awaiting_keyframe,
+                                                        bool(getattr(frame, "key_frame", False)
+                                                             or getattr(packet, "is_keyframe", False))):
+                                    self.recovery_discarded_frames += 1
+                                    continue
+                                if self.awaiting_keyframe:
+                                    self._resume_on_keyframe(pts_s, now)
                                 if not self.frame_reduction.keep(pts_s):
                                     self.reduced_vcount += 1
                                     continue
@@ -380,6 +425,8 @@ class Channel:
                                     self.fresh_until = time.monotonic() + self.tile_stale_secs
                                     if frame.pts is not None:
                                         self.vframes.append((pts_s, tile))
+                                    else:
+                                        self.display = tile
                                 self.scaled_vcount += 1
                         elif res is not None and packet.stream.type == "audio":
                             for frame in decode_packet(
