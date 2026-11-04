@@ -15,9 +15,17 @@ import time
 try:
     from .audio_policy import samples_before_pts
     from .frame_policy import FrameReduction
+    from .stream_resilience import (
+        PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
+        is_pts_discontinuity, is_pts_progress, resample_frame,
+    )
 except ImportError:
     from audio_policy import samples_before_pts
     from frame_policy import FrameReduction
+    from stream_resilience import (
+        PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
+        is_pts_discontinuity, is_pts_progress, resample_frame,
+    )
 
 # Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
 # matching this machine and put it on the path before importing av.
@@ -41,7 +49,6 @@ except ImportError:
 
 TILE_STALE_SECS = 1.5
 VIDEO_PTS_STALL_SECS = 10.0
-PTS_DISCONTINUITY_SECS = 2.0
 RECONNECT_BASE    = 2.0   # first retry delay (seconds)
 RECONNECT_MAX     = 60.0  # cap on per-retry delay
 RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
@@ -81,46 +88,6 @@ def black_planes(w, h):
     return (np.zeros((h, w), np.uint8),
             np.full((h // 2, w // 2), 128, np.uint8),
             np.full((h // 2, w // 2), 128, np.uint8))
-
-
-def resample_audio_frame(resampler, frame, channel_name):
-    """Resample one frame, recreating state when an upstream format changes.
-
-    A live-proxy stream can switch providers with a different audio layout or
-    sample rate. PyAV resamplers are tied to their first input format, so that
-    transition must not tear down the tile's video connection.
-    """
-    try:
-        return resampler.resample(frame), resampler
-    except Exception as e:  # noqa: BLE001
-        log(f"channel {channel_name}: audio format changed; resetting resampler: {e}")
-        try:
-            resampler.close()
-        except Exception:
-            pass
-        replacement = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
-        try:
-            return replacement.resample(frame), replacement
-        except Exception as retry_error:  # noqa: BLE001
-            log(f"channel {channel_name}: dropping incompatible audio frame: {retry_error}")
-            return (), replacement
-
-
-def decode_audio_packet(packet, channel_name):
-    """Decode an audio packet without letting a transition end the tile."""
-    try:
-        return packet.decode()
-    except Exception as e:  # noqa: BLE001
-        # Provider switches can leave one corrupt or format-transition audio
-        # packet in flight. Skip it without interrupting the selected tile's
-        # video or subsequent audio.
-        log(f"channel {channel_name}: dropping bad audio packet: {e}")
-        return ()
-
-
-def is_pts_discontinuity(gap):
-    """Whether a source PTS jump invalidates the current presentation clock."""
-    return abs(gap) >= PTS_DISCONTINUITY_SECS
 
 
 def _yuv_planes(buf, w, h):
@@ -344,13 +311,19 @@ class Channel:
                         if packet.dts is None:
                             continue
                         if packet.stream.type == "video":
-                            for frame in packet.decode():
+                            for frame in decode_packet(
+                                    packet,
+                                    lambda e: log(f"channel {self.name}: dropping bad video packet: {e}")):
                                 self.vcount += 1
                                 pts_s = None
                                 if frame.pts is not None:
                                     pts_s = float(frame.pts * vs.time_base)
                                     now = time.monotonic()
-                                    if last_video_pts is None or pts_s > last_video_pts:
+                                    if is_pts_progress(last_video_pts, pts_s):
+                                        if (last_video_pts is not None
+                                                and pts_s <= last_video_pts - PTS_DISCONTINUITY_SECS):
+                                            log(f"channel {self.name}: source PTS reset "
+                                                f"({pts_s - last_video_pts:+.1f}s)")
                                         last_video_pts = pts_s
                                         last_video_pts_progress = now
                                         if video_pts_stalled:
@@ -399,10 +372,20 @@ class Channel:
                                         self.vframes.append((pts_s, tile))
                                 self.scaled_vcount += 1
                         elif res is not None and packet.stream.type == "audio":
-                            for frame in decode_audio_packet(packet, self.name):
+                            for frame in decode_packet(
+                                    packet,
+                                    lambda e: log(f"channel {self.name}: dropping bad audio packet: {e}")):
                                 pts_s = (float(frame.pts * aus.time_base)
                                          if frame.pts is not None else None)
-                                resampled, res = resample_audio_frame(res, frame, self.name)
+                                resampled, res = resample_frame(
+                                    res, frame,
+                                    lambda: av.AudioResampler(
+                                        format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE),
+                                    lambda action, e: log(
+                                        f"channel {self.name}: "
+                                        f"{'resetting resampler after audio format change' if action == 'reset' else 'dropping incompatible audio frame'}: {e}"
+                                    ),
+                                )
                                 for rf in resampled:
                                     a = rf.to_ndarray()
                                     a = a.reshape(-1, 2) if a.shape[0] == 1 else a.T
@@ -436,7 +419,7 @@ class Channel:
     def current_at(self, wall_time):
         """Return the newest decoded frame due at *wall_time* by source PTS."""
         with self.vlock:
-            if time.monotonic() >= self.fresh_until:
+            if held_frame(self.latest, self.fallback, self.fresh_until, time.monotonic()) is self.fallback:
                 return self.fallback
             if self.clk_pts is None or self.clk_wall is None:
                 return self.latest
