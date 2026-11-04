@@ -330,6 +330,8 @@ class Channel:
             with self.vlock:
                 self.vframes.clear()
                 self.display = self.fallback
+                self.present_pts = None
+                self.present_wall = None
             vcount_before = self.vcount
             try:
                 cont = self._open_container()
