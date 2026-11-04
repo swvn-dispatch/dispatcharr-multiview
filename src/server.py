@@ -23,7 +23,6 @@ import os
 import re
 import socket
 import sys
-from urllib.parse import parse_qs
 
 from . import config as _mvconfig
 from . import dispatcharr as _dispatcharr
@@ -40,14 +39,6 @@ TILE_HOLD_SECONDS = 15
 def fps_string(settings: dict) -> str:
     v = str(settings.get("output_fps") or "30")
     return v if v in _FPS_CHOICES else "30"
-
-
-def child_buffer_seconds(settings: dict) -> int:
-    """Return the per-tile live-proxy delay, bounded for the source buffer TTL."""
-    try:
-        return max(0, min(30, int(settings.get("child_buffer_seconds", 0))))
-    except (TypeError, ValueError):
-        return 0
 
 
 def tile_hold_seconds(settings: dict) -> int:
@@ -285,11 +276,7 @@ class MultiviewServer:
         if path.startswith("/internal/realsrc/"):
             if deny := self._loopback_only(loopback, start_response):
                 return deny
-            query = parse_qs(environ.get("QUERY_STRING", ""))
-            return self._serve_realsrc(
-                path[len("/internal/realsrc/"):], start_response,
-                child_buffer_seconds=query.get("buffer_seconds", [None])[0],
-            )
+            return self._serve_realsrc(path[len("/internal/realsrc/"):], start_response)
 
         dash_path = _normalized_dash_path()
         is_dash_path = path == dash_path or path.startswith(dash_path + "/") or path.startswith("/api/")
@@ -423,8 +410,7 @@ class MultiviewServer:
         tile_cfg = []
         for i, (t, (x, y, w, h, valign, halign)) in enumerate(zip(tiles, rects)):
             tile_cfg.append({
-                "url": (f"http://127.0.0.1:{self.port}/internal/realsrc/{t['id']}"
-                        f"?buffer_seconds={buffer_seconds}"),
+                "url": f"http://127.0.0.1:{self.port}/internal/realsrc/{t['id']}",
                 "x": x, "y": y, "w": w, "h": h,
                 "logo": t.get("logo"), "name": t["name"],
                 "audio": i in audio_idx,
@@ -618,7 +604,7 @@ class MultiviewServer:
         except Exception:
             pass
 
-    def _serve_realsrc(self, raw_id: str, start_response, child_buffer_seconds=None):
+    def _serve_realsrc(self, raw_id: str, start_response):
         channel_uuid = _dispatcharr.resolve_channel_uuid(raw_id)
         if channel_uuid is None:
             start_response("404 Not Found", [("Content-Type", "text/plain")])
@@ -631,7 +617,7 @@ class MultiviewServer:
         first = None
         gen = None
         for attempt in range(3):
-            gen = _dispatcharr.live_stream(channel_uuid, child_buffer_seconds)
+            gen = _dispatcharr.live_stream(channel_uuid)
             try:
                 first = next(gen)
                 break

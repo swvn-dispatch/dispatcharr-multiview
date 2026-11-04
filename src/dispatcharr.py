@@ -71,7 +71,7 @@ def resolve_channel_uuid(value) -> "str | None":
         return None
 
 
-def live_stream(channel_id, child_buffer_seconds=None):
+def live_stream(channel_id):
     """Yield MPEG-TS chunks for a real Dispatcharr channel.
 
     Generator. Initializes the channel if needed, registers a client, and

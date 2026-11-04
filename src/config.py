@@ -108,19 +108,6 @@ _GLOBAL_SETTINGS_FIELDS = [
         ),
     },
     {
-        "id": "child_buffer_seconds",
-        "label": "Child Stream Buffer (seconds)",
-        "type": "number",
-        "default": 0,
-        "min": 0,
-        "max": 30,
-        "placeholder": "0",
-        "description": (
-            "How far behind live each multiview child stream starts. Keep this at 0 "
-            "for the same live-edge delivery as a direct Dispatcharr preview."
-        ),
-    },
-    {
         "id": "tile_hold_seconds",
         "label": "Tile Hold (seconds)",
         "type": "number",
