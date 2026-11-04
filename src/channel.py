@@ -41,6 +41,7 @@ except ImportError:
 
 TILE_STALE_SECS = 1.5
 VIDEO_PTS_STALL_SECS = 10.0
+PTS_DISCONTINUITY_SECS = 2.0
 RECONNECT_BASE    = 2.0   # first retry delay (seconds)
 RECONNECT_MAX     = 60.0  # cap on per-retry delay
 RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
@@ -115,6 +116,11 @@ def decode_audio_packet(packet, channel_name):
         # video or subsequent audio.
         log(f"channel {channel_name}: dropping bad audio packet: {e}")
         return ()
+
+
+def is_pts_discontinuity(gap):
+    """Whether a source PTS jump invalidates the current presentation clock."""
+    return abs(gap) >= PTS_DISCONTINUITY_SECS
 
 
 def _yuv_planes(buf, w, h):
@@ -371,11 +377,17 @@ class Channel:
                                         gap = (self.clk_wall + pts_s - self.clk_pts) - now
                                         if 0 < gap < 2.0:
                                             time.sleep(gap)
-                                        elif gap <= -2.0:
+                                        elif is_pts_discontinuity(gap):
+                                            # A provider switch can reset PTS or jump it
+                                            # forward. Either discontinuity makes the old
+                                            # presentation target invalid. Re-anchor to the
+                                            # recovered frame immediately instead of waiting
+                                            # for wall time to catch up behind a logo.
+                                            log(f"channel {self.name}: video PTS discontinuity "
+                                                f"({gap:+.1f}s); re-anchoring")
                                             self.clk_pts, self.clk_wall = pts_s, time.monotonic()
                                             with self.vlock:
                                                 self.vframes.clear()
-                                                self.display = self.fallback
                                 if not self.frame_reduction.keep(pts_s):
                                     self.reduced_vcount += 1
                                     continue
