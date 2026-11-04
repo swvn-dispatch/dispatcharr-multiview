@@ -45,9 +45,17 @@ def fps_string(settings: dict) -> str:
 def child_buffer_seconds(settings: dict) -> int:
     """Return the per-tile live-proxy delay, bounded for the source buffer TTL."""
     try:
-        return max(0, min(30, int(settings.get("child_buffer_seconds", 5))))
+        return max(0, min(30, int(settings.get("child_buffer_seconds", 0))))
     except (TypeError, ValueError):
-        return 5
+        return 0
+
+
+def tile_hold_seconds(settings: dict) -> int:
+    """Return the last-good-frame hold interval, independent of source delay."""
+    try:
+        return max(1, min(60, int(settings.get("tile_hold_seconds", 15))))
+    except (TypeError, ValueError):
+        return 15
 
 
 def _parse_resolution(settings: dict) -> tuple:

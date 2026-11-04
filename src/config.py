@@ -111,14 +111,26 @@ _GLOBAL_SETTINGS_FIELDS = [
         "id": "child_buffer_seconds",
         "label": "Child Stream Buffer (seconds)",
         "type": "number",
-        "default": 5,
+        "default": 0,
         "min": 0,
         "max": 30,
-        "placeholder": "5",
+        "placeholder": "0",
         "description": (
-            "How far behind live each multiview tile starts. A small buffer absorbs "
-            "brief provider gaps without inheriting Dispatcharr's global client delay. "
-            "0 starts at the live edge."
+            "How far behind live each multiview child stream starts. Keep this at 0 "
+            "for the same live-edge delivery as a direct Dispatcharr preview."
+        ),
+    },
+    {
+        "id": "tile_hold_seconds",
+        "label": "Tile Hold (seconds)",
+        "type": "number",
+        "default": 15,
+        "min": 1,
+        "max": 60,
+        "placeholder": "15",
+        "description": (
+            "How long a tile retains its last good frame during a child-stream gap. "
+            "This does not add live-stream latency."
         ),
     },
 ]
