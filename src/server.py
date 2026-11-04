@@ -41,14 +41,6 @@ def fps_string(settings: dict) -> str:
     return v if v in _FPS_CHOICES else "30"
 
 
-def tile_hold_seconds(settings: dict) -> int:
-    """Return the last-good-frame hold interval, independent of source delay."""
-    try:
-        return max(1, min(60, int(settings.get("tile_hold_seconds", 15))))
-    except (TypeError, ValueError):
-        return 15
-
-
 def _parse_resolution(settings: dict) -> tuple:
     try:
         w, h = (int(x) for x in (settings.get("output_resolution") or "1920x1080").split("x"))
