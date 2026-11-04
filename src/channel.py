@@ -5,6 +5,7 @@ the PyAV/numpy dependency and the YUV compositing utilities are co-located with
 the class that uses them, separate from the encoder and orchestration code.
 """
 
+import collections
 import os
 import platform
 import sys
@@ -46,6 +47,7 @@ RECONNECT_MAX     = 60.0  # cap on per-retry delay
 RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
 AUDIO_RATE = 48000
 AUDIO_LAYOUT = "stereo"
+VIDEO_QUEUE_FRAMES = 120
 
 # Tolerate flaky IPTV (skip corrupt packets, ignore decode errors, generous
 # probe) and bound I/O so a dead child errors and retries instead of hanging.
@@ -203,9 +205,11 @@ class Channel:
         self.vcount = 0          # decoded video frames (for rate diagnostics)
         self.scaled_vcount = 0
         self.reduced_vcount = 0
-        # The decoder and compositor run independently, so guard the latest
-        # complete frame while the compositor reads it.
+        # The compositor selects frames by source PTS. Keeping a short queue
+        # decouples that deterministic choice from decoder-thread wake timing.
         self.vlock = threading.Lock()
+        self.vframes = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
+        self.display = self.fallback
         # audio buffer (only used when provides_audio)
         self.alock = threading.Lock()
         self.aframes = []        # list of (pts_s: float|None, ndarray(n,2) int16)
@@ -302,6 +306,9 @@ class Channel:
             last_video_pts = None
             last_video_pts_progress = None
             video_pts_stalled = False
+            with self.vlock:
+                self.vframes.clear()
+                self.display = self.fallback
             vcount_before = self.vcount
             try:
                 cont = self._open_container()
@@ -343,13 +350,7 @@ class Channel:
                                 if frame.pts is not None:
                                     pts_s = float(frame.pts * vs.time_base)
                                     now = time.monotonic()
-                                    if (last_video_pts is None
-                                            or pts_s > last_video_pts
-                                            or pts_s <= last_video_pts - PTS_DISCONTINUITY_SECS):
-                                        if (last_video_pts is not None
-                                                and pts_s <= last_video_pts - PTS_DISCONTINUITY_SECS):
-                                            log(f"channel {self.name}: source PTS reset "
-                                                f"({pts_s - last_video_pts:+.1f}s)")
+                                    if last_video_pts is None or pts_s > last_video_pts:
                                         last_video_pts = pts_s
                                         last_video_pts_progress = now
                                         if video_pts_stalled:
@@ -363,6 +364,10 @@ class Channel:
                                             video_pts_stalled = True
                                             self.clk_pts = None
                                             self.clk_wall = None
+                                            with self.vlock:
+                                                self.vframes.clear()
+                                                self.display = self.fallback
+                                                self.fresh_until = 0.0
                                         continue
                                     if video_pts_stalled:
                                         continue
@@ -381,6 +386,8 @@ class Channel:
                                             log(f"channel {self.name}: video PTS discontinuity "
                                                 f"({gap:+.1f}s); re-anchoring")
                                             self.clk_pts, self.clk_wall = pts_s, time.monotonic()
+                                            with self.vlock:
+                                                self.vframes.clear()
                                 if not self.frame_reduction.keep(pts_s):
                                     self.reduced_vcount += 1
                                     continue
@@ -388,6 +395,8 @@ class Channel:
                                 with self.vlock:
                                     self.latest = tile
                                     self.fresh_until = time.monotonic() + self.tile_stale_secs
+                                    if frame.pts is not None:
+                                        self.vframes.append((pts_s, tile))
                                 self.scaled_vcount += 1
                         elif res is not None and packet.stream.type == "audio":
                             for frame in decode_audio_packet(packet, self.name):
@@ -424,12 +433,21 @@ class Channel:
                 log(f"channel {self.name}: retry {failures}/{RECONNECT_RETRIES} in {delay:.0f}s")
                 time.sleep(delay)
 
-    def current(self):
-        """Return the last good frame until its configured hold interval expires."""
+    def current_at(self, wall_time):
+        """Return the newest decoded frame due at *wall_time* by source PTS."""
         with self.vlock:
             if time.monotonic() >= self.fresh_until:
                 return self.fallback
-            return self.latest
+            if self.clk_pts is None or self.clk_wall is None:
+                return self.latest
+            target_pts = self.clk_pts + wall_time - self.clk_wall
+            while self.vframes and self.vframes[0][0] <= target_pts:
+                _, self.display = self.vframes.popleft()
+            return self.display
+
+    def video_queue_depth(self):
+        with self.vlock:
+            return len(self.vframes)
 
     def _trim(self):
         cap = AUDIO_RATE * 2  # ~2s
