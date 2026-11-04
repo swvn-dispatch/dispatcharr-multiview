@@ -33,19 +33,12 @@ from .regex_order import regex_sort_key
 logger = logging.getLogger(__name__)
 
 _FPS_CHOICES = {"24", "25", "30", "50", "60", "30000/1001", "60000/1001"}
+TILE_HOLD_SECONDS = 15
 
 
 def fps_string(settings: dict) -> str:
     v = str(settings.get("output_fps") or "30")
     return v if v in _FPS_CHOICES else "30"
-
-
-def tile_hold_seconds(settings: dict) -> int:
-    """Return the last-good-frame hold interval, independent of source delay."""
-    try:
-        return max(1, min(60, int(settings.get("tile_hold_seconds", 15))))
-    except (TypeError, ValueError):
-        return 15
 
 
 def _parse_resolution(settings: dict) -> tuple:
@@ -405,7 +398,7 @@ class MultiviewServer:
         # tiles) decodes at lower effort to save CPU.
         featured_layout = layout in ("featured", "top_featured")
         encoder = settings.get("video_encoder") or "libx264"
-        hold_seconds = tile_hold_seconds(settings)
+        hold_seconds = TILE_HOLD_SECONDS
         tile_cfg = []
         for i, (t, (x, y, w, h, valign, halign)) in enumerate(zip(tiles, rects)):
             tile_cfg.append({

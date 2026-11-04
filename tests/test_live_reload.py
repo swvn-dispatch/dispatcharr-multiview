@@ -20,16 +20,14 @@ class LiveReloadFieldTests(unittest.TestCase):
 
     def test_tiles_hold_last_good_frame_for_fifteen_seconds(self):
         fields = config.build_plugin_fields({})
-        hold = next(field for field in fields if field["id"] == "tile_hold_seconds")
 
-        self.assertEqual(hold["default"], 15)
-        self.assertEqual(server.tile_hold_seconds({}), 15)
-        self.assertEqual(server.tile_hold_seconds({"tile_hold_seconds": 99}), 60)
+        self.assertNotIn("tile_hold_seconds", [field["id"] for field in fields])
+        self.assertEqual(server.TILE_HOLD_SECONDS, 15)
 
     def test_worker_config_uses_live_edge_child_urls(self):
         cfg = server.MultiviewServer("127.0.0.1", 9292)._worker_config(
             [{"id": 1, "name": "One", "logo": None}, {"id": 2, "name": "Two", "logo": None}],
-            "auto", "0", {"tile_hold_seconds": 15},
+            "auto", "0", {},
         )
 
         self.assertEqual(

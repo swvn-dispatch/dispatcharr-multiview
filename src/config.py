@@ -107,19 +107,6 @@ _GLOBAL_SETTINGS_FIELDS = [
             "preserved because audio is decoded to raw PCM before output."
         ),
     },
-    {
-        "id": "tile_hold_seconds",
-        "label": "Tile Hold (seconds)",
-        "type": "number",
-        "default": 15,
-        "min": 1,
-        "max": 60,
-        "placeholder": "15",
-        "description": (
-            "How long a tile retains its last good frame during a child-stream gap. "
-            "This does not add live-stream latency."
-        ),
-    },
 ]
 
 _VIDEO_OUTPUT_FIELDS = [
