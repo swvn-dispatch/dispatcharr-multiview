@@ -281,10 +281,8 @@ _MULTIVIEW_COUNT_FIELD = {
     "default": 1,
     "min": 1,
     "description": (
-        "How many multiview streams to define. "
-        "After changing this value, save and reload the plugin to see the new layout blocks. "
-        "Our own dashboard (/dash) manages layouts directly and hides this field -- "
-        "it's only needed when adding a layout from this native settings page."
+        "Number of layouts. Manage layouts in the Multiview dashboard. "
+        "Changing this field on Dispatcharr's settings page requires a plugin reload."
     ),
     "placeholder": "1",
 }
@@ -346,6 +344,21 @@ def _backfill_layout_names(settings: dict) -> tuple:
     return new_settings, True
 
 
+def recover_filtered_layout_order(settings: dict) -> tuple:
+    """Recover stable IDs if an older host filtered the internal order key."""
+    if "multiview_order" in settings:
+        return settings, False
+    import re
+    ids = []
+    for key in settings:
+        match = re.match(r"^multiview_([0-9a-f]{8})_", key)
+        if match and match.group(1) not in ids:
+            ids.append(match.group(1))
+    if not ids:
+        return settings, False
+    return {**settings, "multiview_order": ids}, True
+
+
 def ensure_layout_order(settings: dict) -> tuple:
     """Ensure *settings* has a `multiview_order` list of stable layout ids.
 
@@ -362,8 +375,10 @@ def ensure_layout_order(settings: dict) -> tuple:
     DB when changed=True, since the migration must not silently re-run (and
     generate different ids) on every request.
     """
+    settings, recovered = recover_filtered_layout_order(settings)
     if "multiview_order" in settings:
-        return _backfill_layout_names(settings)
+        settings, backfilled = _backfill_layout_names(settings)
+        return settings, recovered or backfilled
 
     new_settings = dict(settings)
 
@@ -485,6 +500,24 @@ def _get_multiview_profile_params() -> str:
 def _build_warnings_fields(settings: dict) -> list:
     """Return warning info fields for the settings page. Empty list = no warnings = section hidden."""
     warnings = []
+
+    missing_backgrounds = settings.get("multiview_missing_backgrounds") or []
+    if missing_backgrounds:
+        warnings.append({
+            "id": "_warn_missing_backgrounds",
+            "label": "Background images need to be re-uploaded",
+            "type": "info",
+            "description": "Missing images were removed from these styles: " + ", ".join(map(str, missing_backgrounds)),
+        })
+
+    try:
+        from .storage import data_dir
+        from .refresh import warn_if_blocked
+        warning = warn_if_blocked(data_dir())
+        if warning:
+            warnings.append(warning)
+    except Exception:
+        pass
 
     try:
         from . import deps as _deps
@@ -682,10 +715,10 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
 
     fields = [
         {
-            "id": f"multiview_{layout_id}_header",
-            "label": f"── Layout {n} ──────────────────────",
-            "type": "info",
-            "description": "",
+            "id": f"_section_layout_{layout_id}",
+            "label": f"Layout {n}",
+            "type": "section",
+            "collapsed": True,
         },
         {
             "id": f"multiview_{layout_id}_name",
@@ -873,21 +906,21 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
             },
         ]
 
-    return fields
+    section_id = fields[0]["id"]
+    return [fields[0]] + [{**field, "section": section_id} for field in fields[1:]]
 
 
 _GLOBAL_SETTINGS_HEADER = {
-    "id": "_global_settings_header",
-    "label": "── Global Settings ──────────────────────",
-    "type": "info",
-    "description": "",
+        "id": "_global_settings_header",
+    "label": "Global Settings",
+    "type": "section",
+    "collapsed": False,
 }
 
 _VIDEO_SETTINGS_HEADER = {
     "id": "_video_settings_header",
-    "label": "── Video Settings ───────────────────────",
-    "type": "info",
-    "description": "",
+    "label": "Video Settings",
+    "type": "section",
 }
 
 
@@ -916,14 +949,14 @@ def build_plugin_fields(settings: dict) -> list:
 
     fields = _build_warnings_fields(settings)
     fields.append(_GLOBAL_SETTINGS_HEADER)
-    fields.extend(_GLOBAL_SETTINGS_FIELDS)
-    fields.append(count_field)
+    fields.extend({**field, "section": _GLOBAL_SETTINGS_HEADER["id"]} for field in _GLOBAL_SETTINGS_FIELDS)
+    fields.append({**count_field, "section": _GLOBAL_SETTINGS_HEADER["id"]})
     fields.append(_VIDEO_SETTINGS_HEADER)
-    fields.extend(_VIDEO_OUTPUT_FIELDS)
-    fields.append(enc_field)
+    fields.extend({**field, "section": _VIDEO_SETTINGS_HEADER["id"]} for field in _VIDEO_OUTPUT_FIELDS)
+    fields.append({**enc_field, "section": _VIDEO_SETTINGS_HEADER["id"]})
 
     extra_fn = _ENCODER_EXTRA_FIELDS.get(encoder, _x264_fields)
-    fields.extend(extra_fn())
+    fields.extend({**field, "section": _VIDEO_SETTINGS_HEADER["id"]} for field in extra_fn())
 
     for idx, layout_id in enumerate(order):
         position = idx + 1
@@ -934,8 +967,30 @@ def build_plugin_fields(settings: dict) -> list:
         layout_ch_opts = _build_layout_channel_options(layout_id, settings, ch_count, selector_type, regex_pattern)
         fields.extend(_build_multiview_block(layout_id, position, ch_count, selector_type, regex_pattern, epg_source_mode, layout_ch_opts, layout_style_options))
 
+    # Dispatcharr replaces settings on save and filters against its cached
+    # field list. These display-only entries preserve known hidden values when
+    # they are included in the submitted settings object.
+    declared = {field["id"] for field in fields}
+    internal_keys = {
+        "multiview_order", "multiview_custom_layouts", "multiview_custom_layouts_order",
+        "multiview_pre_migration_backup", "multiview_pre_reconcile_backup",
+        "pyav_consent_linux-x86_64", "pyav_consent_linux-aarch64", "pyav_auto_install_error",
+        "multiview_missing_backgrounds",
+    }
+    for layout_id in order:
+        prefix = f"multiview_{layout_id}_"
+        internal_keys.update(prefix + suffix for suffix in (
+            "regex_sort", "regex_pattern", "epg_forward_channel", "epg_title",
+            "epg_subtitle", "epg_categories",
+        ))
+        count = max(2, min(9, int(settings.get(prefix + "channel_count", 4))))
+        internal_keys.update(prefix + f"channel_{number}" for number in range(1, count + 1))
+    for key in sorted(key for key in internal_keys | settings.keys() if isinstance(key, str) and key):
+        if key not in declared:
+            fields.append({"id": key, "type": "info"})
+
     return fields
 
 
-# Default field list (1 layout, 4 channels) used as plugin.json fallback
+# Field list for callers without persisted layout settings.
 PLUGIN_FIELDS = build_plugin_fields({})

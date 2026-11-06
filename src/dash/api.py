@@ -12,9 +12,15 @@ logger = logging.getLogger(__name__)
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_BACKGROUNDS_DIR = os.path.join(_PLUGIN_DIR, "style_backgrounds")
 _MAX_BACKGROUND_BYTES = 5 * 1024 * 1024
 _PLUGIN_KEY = "multiview"
+
+
+def _backgrounds_dir():
+    server = globals().get("_server")
+    if not server or not server.data_dir:
+        raise RuntimeError("Multiview durable storage is unavailable")
+    return os.path.join(server.data_dir, "style_backgrounds")
 
 _CORS_HEADERS = [
     ("Access-Control-Allow-Origin", "*"),
@@ -88,32 +94,41 @@ def _get_settings() -> dict:
 
 
 def _save_settings(updates: dict):
+    server = globals().get("_server")
+    if updates.get("multiview_custom_layouts") is not None and server and server.data_dir:
+        current = _get_settings()
+        candidate = {**current, "multiview_custom_layouts": updates["multiview_custom_layouts"]}
+        migrated, changed = server.storage_module.migrate_backgrounds(candidate, _PLUGIN_DIR, server.data_dir)
+        if changed:
+            updates = {**updates, "multiview_custom_layouts": migrated["multiview_custom_layouts"],
+                       "multiview_missing_backgrounds": migrated["multiview_missing_backgrounds"]}
     from apps.plugins.models import PluginConfig
-    cfg = PluginConfig.objects.get(key=_PLUGIN_KEY)
-    for k, v in updates.items():
-        if v is None:
-            cfg.settings.pop(k, None)
-        else:
-            cfg.settings[k] = v
-    # Keep the legacy multiview_count field (still authoritative for
-    # reconcile_layout_count, which detects native-settings-page edits) in
-    # sync whenever the dashboard itself changes multiview_order -- otherwise
-    # reconcile_layout_count treats the dashboard's own change as drift and
-    # deletes it back out on the very next settings read.
+    from django.db import transaction
+    with transaction.atomic():
+        cfg = PluginConfig.objects.select_for_update().get(key=_PLUGIN_KEY)
+        for k, v in updates.items():
+            if v is None:
+                cfg.settings.pop(k, None)
+            else:
+                cfg.settings[k] = v
+        # Keep the native page's count synchronized with dashboard edits.
+        if updates.get("multiview_order") is not None:
+            cfg.settings["multiview_count"] = len(cfg.settings.get("multiview_order") or [])
+        cfg.save(update_fields=["settings", "updated_at"])
     if updates.get("multiview_order") is not None:
-        cfg.settings["multiview_count"] = len(cfg.settings.get("multiview_order") or [])
-    cfg.save()
-    if updates.get("multiview_order") is not None:
-        return _generate_m3u()
+        try:
+            return _generate_m3u()
+        except Exception as exc:
+            logger.exception("Settings saved, but refresh could not be queued")
+            return {"status": "error", "message": f"Settings saved, but refresh could not be queued: {exc}"}
 
 
 def _generate_m3u():
-    import sys
-
-    for mod in sys.modules.values():
-        if getattr(mod, "PLUGIN_DB_KEY", None) == _PLUGIN_KEY and hasattr(mod, "Plugin"):
-            return mod.Plugin.__new__(mod.Plugin)._generate_m3u()
-    raise RuntimeError("Plugin module not found")
+    server = globals().get("_server")
+    if not server or not server.dispatch_task:
+        raise RuntimeError("Multiview service is unavailable")
+    task_id = server.dispatch_task("generate_m3u", {})
+    return {"status": "started", "task_id": task_id, "message": "M3U and EPG refresh queued"}
 
 
 # ------------------------------------------------------------------
@@ -229,6 +244,38 @@ def handle_config(environ, start_response):
             return _json_error(start_response, "500 Internal Server Error", str(e))
 
     return _json_error(start_response, "405 Method Not Allowed", "GET or PATCH only")
+
+
+def handle_acknowledge_backgrounds(environ, start_response):
+    if environ.get("REQUEST_METHOD") == "OPTIONS":
+        return cors_preflight(start_response)
+    if not _verify_token(environ):
+        return _json_error(start_response, "401 Unauthorized", "Authentication required")
+    if environ.get("REQUEST_METHOD") != "POST":
+        return _json_error(start_response, "405 Method Not Allowed", "POST only")
+    try:
+        _save_settings({"multiview_missing_backgrounds": None})
+        return _json_ok(start_response, {"status": "ok"})
+    except Exception as exc:
+        return _json_error(start_response, "500 Internal Server Error", str(exc))
+
+
+def handle_refresh_recover(environ, start_response):
+    if environ.get("REQUEST_METHOD") == "OPTIONS":
+        return cors_preflight(start_response)
+    if not _verify_token(environ):
+        return _json_error(start_response, "401 Unauthorized", "Authentication required")
+    if environ.get("REQUEST_METHOD") != "POST":
+        return _json_error(start_response, "405 Method Not Allowed", "POST only")
+    try:
+        from celery.result import AsyncResult
+        server = globals()["_server"]
+        success, message = server.refresh_module.recover(server.data_dir, AsyncResult)
+        if not success:
+            return _json_error(start_response, "409 Conflict", message)
+        return _json_ok(start_response, {"status": "ok", "message": message})
+    except Exception as exc:
+        return _json_error(start_response, "500 Internal Server Error", str(exc))
 
 
 def handle_channels(environ, start_response):
@@ -475,7 +522,9 @@ def handle_style_background(environ, start_response):
         filename = style.get("background_image") if style else None
         if not filename:
             return _json_error(start_response, "404 Not Found", "No background image set")
-        path = os.path.join(_BACKGROUNDS_DIR, filename)
+        if not isinstance(filename, str) or os.path.basename(filename) != filename or filename in (".", ".."):
+            return _json_error(start_response, "400 Bad Request", "Invalid background image")
+        path = os.path.join(_backgrounds_dir(), filename)
         if not os.path.isfile(path):
             return _json_error(start_response, "404 Not Found", "Background image file missing")
         try:
@@ -498,7 +547,7 @@ def handle_style_background(environ, start_response):
         style_id = body.get("style_id")
         filename = body.get("filename")
         data_b64 = body.get("data_base64")
-        if not style_id or not filename or not data_b64:
+        if not isinstance(style_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", style_id) or not isinstance(filename, str) or not data_b64:
             return _json_error(start_response, "400 Bad Request", "style_id, filename, data_base64 required")
 
         try:
@@ -510,8 +559,8 @@ def handle_style_background(environ, start_response):
 
         stored_name = f"{style_id}_{_sanitize_filename(filename)}"
         try:
-            os.makedirs(_BACKGROUNDS_DIR, exist_ok=True)
-            with open(os.path.join(_BACKGROUNDS_DIR, stored_name), "wb") as f:
+            os.makedirs(_backgrounds_dir(), exist_ok=True)
+            with open(os.path.join(_backgrounds_dir(), stored_name), "wb") as f:
                 f.write(raw)
         except OSError as e:
             return _json_error(start_response, "500 Internal Server Error", f"Failed to save image: {e}")
@@ -554,6 +603,8 @@ def handle_fields(environ, start_response):
 
         for f in all_fields:
             fid = f.get("id", "")
+            if f.get("type") == "section" or (f.get("type") == "info" and not f.get("label")):
+                continue
             if fid.startswith("_warn") and fid != "_warnings_header":
                 warnings.append(f)
             elif fid.startswith("_") or fid == "multiview_count":

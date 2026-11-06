@@ -8,8 +8,7 @@ number of channel inputs and either an auto-grid or featured arrangement.
 import json
 import logging
 import os
-import socket
-import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -93,99 +92,86 @@ class Plugin:
     version     = _PLUGIN_CONFIG["version"]
     author      = _PLUGIN_CONFIG["author"]
 
-    actions = [
-        {
-            "id": "generate_m3u",
-            "label": "Regenerate M3U & EPG",
-            "description": "Write multiview.m3u and multiview_epg.xml, then refresh the M3U account and EPG source in Dispatcharr",
-            "button_label": "Regenerate M3U & EPG",
-            "button_variant": "filled",
-            "button_color": "green",
-        },
-        {
-            "id": "reload_active_multiviews",
-            "label": "Reload All Active Multiviews",
-            "description": (
-                "Stop every active multiview compositor so Dispatcharr reconnects each "
-                "stream with its current configuration. Players may briefly buffer or "
-                "need to reconnect."
-            ),
-            "button_label": "Reload All Active Multiviews",
-            "button_variant": "filled",
-            "button_color": "orange",
-        },
-        {
-            "id": "install_pyav_amd64",
-            "label": "Install / Update PyAV (amd64 / x86_64)",
-            "description": (
-                "Download and install the PyAV media dependency for x86_64 hosts. "
-                "Required before streaming. Needs internet access. Running this "
-                "once is treated as consent for the plugin to automatically "
-                "reinstall PyAV for you later if it's ever found missing or "
-                "outdated (e.g. after a plugin update resets the vendored copy) "
-                "-- you shouldn't need to click this again after the first time."
-            ),
-            "button_label": "Install PyAV (amd64)",
-            "button_variant": "filled",
-            "button_color": "blue",
-        },
-        {
-            "id": "install_pyav_arm64",
-            "label": "Install / Update PyAV (arm64 / aarch64)",
-            "description": (
-                "Download and install the PyAV media dependency for aarch64 hosts. "
-                "Required before streaming. Needs internet access. Running this "
-                "once is treated as consent for the plugin to automatically "
-                "reinstall PyAV for you later if it's ever found missing or "
-                "outdated (e.g. after a plugin update resets the vendored copy) "
-                "-- you shouldn't need to click this again after the first time."
-            ),
-            "button_label": "Install PyAV (arm64)",
-            "button_variant": "filled",
-            "button_color": "blue",
-        },
-    ]
+    actions = _PLUGIN_CONFIG["actions"]
 
-    # Lifecycle (init)
+    def on_leader_acquired(self, context):
+        context["start_service"](lambda stop_event: self._run_service(stop_event, context), name="multiview")
 
-    def __init__(self):
-        threading.Thread(target=self._auto_repair_pyav, daemon=True).start()
-        try:
-            self._autostart()
-        except Exception as e:
-            logger.warning(f"Multiview server auto-start skipped: {e}")
-        finally:
-            _close_db_connections()
+    def on_leader_lost(self, context):
+        # Dispatcharr has already signalled and joined the managed service.
+        pass
 
-    def _auto_repair_pyav(self):
-        try:
-            self._deps().maybe_auto_install()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Multiview PyAV auto-repair skipped: {e}")
-        finally:
-            _close_db_connections()
+    def _run_service(self, stop_event, context):
+        server = _server().MultiviewServer(
+            host=DEFAULT_SERVER_HOST, port=DEFAULT_SERVER_PORT,
+            data_dir=context["data_dir"], dispatch_task=context["dispatch_task"],
+        )
+        server.refresh_module = _load_submodule("refresh")
+        server.storage_module = _load_submodule("storage")
+        state = {"next_check": 0.0, "next_refresh": None, "interval": None}
 
-    def _autostart(self):
-        existing = _server().get_server()
-        if existing and existing.is_running():
-            return
-        try:
-            with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
+        def ready():
+            if stop_event.is_set():
                 return
-        except OSError:
-            pass
-        result = self._start_server()
-        if result.get("status") == "success":
-            logger.info(f"Multiview auto-start: {result['message']}")
+            from .control import ensure_token
+            ensure_token(context["data_dir"])
+            self._migrate_backgrounds(context["data_dir"])
+            if stop_event.is_set():
+                return
+            arch = self._deps().detect_arch()
+            if arch:
+                action = {"linux-x86_64": "install_pyav_amd64", "linux-aarch64": "install_pyav_arm64"}.get(arch)
+                try:
+                    settings = context["get_settings"]()
+                    if action and (settings.get(f"pyav_consent_{arch}") or os.path.isdir(os.path.join(_PLUGIN_DIR, "vendor", arch))):
+                        context["dispatch_task"](action, {"automatic": True})
+                except Exception:
+                    logger.exception("Could not queue automatic PyAV repair")
+
+        def tick():
+            now = time.monotonic()
+            if now < state["next_check"]:
+                return
+            state["next_check"] = now + 5
             try:
-                from apps.plugins.models import PluginConfig
-                cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-                interval_hours = int(cfg.settings.get("epg_refresh_hours", 24))
+                from celery.result import AsyncResult
+                from . import refresh
+                def scheduled_dispatch(action, params):
+                    if stop_event.is_set():
+                        raise RuntimeError("Multiview leadership is stopping")
+                    return context["dispatch_scheduled_task"](action, params)
+
+                def internal_dispatch(action, args):
+                    if stop_event.is_set():
+                        raise RuntimeError("Multiview leadership is stopping")
+                    return context["dispatch_internal_task"](action, args=args)
+
+                refresh.advance(context["data_dir"], internal_dispatch,
+                                scheduled_dispatch, AsyncResult, refresh.validate_m3u)
+                interval = max(0, int(context["get_settings"]().get("epg_refresh_hours", 24))) * 3600
+                if interval != state["interval"]:
+                    state["interval"] = interval
+                    state["next_refresh"] = now + interval if interval else None
+                if state["next_refresh"] is not None and now >= state["next_refresh"]:
+                    scheduled_dispatch("generate_m3u", {})
+                    state["next_refresh"] = now + interval
             except Exception:
-                interval_hours = 24
-            self._schedule_auto_refresh(interval_hours)
-        else:
-            logger.warning(f"Multiview auto-start failed: {result['message']}")
+                logger.exception("Multiview service scheduling failed")
+            finally:
+                _close_db_connections()
+
+        server.serve(stop_event, on_ready=ready, on_tick=tick)
+
+    def _migrate_backgrounds(self, data_dir):
+        from apps.plugins.models import PluginConfig
+        from django.db import transaction
+        from .storage import migrate_backgrounds
+        with transaction.atomic():
+            cfg = PluginConfig.objects.select_for_update().get(key=PLUGIN_DB_KEY)
+            settings, changed = migrate_backgrounds(cfg.settings, _PLUGIN_DIR, data_dir)
+            if changed:
+                cfg.settings = settings
+                cfg.save(update_fields=["settings", "updated_at"])
 
     # Dynamic fields
 
@@ -212,17 +198,24 @@ class Plugin:
 
     def run(self, action: str, params: dict, context: dict):
         if action == "generate_m3u":
-            return self._generate_m3u()
+            return self._generate_m3u(context, params)
         if action == "reload_active_multiviews":
-            server = _server().get_server()
-            if server is None or not server.is_running():
-                return {"status": "success", "message": "No running multiview server found (0 streams reloaded)"}
-            count = server.kill_active_streams()
-            return {"status": "success", "message": f"Reloading {count} active multiview(s)"}
+            from .control import reload_streams
+            try:
+                count = reload_streams(context["data_dir"], DEFAULT_SERVER_PORT)
+                return {"status": "success", "message": f"Reloading {count} active multiview(s)"}
+            except Exception as exc:
+                raise RuntimeError(f"Multiview service unavailable: {exc}") from exc
         if action == "install_pyav_amd64":
-            return self._deps().install_pyav("linux-x86_64")
+            if params.get("automatic"):
+                self._deps().prepare_vendor("linux-x86_64", context["data_dir"], _PLUGIN_DIR)
+                return self._deps().maybe_auto_install("linux-x86_64", context["data_dir"], context.get("report_progress")) or {"status": "ok", "message": "PyAV is current or automatic repair is not authorized"}
+            return self._deps().install_pyav("linux-x86_64", context["data_dir"], progress=context.get("report_progress"))
         if action == "install_pyav_arm64":
-            return self._deps().install_pyav("linux-aarch64")
+            if params.get("automatic"):
+                self._deps().prepare_vendor("linux-aarch64", context["data_dir"], _PLUGIN_DIR)
+                return self._deps().maybe_auto_install("linux-aarch64", context["data_dir"], context.get("report_progress")) or {"status": "ok", "message": "PyAV is current or automatic repair is not authorized"}
+            return self._deps().install_pyav("linux-aarch64", context["data_dir"], progress=context.get("report_progress"))
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
@@ -232,39 +225,58 @@ class Plugin:
 
     # generate_m3u
 
-    def _generate_m3u(self) -> dict:
+    def _generate_m3u(self, context, params=None) -> dict:
+        from . import refresh
+        with refresh.locked(context["data_dir"]):
+            state = refresh.read_state(context["data_dir"])
+            retry = state.get("phase") == "dispatching_retry" and params and params.get("retry_token") == state.get("retry_token")
+            if state.get("phase") == "blocked":
+                return {"status": "error", "message": state.get("error", "A prior refresh requires recovery")}
+            if not retry and state.get("phase") in {"dispatching_m3u", "m3u", "dispatching_epg", "epg", "retry_pending", "dispatching_retry"}:
+                state["pending"] = True
+                refresh.write_state(context["data_dir"], state)
+                return {"status": "ok", "message": "Refresh queued behind the current refresh"}
+            return self._generate_m3u_locked(context, params)
+
+    def _generate_m3u_locked(self, context, params=None) -> dict:
+        from . import refresh
         config_mod = _config()
         try:
+            from django.db import transaction
             from apps.plugins.models import PluginConfig
-            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
-            settings, changed2 = config_mod.reconcile_layout_count(settings)
-            settings, changed3 = config_mod.ensure_custom_layout_order(settings)
-            if changed1 or changed2 or changed3:
-                cfg.settings = settings
-                cfg.save()
-        except Exception:
-            settings, _changed = config_mod.ensure_layout_order({})
-            settings, _changed = config_mod.reconcile_layout_count(settings)
-            settings, _changed = config_mod.ensure_custom_layout_order(settings)
+            with transaction.atomic():
+                cfg = PluginConfig.objects.select_for_update().get(key=PLUGIN_DB_KEY)
+                settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
+                settings, changed2 = config_mod.reconcile_layout_count(settings)
+                settings, changed3 = config_mod.ensure_custom_layout_order(settings)
+                if changed1 or changed2 or changed3:
+                    cfg.settings = settings
+                    cfg.save(update_fields=["settings", "updated_at"])
+        except Exception as exc:
+            logger.exception("Cannot load Multiview settings for M3U generation")
+            return {"status": "error", "message": f"Cannot load Multiview settings: {exc}"}
         order = settings.get("multiview_order", [])
 
         m3u_content = _m3u_content(settings, order)
 
-        m3u_path = os.path.join(_PLUGIN_DIR, "multiview.m3u")
+        from .storage import atomic_write
+        m3u_path = os.path.join(context["data_dir"], "multiview.m3u")
         try:
-            with open(m3u_path, "w") as f:
-                f.write(m3u_content)
+            if context.get("report_progress"):
+                context["report_progress"](10, "Generating playlist and guide")
+            atomic_write(m3u_path, m3u_content)
         except OSError as e:
             return {"status": "error", "message": f"Failed to write M3U file: {e}"}
 
         source_id = None
         try:
-            source_id = _epg().generate_epg(settings, _PLUGIN_DIR)
+            source_id = _epg().generate_epg(settings, context["data_dir"])
         except Exception as e:
             logger.warning(f"EPG generation failed: {e}")
 
         try:
+            if context.get("report_progress"):
+                context["report_progress"](70, "Registering playlist")
             from apps.m3u.models import M3UAccount
             account, created = M3UAccount.objects.update_or_create(
                 name="Dispatcharr Multiview",
@@ -276,92 +288,22 @@ class Plugin:
                 },
             )
             verb = "created" if created else "updated"
-            self._refresh_m3u_then_epg(account.id, source_id)
+            refresh.start(context["data_dir"], account.id, source_id, order,
+                          context["dispatch_internal_task"], (params or {}).get("retry_token"))
             return {
-                "status": "success",
-                "message": f"M3U written to {m3u_path} | M3U account {verb} in Dispatcharr",
+                "status": "ok" if source_id is not None else "partial",
+                "message": f"M3U account {verb}; Dispatcharr refresh queued" + (" (EPG generation failed)" if source_id is None else ""),
             }
         except Exception as e:
             logger.error(f"Failed to create M3U account: {e}", exc_info=True)
             return {
-                "status": "success",
+                "status": "error",
                 "message": f"M3U written to {m3u_path} (could not create M3U account: {e})",
             }
-
-    def _refresh_m3u_then_epg(self, account_id, source_id) -> None:
-        """Refresh M3U first, then parse EPG after its channel mappings exist.
-
-        Firing both at once collides on Dispatcharr's shared celery DB connection
-        ("the last operation didn't produce records (command status: INSERT 0 N)").
-        The EPG parser only reads programmes for EPG rows mapped to channels, and
-        M3U refresh creates those mappings, so the tasks must be serialized in
-        this order. If M3U refresh fails, skip EPG parsing rather than parse stale
-        channel mappings.
-        """
-        try:
-            from celery import chain
-            from apps.m3u.tasks import refresh_single_m3u_account
-            if source_id is not None:
-                from apps.epg.tasks import refresh_epg_data
-                chain(
-                    refresh_single_m3u_account.si(account_id),
-                    refresh_epg_data.si(source_id),
-                ).delay()
-            else:
-                refresh_single_m3u_account.delay(account_id)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Could not trigger EPG/M3U refresh: {e}")
-
-    # start_server
-
-    def _start_server(self) -> dict:
-        srv = _server()
-        existing = srv.get_server()
-        if existing and existing.is_running():
-            existing.stop()
-
-        server = srv.MultiviewServer(host=DEFAULT_SERVER_HOST, port=DEFAULT_SERVER_PORT)
-        if server.start():
-            return {
-                "status": "success",
-                "message": f"Multiview server started on http://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}/",
-            }
-        return {
-            "status": "error",
-            "message": f"Failed to start server on {DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}; port may be in use",
-        }
-
-    # Auto-refresh
-
-    def _refresh_loop(self, interval_secs: int):
-        import time
-        while True:
-            time.sleep(interval_secs)
-            try:
-                self._generate_m3u()
-            except Exception as e:
-                logger.warning(f"Multiview auto-refresh failed: {e}")
-            finally:
-                _close_db_connections()
-
-    def _schedule_auto_refresh(self, interval_hours: int):
-        if interval_hours <= 0:
-            return
-        interval_secs = interval_hours * 3600
-        try:
-            import gevent
-            gevent.spawn(self._refresh_loop, interval_secs)
-        except ImportError:
-            import threading
-            t = threading.Thread(target=self._refresh_loop, args=(interval_secs,), daemon=True)
-            t.start()
 
     # Lifecycle
 
     def stop(self, context: dict):
         """Called when the plugin is disabled or Dispatcharr shuts down."""
-        srv = _server()
-        server = srv.get_server()
-        if server and server.is_running():
-            logger.info("Plugin stopping, shutting down multiview server")
-            server.stop()
+        # The host owns the service and signals it after this hook returns.
+        pass

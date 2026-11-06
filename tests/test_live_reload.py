@@ -147,28 +147,17 @@ class StreamLifecycleTests(unittest.TestCase):
 
 class PluginReloadActionTests(unittest.TestCase):
     def test_action_reloads_all_active_workers(self):
-        running_server = Mock()
-        running_server.is_running.return_value = True
-        running_server.kill_active_streams.return_value = 2
-        server_module = Mock()
-        server_module.get_server.return_value = running_server
-
-        with patch("src._server", return_value=server_module):
-            result = Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {})
+        with patch("src.control.reload_streams", return_value=2) as reload_streams:
+            result = Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {"data_dir": "/data"})
 
         self.assertEqual(result["status"], "success")
         self.assertIn("2", result["message"])
-        running_server.kill_active_streams.assert_called_once_with()
+        reload_streams.assert_called_once_with("/data", 9292)
 
     def test_action_is_safe_when_server_is_not_running(self):
-        server_module = Mock()
-        server_module.get_server.return_value = None
-
-        with patch("src._server", return_value=server_module):
-            result = Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {})
-
-        self.assertEqual(result["status"], "success")
-        self.assertIn("0", result["message"])
+        with patch("src.control.reload_streams", side_effect=OSError("not running")):
+            with self.assertRaisesRegex(RuntimeError, "service unavailable"):
+                Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {"data_dir": "/data"})
 
 
 if __name__ == "__main__":

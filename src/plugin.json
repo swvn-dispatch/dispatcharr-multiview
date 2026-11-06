@@ -1,11 +1,60 @@
 {
+  "manifest_version": 1,
   "name": "Multiview",
   "license": "MIT",
   "description": "Tile multiple Dispatcharr channel streams into multi-view outputs using FFmpeg",
   "author": "sethwv",
 
   "version": "0.1.0",
-  "min_dispatcharr_version": "v0.27.0",
+  "min_dispatcharr_version": "v0.34.0",
+  "capabilities": [
+    "background_tasks",
+    "persistent_service",
+    "network_listener",
+    "subprocess",
+    "outbound_network",
+    "celery_dispatch",
+    "proxy_internals",
+    "user_data",
+    "external_dependencies"
+  ],
+  "actions": [
+    {
+      "id": "generate_m3u",
+      "label": "Regenerate M3U & EPG",
+      "description": "Generate the playlist and guide and queue their Dispatcharr refreshes.",
+      "button_label": "Regenerate M3U & EPG",
+      "button_variant": "filled",
+      "button_color": "green",
+      "async": true
+    },
+    {
+      "id": "reload_active_multiviews",
+      "label": "Reload All Active Multiviews",
+      "description": "Stop active compositors so players reconnect with their current configuration.",
+      "button_label": "Reload All Active Multiviews",
+      "button_variant": "filled",
+      "button_color": "orange"
+    },
+    {
+      "id": "install_pyav_amd64",
+      "label": "Install / Update PyAV (amd64 / x86_64)",
+      "description": "Install PyAV for x86_64 and enable automatic repair.",
+      "button_label": "Install PyAV (amd64)",
+      "button_variant": "filled",
+      "button_color": "blue",
+      "async": true
+    },
+    {
+      "id": "install_pyav_arm64",
+      "label": "Install / Update PyAV (arm64 / aarch64)",
+      "description": "Install PyAV for aarch64 and enable automatic repair.",
+      "button_label": "Install PyAV (arm64)",
+      "button_variant": "filled",
+      "button_color": "blue",
+      "async": true
+    }
+  ],
 
   "discord_thread": "https://discord.com/channels/1340492560220684331/1509200002407465001",
   "repo_url": "https://github.com/swvn-dispatch/dispatcharr-multiview",

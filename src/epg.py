@@ -7,6 +7,7 @@ from datetime import timedelta, timezone as dt_timezone
 
 from . import config as _mvconfig
 from .regex_order import regex_sort_key
+from .storage import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -269,8 +270,7 @@ def generate_epg(settings: dict, plugin_dir: str) -> "int | None":
     xmltv = _build_xmltv(settings, order, window_start, window_end)
 
     xml_path = os.path.join(plugin_dir, "multiview_epg.xml")
-    with open(xml_path, "w", encoding="utf-8") as f:
-        f.write(xmltv)
+    atomic_write(xml_path, xmltv)
 
     source, _ = EPGSource.objects.update_or_create(
         name="Dispatcharr Multiview",
@@ -281,7 +281,9 @@ def generate_epg(settings: dict, plugin_dir: str) -> "int | None":
             "is_active": True,
         },
     )
-    deleted_count = _remove_stale_epg_data(source, _active_tvg_ids(order))
-    if deleted_count:
-        logger.info("Removed %s stale EPG records from Dispatcharr Multiview source %s", deleted_count, source.id)
+    from apps.epg.models import EPGData
+    for layout_id in order:
+        tvg_id = f"mv-{layout_id}"
+        name = settings.get(f"multiview_{layout_id}_name") or f"Multiview {layout_id}"
+        EPGData.objects.get_or_create(epg_source=source, tvg_id=tvg_id, defaults={"name": name})
     return source.id

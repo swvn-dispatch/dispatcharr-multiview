@@ -1,4 +1,5 @@
 import { createApiClient } from '@swvn-dispatch/dispatch-ui-kit';
+import { notifications } from '@mantine/notifications';
 
 let handleUnauthorized = () => {};
 export function setUnauthorizedHandler(fn) {
@@ -22,8 +23,16 @@ export const loadConfig = () => request('/config');
 export const loadChannels = () => request('/channels');
 export const previewStyle = (layout, channelCount) =>
   request(`/styles/preview?layout=${encodeURIComponent(layout)}&channel_count=${channelCount}`);
-export const patchConfig = (updates) => request('/config', { method: 'PATCH', body: JSON.stringify(updates) });
+export const patchConfig = async (updates) => {
+  const result = await request('/config', { method: 'PATCH', body: JSON.stringify(updates) });
+  if (result.m3u?.status === 'error') {
+    notifications.show({ title: 'Settings saved; refresh failed', message: result.m3u.message, color: 'red' });
+  }
+  return result;
+};
 export const triggerRefresh = () => request('/refresh', { method: 'POST' });
+export const recoverRefresh = () => request('/refresh/recover', { method: 'POST' });
+export const acknowledgeBackgrounds = () => request('/backgrounds/acknowledge', { method: 'POST' });
 export const listStreams = () => request('/streams');
 export const restartStreams = (n) =>
   request('/streams/restart', { method: 'POST', body: JSON.stringify(n != null ? { n } : {}) });

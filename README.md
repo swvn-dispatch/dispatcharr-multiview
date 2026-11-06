@@ -10,7 +10,13 @@ This project is maintained in my spare time. If it's saved you some headaches, a
 
 ---
 
-> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. It is a one-time step per host and takes about 30 seconds. Streams return a 503 until it completes. After that first run, the plugin remembers your consent and automatically reinstalls PyAV in the background if it's ever found missing or outdated (e.g. after a plugin update resets the vendored copy) -- no need to click it again.
+> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This queues a download of the media engine. Streams return a 503 until installation completes. A successful install records consent for automatic repair if PyAV is later missing or outdated.
+
+## Requirements and upgrades
+
+This version requires Dispatcharr 0.34.0 or a development build containing manifest v1, plugin sections, asynchronous actions, durable plugin storage, and leader-elected services. These APIs were unreleased after Dispatcharr 0.33.0 when this change was written. The administrator must approve the listed plugin capabilities; listener approval may require a Dispatcharr restart. Manifest v1 discloses capabilities but does not isolate plugins from the host process.
+
+Generated playlists, EPG files, PyAV, and style backgrounds are stored in Dispatcharr's durable plugin data directory. Existing files are copied when available. A managed upgrade can remove the old code directory before Multiview runs; if a custom background is already missing, its style reference is cleared and a warning asks you to upload it again. Dashboard backups contain style settings and filenames, not background image bytes.
 
 ---
 
@@ -23,7 +29,7 @@ A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your 
 - **Settings** auto-save as you change them.
 - **Active Multiviews** button (top bar) shows running streams; per-layout reload and per-channel reconnect are available.
 - The plugin settings pane includes **Reload All Active Multiviews** for reloading every running compositor without opening the dashboard.
-- **Refresh** regenerates the M3U and EPG and triggers a Dispatcharr sync.
+- **Refresh** queues M3U and EPG regeneration. Dispatcharr's plugin task history reports the generation action; subsequent M3U and EPG refreshes run separately.
 - Click the logo (top-left) for links to this repo and Ko-fi support.
 
 Add `9292:9292` to your `docker-compose.yml` ports to expose the dashboard.
@@ -42,14 +48,14 @@ npm run dev
 
 Each `/stream/{n}` request spawns a dedicated Python worker process with no gevent overhead, giving the compositor real OS threads and full CPU parallelism:
 
-- Each source channel is decoded in its own thread using PyAV (bundled). Frames are scaled and selected against a source-PTS clock at the configured output frame rate.
+- Each source channel is decoded in its own thread using the separately installed PyAV dependency. Frames are scaled and selected against a source-PTS clock at the configured output frame rate.
 - Software profiles composite tile frames onto a numpy YUV420p canvas. Hardware profiles automatically use matching FFmpeg CUDA, QSV, or VAAPI composition filters when available, then encode CBR MPEG-TS for the plugin's gevent server to stream.
 - Source channels are fetched through Dispatcharr's internal live proxy so they appear in stream stats and respect stream profiles.
 - A per-channel PTS rate limiter ensures playback stays at realtime regardless of how fast the host machine or source proxy delivers packets. Audio is aligned to the video PTS clock at startup and the audio buffer is flushed on reconnect to keep lip-sync stable.
 
 ## Configuration
 
-**Global settings** apply to all layouts:
+The native settings page groups fields into Global Settings, Video Settings, and one section per layout. Global and video settings apply to all layouts:
 
 | Setting | Description |
 |---|---|
@@ -88,7 +94,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 - **All channels:** one AC3 track per tile. Players that support multi-track audio (VLC, Infuse, mpv) can switch between them via the Audio Track menu. Duplicate track labels (e.g. three TSN channels) are auto-numbered: `ts1`, `ts2`, `ts3`.
 - **Audio Track Labels:** enabled by default. Generated title and language labels identify multiview audio tracks in compatible players. Disabling them omits generated labels; source metadata cannot be preserved because audio is decoded to raw PCM before it is re-encoded for output.
 
-After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create or update the M3U account, and rebuild EPG data. The Auto-Refresh Interval controls how often this happens automatically.
+After saving settings, click **Regenerate M3U** to queue the playlist and EPG update. The service waits for the M3U task to succeed and checks layout mappings before dispatching EPG parsing. If the result is ambiguous, the refresh is blocked rather than risking an out-of-order EPG update. The dashboard displays a warning and can check recovery for a known completed task. For an unknown submission outcome, inspect Dispatcharr's task history and active workers before clearing the `refresh-state.json` file in the plugin data directory and retrying. The Auto-Refresh Interval controls automatic scheduling.
 
 ## Hardware acceleration
 

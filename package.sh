@@ -137,6 +137,7 @@ cd "$TEMP_DIR"
 zip -q -r "$OLDPWD/$OUTPUT_FILE" "$PLUGIN_NAME" \
     -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store" \
     -x "*/vendor/*" \
+    -x "*/style_backgrounds/*" -x "*/multiview.m3u" -x "*/multiview_epg.xml" \
     -x "*/dash/ui/*"
 cd "$OLDPWD"
 

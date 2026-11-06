@@ -31,7 +31,7 @@ except ImportError:
 
 # Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
 # matching this machine and put it on the path before importing av.
-_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+_VENDOR = os.environ.get("MULTIVIEW_VENDOR_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
 _ARCH_DIR = {
     "x86_64": "linux-x86_64", "amd64": "linux-x86_64",
     "aarch64": "linux-aarch64", "arm64": "linux-aarch64",

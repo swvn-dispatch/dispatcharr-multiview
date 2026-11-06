@@ -1,12 +1,12 @@
 """Regression tests for multiview's generated EPG refresh contract."""
 
-import sys
-import types
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from src import Plugin, _m3u_content
 from src import epg
+from src import refresh
 
 
 class EPGDataCleanupTests(unittest.TestCase):
@@ -45,60 +45,36 @@ class M3UOrderTests(unittest.TestCase):
 
 class RefreshOrderTests(unittest.TestCase):
     def test_m3u_refresh_precedes_epg_refresh(self):
-        m3u_task = Mock()
-        epg_task = Mock()
-        m3u_signature = object()
-        epg_signature = object()
-        m3u_task.si.return_value = m3u_signature
-        epg_task.si.return_value = epg_signature
-        chained = Mock()
-        chain = Mock(return_value=chained)
+        with tempfile.TemporaryDirectory() as data_dir:
+            dispatch = Mock(side_effect=["m3u-task", "epg-task"])
+            refresh.start(data_dir, 12, 34, ["abcdef01"], dispatch)
+            task = Mock(result="Dispatched jobs complete.")
+            task.ready.return_value = True
+            task.successful.return_value = True
+            with patch.object(refresh, "remove_stale"), patch.object(refresh, "layout_order_changed", return_value=False):
+                state = refresh.advance(data_dir, dispatch, Mock(), lambda _: task, lambda *_: None)
+            self.assertEqual(state["phase"], "epg")
+            self.assertEqual(dispatch.call_args_list[0].args[0], "apps.m3u.tasks.refresh_single_m3u_account")
+            self.assertEqual(dispatch.call_args_list[1].args[0], "apps.epg.tasks.refresh_epg_data")
 
-        celery = types.ModuleType("celery")
-        celery.chain = chain
-        apps = types.ModuleType("apps")
-        m3u = types.ModuleType("apps.m3u")
-        m3u_tasks = types.ModuleType("apps.m3u.tasks")
-        m3u_tasks.refresh_single_m3u_account = m3u_task
-        epg_package = types.ModuleType("apps.epg")
-        epg_tasks = types.ModuleType("apps.epg.tasks")
-        epg_tasks.refresh_epg_data = epg_task
+    def test_failed_or_unverified_m3u_never_queues_epg(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            dispatch = Mock(return_value="m3u-task")
+            refresh.start(data_dir, 12, 34, [], dispatch)
+            task = Mock(result="Task already running")
+            task.ready.return_value = True
+            task.successful.return_value = True
+            state = refresh.advance(data_dir, dispatch, Mock(), lambda _: task, lambda *_: "M3U not verified")
+            self.assertEqual(state["phase"], "error")
+            dispatch.assert_called_once()
 
-        modules = {
-            "celery": celery,
-            "apps": apps,
-            "apps.m3u": m3u,
-            "apps.m3u.tasks": m3u_tasks,
-            "apps.epg": epg_package,
-            "apps.epg.tasks": epg_tasks,
-        }
-        with patch.dict(sys.modules, modules):
-            Plugin.__new__(Plugin)._refresh_m3u_then_epg(12, 34)
-
-        m3u_task.si.assert_called_once_with(12)
-        epg_task.si.assert_called_once_with(34)
-        chain.assert_called_once_with(m3u_signature, epg_signature)
-        chained.delay.assert_called_once_with()
-
-    def test_m3u_refresh_runs_without_epg_source(self):
-        m3u_task = Mock()
-        celery = types.ModuleType("celery")
-        celery.chain = Mock()
-        apps = types.ModuleType("apps")
-        m3u = types.ModuleType("apps.m3u")
-        m3u_tasks = types.ModuleType("apps.m3u.tasks")
-        m3u_tasks.refresh_single_m3u_account = m3u_task
-
-        modules = {
-            "celery": celery,
-            "apps": apps,
-            "apps.m3u": m3u,
-            "apps.m3u.tasks": m3u_tasks,
-        }
-        with patch.dict(sys.modules, modules):
-            Plugin.__new__(Plugin)._refresh_m3u_then_epg(12, None)
-
-        m3u_task.delay.assert_called_once_with(12)
+    def test_pending_refresh_waits_for_existing_work(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            dispatch = Mock(return_value="m3u-task")
+            refresh.start(data_dir, 12, 34, [], dispatch)
+            self.assertFalse(refresh.start(data_dir, 12, 34, [], dispatch))
+            self.assertTrue(refresh.read_state(data_dir)["pending"])
+            dispatch.assert_called_once()
 
 
 if __name__ == "__main__":

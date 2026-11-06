@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-import socket
 import sys
 
 from . import config as _mvconfig
@@ -50,7 +49,6 @@ def _parse_resolution(settings: dict) -> tuple:
 
 CHUNK_SIZE = 65536
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compositor_worker.py")
-_BACKGROUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "style_backgrounds")
 
 _server_instance = None
 _dash_api = None
@@ -210,13 +208,17 @@ def _channel_logo(ch) -> "str | None":
 
 
 class MultiviewServer:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, data_dir=None, dispatch_task=None):
         self.host = host
         self.port = port
         self._server = None
         self._greenlet = None
         self.running = False
         self._active_procs: dict = {}  # proc -> layout_n
+        self.data_dir = data_dir
+        self.dispatch_task = dispatch_task
+        self.refresh_module = None
+        self.storage_module = None
 
     # ------------------------------------------------------------------ WSGI
 
@@ -228,8 +230,6 @@ class MultiviewServer:
 
     def wsgi_app(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
-        loopback = environ.get("REMOTE_ADDR", "") in ("127.0.0.1", "::1")
-
         remote = environ.get("REMOTE_ADDR", "")
         loopback = remote in ("127.0.0.1", "::1")
 
@@ -252,6 +252,16 @@ class MultiviewServer:
         # Checked first, unconditionally, so a dash_path that happens to
         # collide with these reserved prefixes can't shadow the plugin's
         # actual streaming endpoints (see _normalized_dash_path's docstring).
+        if path == "/internal/control/reload":
+            if deny := self._loopback_only(loopback, start_response):
+                return deny
+            from .control import verify_token
+            if environ.get("REQUEST_METHOD") != "POST" or not verify_token(self.data_dir, environ.get("HTTP_AUTHORIZATION", "")):
+                start_response("403 Forbidden", [("Content-Type", "text/plain")])
+                return [b"Forbidden\n"]
+            body = json.dumps({"killed": self.kill_active_streams()}).encode()
+            start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+            return [body]
         if path.startswith("/stream/"):
             if deny := self._loopback_only(loopback, start_response):
                 return deny
@@ -307,12 +317,16 @@ class MultiviewServer:
             return api.handle_auth_refresh(environ, start_response)
         if path == "/api/config":
             return api.handle_config(environ, start_response)
+        if path == "/api/backgrounds/acknowledge":
+            return api.handle_acknowledge_backgrounds(environ, start_response)
         if path == "/api/channels":
             return api.handle_channels(environ, start_response)
         if path == "/api/fields":
             return api.handle_fields(environ, start_response)
         if path == "/api/refresh":
             return api.handle_refresh(environ, start_response)
+        if path == "/api/refresh/recover":
+            return api.handle_refresh_recover(environ, start_response)
         if path == "/api/streams":
             return api.handle_streams_list(environ, start_response)
         if path == "/api/streams/restart":
@@ -338,7 +352,7 @@ class MultiviewServer:
 
         from . import deps as _deps
         arch = _deps.detect_arch()
-        if not arch or not _deps.pyav_status(arch):
+        if not arch or not _deps.pyav_status(arch, self.data_dir):
             logger.warning(f"Stream {layout_id}: PyAV not installed for {arch or 'this arch'}")
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [(f"PyAV media engine not installed for {arch or 'this CPU arch'}. "
@@ -353,7 +367,10 @@ class MultiviewServer:
 
         import gevent
         import gevent.subprocess as gsub
-        proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE)
+        env = os.environ.copy()
+        if self.data_dir:
+            env["MULTIVIEW_VENDOR_DIR"] = os.path.join(self.data_dir, "vendor")
+        proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE, env=env)
         stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{layout_id}")
         self._active_procs[proc] = {"n": layout_id, "cfg": cfg}
         self._active_procs[proc]["reload_monitor"] = gevent.spawn(
@@ -378,8 +395,8 @@ class MultiviewServer:
         if isinstance(layout, str) and layout.startswith("custom:"):
             style = custom_registry.get(layout[len("custom:"):]) or {}
             bg_filename = style.get("background_image")
-            if bg_filename:
-                bg_path = os.path.join(_BACKGROUNDS_DIR, bg_filename)
+            if isinstance(bg_filename, str) and os.path.basename(bg_filename) == bg_filename and bg_filename not in (".", ".."):
+                bg_path = os.path.join(self.data_dir or "", "style_backgrounds", bg_filename)
                 if os.path.isfile(bg_path):
                     background = bg_path
 
@@ -698,56 +715,66 @@ class MultiviewServer:
 
     # ------------------------------------------------------------- lifecycle
 
-    def start(self) -> bool:
-        if self.running:
-            logger.warning("Multiview server is already running")
-            return False
+    def serve(self, stop_event, on_ready=None, on_tick=None):
+        """Run the gevent hub in Dispatcharr's managed native service thread."""
+        import gevent
+        from gevent import pywsgi
 
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, self.port))
-            sock.close()
-        except OSError as e:
-            logger.info(f"Multiview: port {self.port} already taken, skipping ({e})")
-            return False
-
-        try:
-            from gevent import pywsgi
-            import gevent as _gevent
-        except ImportError:
-            logger.error("gevent is not installed; cannot start multiview server")
-            return False
-
-        def _run():
+        for attempt in range(5):
+            self._server = pywsgi.WSGIServer((self.host, self.port), self.wsgi_app, log=None)
             try:
-                self._server = pywsgi.WSGIServer(
-                    (self.host, self.port), self.wsgi_app, log=None,
-                )
-                self.running = True
-                set_server(self)
-                self._server.serve_forever()
-            except OSError as e:
-                # EADDRINUSE here means a concurrent worker won the race between
-                # our test-bind above and this re-bind -- expected on multi-worker
-                # startup, not an error.
-                logger.info(f"Multiview: port {self.port} taken by concurrent worker ({e})")
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Multiview server crashed: {e}", exc_info=True)
-            finally:
-                self.running = False
-
-        self._greenlet = _gevent.spawn(_run)
-        return True
+                self._server.start()
+                break
+            except OSError:
+                if stop_event.is_set():
+                    gevent.get_hub().destroy()
+                    return
+                if attempt == 4:
+                    gevent.get_hub().destroy()
+                    raise
+                gevent.sleep(0.25)
+        if stop_event.is_set():
+            self._server.stop(timeout=1)
+            gevent.get_hub().destroy()
+            return
+        self.running = True
+        set_server(self)
+        worker = gevent.spawn(self._server.serve_forever)
+        try:
+            if on_ready:
+                on_ready()
+            while not stop_event.is_set():
+                if on_tick:
+                    on_tick()
+                gevent.sleep(0.25)
+                if worker.ready():
+                    worker.get()
+                    raise RuntimeError("Multiview listener stopped unexpectedly")
+        finally:
+            self.stop()
+            worker.kill(block=False)
+            _close_db_connections()
+            gevent.get_hub().destroy()
 
     def stop(self):
+        import gevent
+
+        procs = list(self._active_procs)
+        self.kill_active_streams()
         if self._server:
             try:
-                self._server.stop()
+                self._server.stop(timeout=2)
             except Exception:
                 pass
+        try:
+            with gevent.Timeout(1, False):
+                for proc in procs:
+                    proc.wait()
+        except Exception:
+            pass
         self.running = False
-        set_server(None)
+        if get_server() is self:
+            set_server(None)
         logger.info("Multiview server stopped")
 
     def is_running(self) -> bool:

@@ -7,7 +7,7 @@ import { DndContext, PointerSensor, closestCenter, useSensor, useSensors } from 
 import { SortableContext, verticalListSortingStrategy, useSortable, arrayMove } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import logoUrl from '/logo.png';
-import { loadFields, loadConfig, patchConfig, triggerRefresh, listStreams, restartStreams, loadChannels, setUnauthorizedHandler, getUsername } from '../api.js';
+import { loadFields, loadConfig, patchConfig, triggerRefresh, recoverRefresh, acknowledgeBackgrounds, listStreams, restartStreams, loadChannels, setUnauthorizedHandler, getUsername } from '../api.js';
 import { isTrigger } from '../utils/fields.js';
 import { genId } from '../utils/id.js';
 import { downloadJson } from '../utils/download.js';
@@ -247,8 +247,8 @@ export function Dashboard({ onLoggedOut }) {
     try {
       const result = await triggerRefresh();
       notifications.show({
-        message: result.message || 'M3U & EPG refreshed',
-        color: result.status === 'success' ? 'green' : 'red',
+        message: result.message || 'M3U & EPG refresh queued',
+        color: result.status === 'started' || result.status === 'success' ? 'green' : 'red',
         autoClose: 3000,
       });
     } catch (err) {
@@ -456,6 +456,27 @@ export function Dashboard({ onLoggedOut }) {
 
       <AppShell.Main>
         <Stack p="md" maw={860} mx="auto">
+          {warnings.some((warning) => warning.id === '_warn_refresh') && (
+            <Button variant="light" color="orange" onClick={async () => {
+              try {
+                const result = await recoverRefresh();
+                notifications.show({ message: result.message, color: 'green' });
+                await fetchFields();
+              } catch (err) {
+                notifications.show({ title: 'Refresh recovery unavailable', message: err.message, color: 'red' });
+              }
+            }}>Check blocked refresh</Button>
+          )}
+          {settings.multiview_missing_backgrounds?.length > 0 && (
+            <Button variant="light" color="orange" onClick={async () => {
+              try {
+                await acknowledgeBackgrounds();
+                await fetchFields();
+              } catch (err) {
+                notifications.show({ title: 'Could not dismiss warning', message: err.message, color: 'red' });
+              }
+            }}>Dismiss missing background warning</Button>
+          )}
           <SettingsPanel
             fields={globalFields}
             warnings={warnings}
