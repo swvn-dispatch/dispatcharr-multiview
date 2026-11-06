@@ -18,6 +18,35 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "multiview-plugin"
 CLIENT_IP = "127.0.0.1"
+RECOVERY_BEHIND_CHUNKS = 4
+
+
+class _LiveEdgeRecoveryBuffer:
+    """Adapt expired multiview cursors to a recent live-buffer position.
+
+    StreamGenerator normally retries from the oldest retained chunk. That is
+    appropriate for catch-up clients, but a PTS-paced compositor can remain
+    behind and expire repeatedly. A tile holding its last frame should instead
+    resume a few chunks behind live so decoding can begin on a recent GOP.
+    """
+    def __init__(self, buffer, channel_id):
+        self._buffer = buffer
+        self._channel_id = channel_id
+
+    def __getattr__(self, name):
+        return getattr(self._buffer, name)
+
+    def find_oldest_available_chunk(self, local_index):
+        if self._buffer.index > local_index:
+            recovery_index = max(0, self._buffer.index - RECOVERY_BEHIND_CHUNKS)
+            logger.warning(
+                "multiview: channel %s child cursor expired at %s; rebasing to index %s "
+                "(%s chunks behind live index %s)",
+                self._channel_id, local_index, recovery_index,
+                RECOVERY_BEHIND_CHUNKS, self._buffer.index,
+            )
+            return recovery_index
+        return self._buffer.find_oldest_available_chunk(local_index)
 
 
 def resolve_channel_uuid(value) -> "str | None":
@@ -59,6 +88,19 @@ def live_stream(channel_id):
     from apps.proxy.live_proxy.services.channel_service import ChannelService
     from apps.proxy.live_proxy.url_utils import get_stream_info_for_switch
     from apps.proxy.live_proxy.output.ts.generator import StreamGenerator
+
+    class MultiviewStreamGenerator(StreamGenerator):
+        """Always start multiview inputs at Dispatcharr's live edge."""
+        def _setup_streaming(self):
+            if not super()._setup_streaming():
+                return False
+            self.buffer = _LiveEdgeRecoveryBuffer(self.buffer, self.channel_id)
+            self.local_index = max(0, self.buffer.index)
+            logger.info(
+                f"multiview: channel {self.channel_id} starts at live "
+                f"at buffer index {self.local_index}"
+            )
+            return True
 
     proxy = ProxyServer.get_instance()
     client_manager = proxy.client_managers.get(channel_id)
@@ -104,22 +146,29 @@ def live_stream(channel_id):
         return
 
     logger.info(f"multiview: streaming channel {channel_id} as client {client_id}")
-    gen = StreamGenerator(
+    gen = MultiviewStreamGenerator(
         channel_id, client_id, CLIENT_IP, USER_AGENT,
         channel_initializing=True, user=None, buffer=buffer,
     ).generate()
 
+    end_reason = "source stream ended"
     try:
         for chunk in gen:
             if chunk:
                 yield chunk
+    except GeneratorExit:
+        end_reason = "multiview tile consumer disconnected"
+        raise
+    except Exception as e:  # noqa: BLE001
+        end_reason = f"source stream failed: {e}"
+        raise
     finally:
         try:
             gen.close()
         except Exception:
             pass
         _safe_remove(client_manager, client_id)
-        logger.info(f"multiview: channel {channel_id} client {client_id} closed")
+        logger.info(f"multiview: channel {channel_id} client {client_id} closed: {end_reason}")
 
 
 def _safe_remove(client_manager, client_id) -> None:

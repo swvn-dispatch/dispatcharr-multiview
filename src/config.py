@@ -73,6 +73,40 @@ _GLOBAL_SETTINGS_FIELDS = [
         "placeholder": "24",
         "description": "How often to automatically regenerate M3U and EPG. 0 = manual only (Regenerate M3U button).",
     },
+    {
+        "id": "live_reload_interval",
+        "label": "Live Multiview Reload",
+        "type": "select",
+        "default": "manual",
+        "options": [
+            {"value": "manual", "label": "Manual"},
+            {"value": "15", "label": "Every 15 seconds"},
+            {"value": "30", "label": "Every 30 seconds"},
+            {"value": "60", "label": "Every 60 seconds"},
+            {"value": "120", "label": "Every 2 minutes"},
+            {"value": "300", "label": "Every 5 minutes"},
+        ],
+        "description": (
+            "Checks each active multiview for changed regex matches or stream-affecting "
+            "layout settings, then reloads only affected streams. Reloading briefly "
+            "disconnects players while Dispatcharr reconnects. Manual disables checks."
+        ),
+    },
+    {
+        "id": "audio_track_labels",
+        "label": "Audio Track Labels",
+        "type": "select",
+        "default": "enabled",
+        "options": [
+            {"value": "enabled", "label": "Generated from channel names"},
+            {"value": "disabled", "label": "No generated labels"},
+        ],
+        "description": (
+            "Generates title and language metadata for multiview audio tracks. "
+            "Disabling this omits generated labels; source metadata cannot be "
+            "preserved because audio is decoded to raw PCM before output."
+        ),
+    },
 ]
 
 _VIDEO_OUTPUT_FIELDS = [
@@ -82,11 +116,12 @@ _VIDEO_OUTPUT_FIELDS = [
         "type": "select",
         "default": "1920x1080",
         "options": [
+            {"value": "3840x2160", "label": "4K (3840×2160)"},
             {"value": "1920x1080", "label": "1080p (1920×1080)"},
             {"value": "1280x720",  "label": "720p (1280×720)"},
             {"value": "854x480",   "label": "480p (854×480)"},
         ],
-        "description": "Resolution of the tiled output. Lower resolutions reduce CPU and bandwidth.",
+        "description": "Resolution of the tiled output. 4K requires substantially more CPU/GPU power and bandwidth; lower resolutions reduce both.",
     },
     {
         "id": "output_fps",
@@ -110,7 +145,7 @@ _VIDEO_OUTPUT_FIELDS = [
         "min": 1000,
         "max": 40000,
         "placeholder": "8000",
-        "description": "Target output video bitrate in kbps (CBR). Higher values improve quality at the cost of bandwidth. 8000 is a good baseline for 1080p multiview; 12000-16000 for noticeably sharper tiles.",
+        "description": "Target output video bitrate in kbps (CBR). Higher values improve quality at the cost of bandwidth. 8000 is a good baseline for 1080p multiview; 12000-16000 for noticeably sharper tiles. 4K needs substantially more bitrate.",
     },
 ]
 

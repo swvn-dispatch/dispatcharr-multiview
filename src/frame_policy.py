@@ -54,3 +54,9 @@ class FrameReduction:
             return False
         self.last_bucket = bucket
         return True
+
+    def source_fps(self):
+        """Best PTS-derived source cadence, or ``None`` while warming up."""
+        if not self.intervals:
+            return None
+        return len(self.intervals) / sum(self.intervals)

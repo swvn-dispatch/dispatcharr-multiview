@@ -3,7 +3,7 @@
 import unittest
 import threading
 
-from src.audio_policy import samples_before_pts
+from src.audio_policy import PresentationClock, samples_before_pts
 
 try:
     import numpy as np
@@ -15,6 +15,13 @@ except ModuleNotFoundError:
 
 
 class AudioPolicyTests(unittest.TestCase):
+    def test_presentation_clock_does_not_advance_until_video_is_marked_presented(self):
+        clock = PresentationClock(10.0)
+
+        self.assertEqual(clock.presented_until(), 10.0)
+        clock.mark_presented(10.5)
+        self.assertEqual(clock.presented_until(), 10.5)
+
     def test_allows_samples_without_pts(self):
         self.assertEqual(samples_before_pts(None, 960, 5.0, 48000), 960)
 
@@ -24,12 +31,14 @@ class AudioPolicyTests(unittest.TestCase):
     def test_limits_chunk_at_video_boundary(self):
         self.assertEqual(samples_before_pts(5.0, 960, 5.01, 48000), 480)
 
-    def test_audio_pts_offset_allows_a_persistently_ahead_chunk(self):
+    def test_holds_ahead_audio_until_video_reaches_its_pts(self):
         video_pts = 5.0
-        audio_pts = 5.6
-        offset = audio_pts - video_pts
-        self.assertEqual(samples_before_pts(audio_pts, 960, video_pts + offset, 48000), 0)
-        self.assertEqual(samples_before_pts(audio_pts, 960, video_pts + offset + 0.01, 48000), 480)
+        for lead in (0.25, 0.5):
+            with self.subTest(lead=lead):
+                audio_pts = video_pts + lead
+                self.assertEqual(samples_before_pts(audio_pts, 960, video_pts, 48000), 0)
+                self.assertEqual(samples_before_pts(audio_pts, 960, audio_pts, 48000), 0)
+                self.assertEqual(samples_before_pts(audio_pts, 960, audio_pts + 0.01, 48000), 480)
 
     @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
     def test_take_limits_partial_chunk_without_overfilling_output(self):
@@ -66,12 +75,27 @@ class AudioPolicyTests(unittest.TestCase):
         track.alock = threading.Lock()
         track.aframes = [(5.0, np.ones((100, 2), np.int16))]
         track.abuffered = 100
+        track.last_taken_pts = 4.7
 
         track._align_to_pts(5.0 + 85 / AUDIO_RATE)
 
         self.assertEqual(track.aframes[0][0], 5.0 + 85 / AUDIO_RATE)
         self.assertEqual(track.aframes[0][1].shape, (15, 2))
         self.assertEqual(track.abuffered, 15)
+        self.assertIsNone(track.last_taken_pts)
+
+        pcm = track.take(15, 5.0 + 100 / AUDIO_RATE)
+
+        self.assertTrue(np.all(pcm == 1))
+        self.assertEqual(track.last_taken_pts, 5.0 + 100 / AUDIO_RATE)
+
+    @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
+    def test_audio_pts_now_accepts_the_video_presentation_time(self):
+        track = Channel.__new__(Channel)
+        track.clk_pts = 100.0
+        track.clk_wall = 10.0
+
+        self.assertEqual(track.audio_pts_now(10.125), 100.125)
 
 
 if __name__ == "__main__":

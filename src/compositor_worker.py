@@ -28,11 +28,13 @@ import av  # noqa: E402  (vendored, already on sys.path via the channel import a
 import numpy as np  # noqa: E402
 
 from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_compositor_failure, validate_encoder  # noqa: E402
+from audio_metadata import generated_audio_metadata_args  # noqa: E402
+from audio_policy import PresentationClock  # noqa: E402
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
-                         # FIFO forward to re-sync (see audio_feeder())
-AUDIO_GATE_RECOVERY_SECS = 0.5
+                          # FIFO forward to re-sync (see audio_feeder())
 AUDIO_TICK_SECS = 0.005
+AUDIO_PRESENTATION_SAFETY_SECS = 0.02
 
 
 # ---------------------------------------------------------------- compositing helpers
@@ -71,7 +73,7 @@ def stdin_listener(channels, stop):
                 c.reconnect()
 
 
-def audio_feeder(track, fd, stop):
+def audio_feeder(track, fd, stop, presentation_clock):
     CHUNK = int(AUDIO_RATE * AUDIO_TICK_SECS)  # 240 samples = 5ms per tick
     SILENCE = np.zeros((CHUNK, 2), dtype=np.int16)
 
@@ -81,7 +83,11 @@ def audio_feeder(track, fd, stop):
     was_valid = False
 
     while not stop.is_set():
-        pts_now = track.audio_pts_now()
+        # Video is selected against the compositor's scheduled frame time,
+        # which can lag the wall clock under load. Gate audio against the end
+        # of that same presented frame instead of against time.monotonic().
+        presentation_time = presentation_clock.presented_until() - AUDIO_PRESENTATION_SAFETY_SECS
+        pts_now = track.presentation_pts_now(presentation_time)
 
         if pts_now is None:
             if was_valid:
@@ -91,9 +97,6 @@ def audio_feeder(track, fd, stop):
                 snapped = False
                 start = None
                 written = 0
-                with track.alock:
-                    track.audio_gate_since = None
-                    track.audio_pts_offset = 0.0
             was_valid = False
             _write_all(fd, SILENCE.tobytes())
             time.sleep(AUDIO_TICK_SECS)
@@ -110,29 +113,15 @@ def audio_feeder(track, fd, stop):
 
         was_valid = True
 
-        with track.alock:
-            pts_limit = pts_now + track.audio_pts_offset
-            first_pts = track.aframes[0][0] if track.aframes else None
-            if first_pts is not None and first_pts > pts_limit:
-                if track.audio_gate_since is None:
-                    track.audio_gate_since = time.monotonic()
-                gate_duration = time.monotonic() - track.audio_gate_since
-                if gate_duration >= AUDIO_GATE_RECOVERY_SECS:
-                    lead = first_pts - pts_limit
-                    track.audio_pts_offset = first_pts - pts_now
-                    track.audio_gate_since = None
-                    track.audio_gate_recoveries += 1
-                    pts_limit = first_pts
-                    log(f"channel {track.name}: audio PTS recovery "
-                        f"video_pts={pts_now:.3f} audio_pts={first_pts:.3f} "
-                        f"lead={lead:.3f}s")
-            else:
-                track.audio_gate_since = None
+        # Raw PCM pipes carry no source timestamps, so this gate is the final
+        # authority on A/V ordering. Future audio remains queued and take()
+        # emits silence until video reaches its PTS.
+        pts_limit = pts_now
 
         # Catch audio that has fallen behind the video clock by skipping stale
         # FIFO data. Future audio is retained below and silence is emitted
         # until video reaches it, preventing audio from leading video.
-        last_pts, _, _, _, _, _, _ = track.audio_status()
+        last_pts, _, _, _ = track.audio_status()
         if last_pts is not None and (pts_limit - last_pts) > DRIFT_THRESHOLD:
             delta = pts_limit - last_pts
             track._align_to_pts(pts_limit)
@@ -144,6 +133,9 @@ def audio_feeder(track, fd, stop):
         need = target - written
         if need > 0:
             pcm = track.take(need, pts_limit)
+            gain = track.audio_gain(time.monotonic())
+            if gain < 1.0:
+                pcm = (pcm.astype(np.float32) * gain).astype(np.int16)
             if not _write_all(fd, pcm.tobytes()):
                 break
             written += need
@@ -211,9 +203,9 @@ def main():
     video_inputs = ([(fd, c.w, c.h) for fd, c in zip(video_read, channels)]
                     if gpu_composition else None)
     cmd = build_encoder_cmd(cfg, out_w, out_h, audio_read, video_inputs, compositor)
-    for i, a in enumerate(audio_chs):
-        cmd[-1:-1] = [f"-metadata:s:a:{i}", f"title={a.name}",
-                      f"-metadata:s:a:{i}", f"language={a.lang}"]
+    cmd[-1:-1] = generated_audio_metadata_args(
+        audio_chs, cfg.get("audio_track_labels", "enabled") == "enabled",
+    )
     enc = subprocess.Popen(cmd, stdin=None if gpu_composition else video_read[0], stdout=enc_out_w,
                            stderr=sys.stderr, pass_fds=[*video_read, *audio_read])
     for fd in video_read:
@@ -238,8 +230,10 @@ def main():
         stop.set()
     threading.Thread(target=pump_out, name="pump-out", daemon=True).start()
 
+    start = time.monotonic()
+    presentation_clock = PresentationClock(start)
     for a, fd in zip(audio_chs, audio_w):
-        threading.Thread(target=audio_feeder, args=(a, fd, stop), daemon=True).start()
+        threading.Thread(target=audio_feeder, args=(a, fd, stop, presentation_clock), daemon=True).start()
 
     if gpu_composition:
         # One reusable fixed-size yuv420p buffer per ffmpeg tile input. PyAV
@@ -276,7 +270,6 @@ def main():
         bg_buf = cbuf.copy()
         bg_Y, bg_U, bg_V = _yuv_planes(bg_buf, out_w, out_h)
 
-    start = time.monotonic()
     n = 0
     log_at = start + 30.0
     prev_t = start
@@ -312,28 +305,32 @@ def main():
                     Vc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Vt
             if not gpu_composition and not _write_all(video_write[0], memoryview(cbuf)):
                 break
+            if stop.is_set():
+                break
+            # Audio must not advance while a video pipe write is blocked. Mark
+            # this interval available only after FFmpeg has accepted its frame.
+            presentation_clock.mark_presented(frame_time + 1 / fps_f)
             n += 1
             now = time.monotonic()
             if now >= log_at:   # heartbeat: per-channel decode fps (CPU health)
                 dt = now - prev_t
                 rates = " ".join(f"{c.name[:7]}=d{(c.vcount - prev_counts[i]) / dt:.0f}/"
-                                  f"s{(c.scaled_vcount - prev_scaled_counts[i]) / dt:.0f}/"
-                                  f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}"
-                                  for i, c in enumerate(channels))
+                                   f"s{(c.scaled_vcount - prev_scaled_counts[i]) / dt:.0f}/"
+                                   f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}/"
+                                   f"{c.recovery_status()}"
+                                   for i, c in enumerate(channels))
                 audio = []
                 for i, c in enumerate(audio_chs):
-                    (last_pts, buffered, resyncs, first_pts, gate_since,
-                     pts_offset, recoveries) = c.audio_status()
-                    video_pts = c.audio_pts_now()
-                    pts_limit = video_pts + pts_offset if video_pts is not None else None
+                    last_pts, buffered, resyncs, first_pts = c.audio_status()
+                    video_pts = c.presentation_pts_now(
+                        presentation_clock.presented_until() - AUDIO_PRESENTATION_SAFETY_SECS)
+                    pts_limit = video_pts
                     delta = pts_limit - last_pts if pts_limit is not None and last_pts is not None else None
                     delta_text = f"{delta:+.3f}s" if delta is not None else "n/a"
                     lead = first_pts - pts_limit if first_pts is not None and pts_limit is not None else None
                     lead_text = f"{lead:+.3f}s" if lead is not None else "n/a"
-                    blocked = now - gate_since if gate_since is not None else 0.0
                     audio.append(f"{c.name[:7]}=d{delta_text}/q{buffered / AUDIO_RATE:.2f}s/"
-                                 f"lead{lead_text}/block{blocked:.2f}s/"
-                                 f"r{resyncs - prev_audio_resyncs[i]}/g{recoveries}")
+                                 f"lead{lead_text}/r{resyncs - prev_audio_resyncs[i]}")
                 import resource as _res
                 rss_mb = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss // 1024
                 log(f"out {n / (now - start):.1f}fps; decode {rates}; "

@@ -33,6 +33,7 @@ from .regex_order import regex_sort_key
 logger = logging.getLogger(__name__)
 
 _FPS_CHOICES = {"24", "25", "30", "50", "60", "30000/1001", "60000/1001"}
+TILE_HOLD_SECONDS = 15
 
 
 def fps_string(settings: dict) -> str:
@@ -53,6 +54,7 @@ _BACKGROUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sty
 
 _server_instance = None
 _dash_api = None
+_LIVE_RELOAD_INTERVALS = {"15": 15, "30": 30, "60": 60, "120": 120, "300": 300}
 
 
 def _load_dash_api():
@@ -120,6 +122,35 @@ def _settings() -> dict:
         cfg.settings = settings
         cfg.save()
     return settings
+
+
+def _close_db_connections():
+    """Release ORM connections opened by this standalone WSGI server."""
+    try:
+        from django.db import close_old_connections
+        close_old_connections()
+    except Exception:
+        pass
+
+
+def _live_reload_interval_secs(settings: dict) -> int | None:
+    """Return the configured active-stream reload interval, or None for manual."""
+    return _LIVE_RELOAD_INTERVALS.get(str(settings.get("live_reload_interval", "manual")))
+
+
+def _live_reload_signature(cfg: dict) -> dict:
+    """Return the worker settings that require a compositor restart to apply.
+
+    Tile names, language labels, and logos are metadata for the current worker.
+    They may be supplied by storage backends with changing URLs or labels, but
+    do not change which stream is decoded or how the canvas is rendered.
+    """
+    signature = dict(cfg)
+    signature["tiles"] = [
+        {key: value for key, value in tile.items() if key not in {"logo", "name", "lang"}}
+        for tile in cfg.get("tiles", [])
+    ]
+    return signature
 
 
 def _normalized_dash_path() -> str:
@@ -215,11 +246,7 @@ class MultiviewServer:
             # lookups, plugin config) outside of Django's own request cycle,
             # which never runs Django's usual request_finished cleanup. Do it
             # ourselves so connections don't accumulate and eventually go stale.
-            try:
-                from django.db import close_old_connections
-                close_old_connections()
-            except Exception:
-                pass
+            _close_db_connections()
 
     def _route(self, path, loopback, environ, start_response):
         # Checked first, unconditionally, so a dash_path that happens to
@@ -329,6 +356,9 @@ class MultiviewServer:
         proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE)
         stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{layout_id}")
         self._active_procs[proc] = {"n": layout_id, "cfg": cfg}
+        self._active_procs[proc]["reload_monitor"] = gevent.spawn(
+            self._monitor_live_reload, proc, layout_id,
+        )
 
         start_response("200 OK", [
             ("Content-Type", "video/mp2t"),
@@ -368,6 +398,7 @@ class MultiviewServer:
         # tiles) decodes at lower effort to save CPU.
         featured_layout = layout in ("featured", "top_featured")
         encoder = settings.get("video_encoder") or "libx264"
+        hold_seconds = TILE_HOLD_SECONDS
         tile_cfg = []
         for i, (t, (x, y, w, h, valign, halign)) in enumerate(zip(tiles, rects)):
             tile_cfg.append({
@@ -378,6 +409,7 @@ class MultiviewServer:
                 "lang": langs.get(i, "und"),
                 "featured": featured_layout and i == 0,
                 "output_fps": output_fps,
+                "tile_hold_secs": hold_seconds,
                 "hwaccel": {"h264_nvenc": "cuda", "h264_vaapi": "vaapi", "h264_qsv": "qsv"}.get(encoder),
                 "hwaccel_device": (settings.get("render_device") if settings.get("render_device") not in (None, "", "auto") and encoder in ("h264_vaapi", "h264_qsv") else None),
                 "valign": valign, "halign": halign,
@@ -390,6 +422,7 @@ class MultiviewServer:
             "preset": preset,
             "video_encoder": encoder,
             "render_device": settings.get("render_device") or "auto",
+            "audio_track_labels": settings.get("audio_track_labels", "enabled"),
             "background": background,
             "tiles": tile_cfg,
         }
@@ -405,8 +438,75 @@ class MultiviewServer:
         order_rank = {layout_id: i for i, layout_id in enumerate(order)}
         return sorted(seen.values(), key=lambda s: order_rank.get(s["n"], len(order)))
 
+    def _monitor_live_reload(self, proc, layout_id: str):
+        """Watch one active worker until it exits or its desired config changes."""
+        import gevent
+
+        while proc in self._active_procs:
+            interval = _live_reload_interval_secs(_settings())
+            if interval is None:
+                return
+            gevent.sleep(interval)
+            if proc not in self._active_procs:
+                return
+            if self._check_live_reload(proc, layout_id):
+                return
+
+    def _check_live_reload(self, proc, layout_id: str) -> bool:
+        """Reload *proc* when its currently-resolved worker config changed.
+
+        Returns True when the monitor should stop. The exact process is killed
+        instead of looking up the layout again, so an old monitor can never
+        terminate a replacement worker for the same layout id.
+        """
+        try:
+            info = self._active_procs.get(proc)
+            if info is None or info.get("n") != layout_id:
+                return True
+
+            settings = _settings()
+            if layout_id not in settings.get("multiview_order", []):
+                logger.info("Live reload stopping removed layout %s", layout_id)
+                proc.kill()
+                return True
+
+            try:
+                tiles, layout, audio_source = self._resolve_layout(layout_id)
+                desired_cfg = self._worker_config(tiles, layout, audio_source, settings)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Live reload skipped layout %s because its new configuration is invalid: %s",
+                    layout_id, e,
+                )
+                return False
+
+            desired_signature = _live_reload_signature(desired_cfg)
+            current_signature = _live_reload_signature(info["cfg"])
+            if desired_signature == current_signature:
+                info.pop("pending_reload_signature", None)
+                return False
+
+            # A single inconsistent observation should not interrupt playback.
+            # Require the same desired configuration on two consecutive polls.
+            if info.get("pending_reload_signature") != desired_signature:
+                info["pending_reload_signature"] = desired_signature
+                logger.info("Live reload detected a change for layout %s; awaiting confirmation", layout_id)
+                return False
+
+            if desired_signature != current_signature:
+                logger.info("Live reload restarting changed layout %s", layout_id)
+                proc.kill()
+                return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Live reload check failed for layout %s: %s", layout_id, e)
+            return False
+        finally:
+            _close_db_connections()
+
     def kill_active_streams(self) -> int:
         procs = list(self._active_procs)
+        if procs:
+            logger.info("Multiview: stopping %d active stream worker(s) on request", len(procs))
         for proc in procs:
             try:
                 proc.kill()
@@ -416,6 +516,8 @@ class MultiviewServer:
 
     def kill_stream(self, n: str) -> int:
         to_kill = [p for p, info in list(self._active_procs.items()) if info["n"] == n]
+        if to_kill:
+            logger.info("Multiview: stopping %d active worker(s) for layout %s on request", len(to_kill), n)
         for proc in to_kill:
             try:
                 proc.kill()
@@ -437,6 +539,7 @@ class MultiviewServer:
         return False
 
     def _pump_stdout(self, proc, label: str, stderr_gl=None):
+        end_reason = "worker output ended"
         try:
             while True:
                 chunk = proc.stdout.read(CHUNK_SIZE)
@@ -444,9 +547,21 @@ class MultiviewServer:
                     break
                 yield chunk
         except GeneratorExit:
-            pass
+            end_reason = "downstream consumer disconnected"
+            raise
+        except Exception as e:  # noqa: BLE001
+            end_reason = f"output read failed: {e}"
+            raise
         finally:
-            self._active_procs.pop(proc, None)
+            logger.info("Multiview %s ended: %s (worker returncode=%s)",
+                        label, end_reason, proc.poll())
+            info = self._active_procs.pop(proc, None)
+            reload_monitor = info.get("reload_monitor") if info else None
+            if reload_monitor is not None:
+                try:
+                    reload_monitor.kill(block=False)
+                except Exception:
+                    pass
             try:
                 proc.stdin.close()
             except Exception:

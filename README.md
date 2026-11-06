@@ -22,6 +22,7 @@ A mobile-friendly PWA is served at `http://<host>:9292/dash/`. Log in with your 
 
 - **Settings** auto-save as you change them.
 - **Active Multiviews** button (top bar) shows running streams; per-layout reload and per-channel reconnect are available.
+- The plugin settings pane includes **Reload All Active Multiviews** for reloading every running compositor without opening the dashboard.
 - **Refresh** regenerates the M3U and EPG and triggers a Dispatcharr sync.
 - Click the logo (top-left) for links to this repo and Ko-fi support.
 
@@ -52,11 +53,12 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 | Setting | Description |
 |---|---|
-| Output Resolution | 480p / 720p / 1080p |
+| Output Resolution | 480p / 720p / 1080p / 4K (3840×2160) |
 | Output Frame Rate | 24 / 25 / 30 / 50 / 60 fps |
 | Output Bitrate (kbps) | CBR target. 8000 is a good baseline for 1080p; 12000-16000 for noticeably sharper tiles. |
 | Encoder Preset | ultrafast (lowest CPU) through slow (highest quality). Ultrafast recommended for live use. |
 | Auto-Refresh Interval | Hours between automatic M3U and EPG regeneration. 0 = manual only. |
+| Live Multiview Reload | Manual by default. Poll active multiviews every 15s, 30s, 60s, 2m, or 5m and reload only those whose regex matches or stream-affecting settings changed. Reloads briefly interrupt players while Dispatcharr reconnects. |
 
 **Per-layout settings:**
 
@@ -84,6 +86,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 - **Single channel:** one AC3 audio track from the selected tile.
 - **All channels:** one AC3 track per tile. Players that support multi-track audio (VLC, Infuse, mpv) can switch between them via the Audio Track menu. Duplicate track labels (e.g. three TSN channels) are auto-numbered: `ts1`, `ts2`, `ts3`.
+- **Audio Track Labels:** enabled by default. Generated title and language labels identify multiview audio tracks in compatible players. Disabling them omits generated labels; source metadata cannot be preserved because audio is decoded to raw PCM before it is re-encoded for output.
 
 After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create or update the M3U account, and rebuild EPG data. The Auto-Refresh Interval controls how often this happens automatically.
 
@@ -92,6 +95,8 @@ After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create
 Selecting NVIDIA NVENC, Intel QSV, or Intel/AMD VAAPI automatically attempts GPU tile composition as well as GPU encoding. There is no extra setting. The worker validates the selected device and FFmpeg's required hardware filters at startup. If either is unavailable, it logs the reason and keeps the stream running with the CPU compositor.
 
 PyAV source decode, source reconnect handling, PTS scheduling, and audio processing remain on the CPU. A custom layout background image also uses the CPU compositor for now, so its letterbox padding remains correct. Check the worker log for `compositor=cuda`, `compositor=qsv`, `compositor=vaapi`, or a CPU fallback reason.
+
+4K output has four times the pixel workload of 1080p. In a four-tile grid, each tile receives a 1920×1080 region. Use capable hardware, hardware encoding/composition where available, and enough output bitrate for the source material.
 
 ## Notes
 
