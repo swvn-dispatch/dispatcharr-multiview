@@ -168,8 +168,10 @@ _VIDEO_OUTPUT_FIELDS = [
         "options": [
             {"value": "24", "label": "24 fps"},
             {"value": "25", "label": "25 fps"},
+            {"value": "30000/1001", "label": "29.97 fps"},
             {"value": "30", "label": "30 fps"},
             {"value": "50", "label": "50 fps"},
+            {"value": "60000/1001", "label": "59.94 fps"},
             {"value": "60", "label": "60 fps"},
         ],
         "description": "Frame rate of the tiled output. Higher rates are smoother but use more CPU.",
