@@ -4,7 +4,9 @@ import datetime
 import glob
 import json
 import os
+import re
 import secrets
+import shlex
 
 try:
     from .regex_order import regex_sort_key
@@ -482,6 +484,24 @@ def _get_multiview_profile_params() -> str:
         return ""
 
 
+def _audio_copy_may_drop_tracks(params: str) -> bool:
+    """Identify copy profiles without a clearly complete input-zero audio map."""
+    try:
+        tokens = shlex.split(params)
+    except ValueError:
+        # A malformed command cannot establish a safe mapping.
+        return bool(re.search(r'(?:^|\s)-(?:c|codec|c:a|codec:a|acodec)\s+copy(?:\s|$)', params))
+
+    copy_options = {"-c", "-codec", "-c:a", "-codec:a", "-acodec"}
+    if not any(option in copy_options and value == "copy"
+               for option, value in zip(tokens, tokens[1:])):
+        return False
+
+    maps = [value for option, value in zip(tokens, tokens[1:]) if option == "-map"]
+    complete_map = any(value in {"0", "0?", "0:a", "0:a?"} for value in maps)
+    return not complete_map or "-an" in tokens or any(value.startswith("-") for value in maps)
+
+
 def _build_warnings_fields(settings: dict) -> list:
     """Return warning info fields for the settings page. Empty list = no warnings = section hidden."""
     warnings = []
@@ -521,16 +541,16 @@ def _build_warnings_fields(settings: dict) -> list:
         })
 
     params = _get_multiview_profile_params()
-    if params and any(t in params for t in ("-c copy", "-c:a copy", "-codec:a copy", "acodec copy")):
+    if params and _audio_copy_may_drop_tracks(params):
         warnings.append({
             "id": "_warn_audio_copy",
-            "label": "Audio: multi-track will be dropped",
+            "label": "Audio: multi-track may be dropped",
             "type": "info",
             "description": (
-                "The default stream profile uses audio copy (-c copy) without mapping "
-                "all tracks. Multi-track audio from multiview will be silently dropped "
-                "-- players will only see one audio track. Fix: create a stream profile "
-                "that includes '-map 0' or '-map 0:a' and set it as the default."
+                "The default stream profile uses audio copy but does not clearly map "
+                "all audio tracks. Players may not see every multiview audio track. "
+                "Use '-map 0' in the default stream profile, or combine '-map 0:a' "
+                "with an appropriate video map such as '-map 0:v'."
             ),
         })
 
