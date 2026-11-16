@@ -66,14 +66,8 @@ def _get_settings() -> dict:
 
 
 def _save_settings(updates: dict):
-    from apps.plugins.models import PluginConfig
-    cfg = PluginConfig.objects.get(key="multiview")
-    for k, v in updates.items():
-        if v is None:
-            cfg.settings.pop(k, None)
-        else:
-            cfg.settings[k] = v
-    cfg.save()
+    from . import config
+    config.update_settings(updates)
 
 
 def _matches_wheel(fn: str, arch: str) -> bool:

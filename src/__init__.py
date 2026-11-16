@@ -209,14 +209,7 @@ class Plugin:
         """Regenerate fields from current DB settings on every request."""
         config_mod = _config()
         try:
-            from apps.plugins.models import PluginConfig
-            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
-            settings, changed2 = config_mod.reconcile_layout_count(settings)
-            settings, changed3 = config_mod.ensure_custom_layout_order(settings)
-            if changed1 or changed2 or changed3:
-                cfg.settings = settings
-                cfg.save()
+            settings = config_mod.load_settings()
         except Exception:
             settings, _changed = config_mod.ensure_layout_order({})
             settings, _changed = config_mod.reconcile_layout_count(settings)
@@ -261,14 +254,7 @@ class Plugin:
     def _generate_m3u(self) -> dict:
         config_mod = _config()
         try:
-            from apps.plugins.models import PluginConfig
-            cfg = PluginConfig.objects.get(key=PLUGIN_DB_KEY)
-            settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
-            settings, changed2 = config_mod.reconcile_layout_count(settings)
-            settings, changed3 = config_mod.ensure_custom_layout_order(settings)
-            if changed1 or changed2 or changed3:
-                cfg.settings = settings
-                cfg.save()
+            settings = config_mod.load_settings()
         except Exception:
             settings, _changed = config_mod.ensure_layout_order({})
             settings, _changed = config_mod.reconcile_layout_count(settings)
