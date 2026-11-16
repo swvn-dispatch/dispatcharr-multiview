@@ -94,7 +94,7 @@ After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create
 
 Selecting NVIDIA NVENC, Intel QSV, or Intel/AMD VAAPI automatically attempts GPU tile composition as well as GPU encoding. There is no extra setting. The worker validates the selected device and FFmpeg's required hardware filters at startup. If either is unavailable, it logs the reason and keeps the stream running with the CPU compositor.
 
-PyAV source decode, source reconnect handling, PTS scheduling, and audio processing remain on the CPU. A custom layout background image also uses the CPU compositor for now, so its letterbox padding remains correct. Check the worker log for `compositor=cuda`, `compositor=qsv`, `compositor=vaapi`, or a CPU fallback reason.
+With a hardware encoder selected, PyAV also attempts hardware source decoding when the device is supported. The log reports each tile's selected decode path, including a warning when hardware setup falls back to software. A successful hardware container open does not by itself verify that frames are being decoded on the GPU. Source reconnect handling, PTS scheduling, and audio processing remain on the CPU. A custom layout background image also uses the CPU compositor for now, so its letterbox padding remains correct. Check the worker log for `compositor=cuda`, `compositor=qsv`, `compositor=vaapi`, or a CPU fallback reason.
 
 4K output has four times the pixel workload of 1080p. In a four-tile grid, each tile receives a 1920×1080 region. Use capable hardware, hardware encoding/composition where available, and enough output bitrate for the source material.
 
