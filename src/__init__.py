@@ -31,18 +31,32 @@ def _load_submodule(name: str):
     producing KeyError or ModuleNotFoundError. Loading by file path sidesteps
     that lookup entirely.
     """
+    import importlib._bootstrap
     import importlib.util
     import sys
     full_name = f"{__name__}.{name}"
-    if full_name in sys.modules:
-        return sys.modules[full_name]
-    spec = importlib.util.spec_from_file_location(
-        full_name, os.path.join(_PLUGIN_DIR, f"{name}.py")
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[full_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    # Share importlib's per-name lock with ordinary imports and other copies of
+    # this package created by Dispatcharr reloads. Mark the spec as initializing
+    # so ordinary imports also wait instead of returning the published module.
+    with importlib._bootstrap._ModuleLockManager(full_name):
+        if full_name in sys.modules:
+            return sys.modules[full_name]
+        spec = importlib.util.spec_from_file_location(
+            full_name, os.path.join(_PLUGIN_DIR, f"{name}.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec._initializing = True
+        try:
+            sys.modules[full_name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except BaseException:
+                if sys.modules.get(full_name) is mod:
+                    del sys.modules[full_name]
+                raise
+        finally:
+            spec._initializing = False
+        return mod
 
 
 def _m3u_content(settings: dict, order: list) -> str:
