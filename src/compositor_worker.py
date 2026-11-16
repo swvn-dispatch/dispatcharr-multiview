@@ -349,7 +349,7 @@ def main():
     finally:
         stop.set()
         for c in channels:
-            c.running = False
+            c.stop()
         for fd in audio_w:
             try:
                 os.close(fd)

@@ -541,16 +541,17 @@ class MultiviewServer:
 
     def reconnect_channel(self, n: str, idx: int) -> bool:
         import json as _json
+        sent = False
         for proc, info in list(self._active_procs.items()):
             if info["n"] == n:
                 try:
                     cmd = _json.dumps({"cmd": "reconnect_channel", "idx": idx}).encode() + b"\n"
                     proc.stdin.write(cmd)
                     proc.stdin.flush()
-                    return True
+                    sent = True
                 except Exception:
                     pass
-        return False
+        return sent
 
     def _pump_stdout(self, proc, label: str, stderr_gl=None):
         end_reason = "worker output ended"
