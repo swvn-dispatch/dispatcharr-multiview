@@ -1,6 +1,8 @@
 """Regression coverage for automatic active-multiview reloads."""
 
 import unittest
+import json
+import http.client
 from io import BytesIO
 from unittest.mock import Mock, patch
 
@@ -146,29 +148,64 @@ class StreamLifecycleTests(unittest.TestCase):
 
 
 class PluginReloadActionTests(unittest.TestCase):
-    def test_action_reloads_all_active_workers(self):
-        running_server = Mock()
-        running_server.is_running.return_value = True
-        running_server.kill_active_streams.return_value = 2
-        server_module = Mock()
-        server_module.get_server.return_value = running_server
+    def test_action_uses_loopback_for_zero_or_multiple_workers(self):
+        for count in (0, 2):
+            with self.subTest(count=count), patch("src.http.client.HTTPConnection") as factory:
+                conn = factory.return_value
+                conn.getresponse.return_value.status = 200
+                conn.getresponse.return_value.read.return_value = json.dumps({"count": count}).encode()
+                result = Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {})
+                self.assertEqual(result["status"], "success")
+                self.assertIn(str(count), result["message"])
+                factory.assert_called_once_with("127.0.0.1", 9292, timeout=5)
+                conn.request.assert_called_once_with("POST", "/internal/reload", body=b"{}", headers={"Content-Type": "application/json"})
+                conn.close.assert_called_once()
 
-        with patch("src._server", return_value=server_module):
-            result = Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {})
+    def test_action_reports_transport_and_invalid_response_errors(self):
+        for status, body, error in ((200, b'{}', None), (200, b'{"count": true}', None),
+                                    (200, b'not json', None), (500, b'{}', None),
+                                    (200, b'{}', TimeoutError("timeout")),
+                                    (200, b'{}', http.client.HTTPException("bad response"))):
+            with self.subTest(status=status, body=body, error=error), patch("src.http.client.HTTPConnection") as factory:
+                conn = factory.return_value
+                conn.getresponse.return_value.status = status
+                conn.getresponse.return_value.read.return_value = body
+                conn.request.side_effect = error
+                result = Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {})
+                self.assertEqual(result["status"], "error")
+                conn.close.assert_called_once()
 
-        self.assertEqual(result["status"], "success")
-        self.assertIn("2", result["message"])
-        running_server.kill_active_streams.assert_called_once_with()
 
-    def test_action_is_safe_when_server_is_not_running(self):
-        server_module = Mock()
-        server_module.get_server.return_value = None
+class InternalReloadRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.server = server.MultiviewServer("127.0.0.1", 9292)
+        self.proc = Mock()
+        self.server._active_procs[self.proc] = {"n": "layout", "cfg": {}}
 
-        with patch("src._server", return_value=server_module):
-            result = Plugin.__new__(Plugin).run("reload_active_multiviews", {}, {})
+    def request(self, **overrides):
+        environ = {"PATH_INFO": "/internal/reload", "REMOTE_ADDR": "127.0.0.1",
+                   "REQUEST_METHOD": "POST", "CONTENT_TYPE": "application/json"}
+        environ.update(overrides)
+        start = Mock()
+        with patch.object(server, "_settings", return_value={"dash_enabled": "disabled"}):
+            body = b"".join(self.server.wsgi_app(environ, start))
+        return start.call_args.args[0], body
 
-        self.assertEqual(result["status"], "success")
-        self.assertIn("0", result["message"])
+    def test_route_reloads_with_dashboard_disabled(self):
+        status, body = self.request()
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(body), {"count": 1})
+        self.proc.kill.assert_called_once_with()
+
+    def test_route_rejects_remote_methods_and_browser_requests(self):
+        for overrides, expected in (({"REMOTE_ADDR": "192.0.2.1"}, "403"),
+                                    ({"REQUEST_METHOD": "GET"}, "405"),
+                                    ({"HTTP_ORIGIN": "https://example.com"}, "403"),
+                                    ({"CONTENT_TYPE": "text/plain"}, "403")):
+            with self.subTest(overrides=overrides):
+                status, _ = self.request(**overrides)
+                self.assertTrue(status.startswith(expected))
+                self.proc.kill.assert_not_called()
 
 
 if __name__ == "__main__":

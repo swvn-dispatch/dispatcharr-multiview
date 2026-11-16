@@ -6,6 +6,7 @@ number of channel inputs and either an auto-grid or featured arrangement.
 """
 
 import json
+import http.client
 import logging
 import os
 import socket
@@ -228,10 +229,21 @@ class Plugin:
         if action == "generate_m3u":
             return self._generate_m3u()
         if action == "reload_active_multiviews":
-            server = _server().get_server()
-            if server is None or not server.is_running():
-                return {"status": "success", "message": "No running multiview server found (0 streams reloaded)"}
-            count = server.kill_active_streams()
+            conn = http.client.HTTPConnection("127.0.0.1", DEFAULT_SERVER_PORT, timeout=5)
+            try:
+                conn.request("POST", "/internal/reload", body=b"{}",
+                             headers={"Content-Type": "application/json"})
+                response = conn.getresponse()
+                if response.status != 200:
+                    raise ValueError(f"server returned HTTP {response.status}")
+                data = json.loads(response.read(4097))
+                count = data["count"]
+                if type(count) is not int or count < 0:
+                    raise ValueError("invalid worker count")
+            except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as e:
+                return {"status": "error", "message": f"Could not reload active multiviews: {e}"}
+            finally:
+                conn.close()
             return {"status": "success", "message": f"Reloading {count} active multiview(s)"}
         if action == "install_pyav_amd64":
             return self._deps().install_pyav("linux-x86_64")
