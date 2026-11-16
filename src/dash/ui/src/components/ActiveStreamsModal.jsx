@@ -85,7 +85,10 @@ export function ActiveStreamsModal({ opened, onClose, settings }) {
                         loading={busy[`${n}-${idx}`]}
                         onClick={() =>
                           ask('Reconnect', `Reconnect ${chName}?`, 'Reconnect', 'blue', () =>
-                            withBusy(`${n}-${idx}`, () => reconnectChannel(n, idx), `${chName} reconnecting`),
+                            withBusy(`${n}-${idx}`, async () => {
+                              const result = await reconnectChannel(n, idx);
+                              if (!result.reconnected) throw new Error('No active worker received the reconnect request');
+                            }, `Reconnect requested for ${chName}`),
                           )
                         }
                       >

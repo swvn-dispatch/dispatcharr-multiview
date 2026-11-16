@@ -53,7 +53,6 @@ TILE_STALE_SECS = 1.5
 VIDEO_PTS_STALL_SECS = 10.0
 RECONNECT_BASE    = 2.0   # first retry delay (seconds)
 RECONNECT_MAX     = 60.0  # cap on per-retry delay
-RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
 AUDIO_RATE = 48000
 AUDIO_LAYOUT = "stereo"
 VIDEO_QUEUE_FRAMES = 120
@@ -197,7 +196,8 @@ class Channel:
         # clk_pts reset. Protected by self.alock (same as aframes/abuffered).
         self.last_taken_pts: "float | None" = None
         self.audio_resyncs = 0
-        self._reconnect_requested = False
+        self._reconnect_event = threading.Event()
+        self._reconnect_lock = threading.Lock()
         # A provider may change coded size, pixel format, cadence, or PTS epoch
         # without closing this HTTP child stream. Preserve the current tile
         # through that handoff and resume only from a decoded key frame.
@@ -264,8 +264,15 @@ class Channel:
             self.latest = fb
 
     def reconnect(self):
-        """Signal run() to drop and reconnect; checked inside the demux loop."""
-        self._reconnect_requested = True
+        """Interrupt backoff or request a reconnect inside the demux loop."""
+        with self._reconnect_lock:
+            self._reconnect_event.set()
+
+    def stop(self):
+        """Stop the decoder and wake it if it is waiting to retry."""
+        with self._reconnect_lock:
+            self.running = False
+            self._reconnect_event.set()
 
     def _begin_recovery(self, reason, retain_frame=True):
         """Reset timing state while preserving a valid tile through warm-up."""
@@ -314,12 +321,12 @@ class Channel:
     def run(self):
         failures = 0
         while self.running:
-            if self._reconnect_requested:
-                self._reconnect_requested = False
-                failures = 0
-            if failures >= RECONNECT_RETRIES:
-                log(f"channel {self.name}: giving up after {RECONNECT_RETRIES} failed retries")
-                break
+            with self._reconnect_lock:
+                if self._reconnect_event.is_set():
+                    self._reconnect_event.clear()
+                    failures = 0
+                if not self.running:
+                    break
             cont = None
             # Keep an already displayed image while a replacement connection
             # warms up. Initial startup has no frame to preserve.
@@ -357,7 +364,7 @@ class Channel:
                     res = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
                 try:
                     for packet in cont.demux(*streams):
-                        if not self.running or self._reconnect_requested:
+                        if not self.running or self._reconnect_event.is_set():
                             break
                         if packet.dts is None:
                             continue
@@ -468,10 +475,10 @@ class Channel:
                 failures = 0
             else:
                 failures += 1
-            if self.running and failures < RECONNECT_RETRIES:
-                delay = min(RECONNECT_BASE * (2 ** (failures - 1)), RECONNECT_MAX)
-                log(f"channel {self.name}: retry {failures}/{RECONNECT_RETRIES} in {delay:.0f}s")
-                time.sleep(delay)
+            if self.running:
+                delay = min(RECONNECT_BASE * (2 ** min(max(failures - 1, -1), 5)), RECONNECT_MAX)
+                log(f"channel {self.name}: retry after {failures} failures in {delay:.0f}s")
+                self._reconnect_event.wait(delay)
 
     def current_at(self, wall_time):
         """Return the newest decoded frame due at *wall_time* by source PTS."""
