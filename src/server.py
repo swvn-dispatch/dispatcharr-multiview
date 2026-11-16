@@ -252,6 +252,20 @@ class MultiviewServer:
         # Checked first, unconditionally, so a dash_path that happens to
         # collide with these reserved prefixes can't shadow the plugin's
         # actual streaming endpoints (see _normalized_dash_path's docstring).
+        if path == "/internal/reload":
+            if deny := self._loopback_only(loopback, start_response):
+                return deny
+            if environ.get("REQUEST_METHOD") != "POST":
+                start_response("405 Method Not Allowed", [("Content-Type", "text/plain"), ("Allow", "POST")])
+                return [b"Method Not Allowed\n"]
+            if environ.get("HTTP_ORIGIN") or environ.get("CONTENT_TYPE", "").split(";", 1)[0].strip().lower() != "application/json":
+                start_response("403 Forbidden", [("Content-Type", "text/plain")])
+                return [b"Forbidden\n"]
+            import json
+            body = json.dumps({"count": self.kill_active_streams()}).encode("utf-8")
+            start_response("200 OK", [("Content-Type", "application/json")])
+            return [body]
+
         if path.startswith("/stream/"):
             if deny := self._loopback_only(loopback, start_response):
                 return deny
