@@ -71,8 +71,9 @@ DECODE_OPTS = {
 }
 
 
-def log(msg):
-    sys.stderr.write(f"[mvworker] {msg}\n")
+def log(msg, level=None):
+    prefix = f"{level}: " if level else ""
+    sys.stderr.write(f"[mvworker] {prefix}{msg}\n")
     sys.stderr.flush()
 
 
@@ -161,6 +162,7 @@ class Channel:
         self.frame_reduction = FrameReduction(spec.get("output_fps", "30"))
         self.hwaccel = spec.get("hwaccel")
         self.hwaccel_device = spec.get("hwaccel_device")
+        self._reported_decode_mode = None
         self.valign = spec.get("valign", "center")
         self.halign = spec.get("halign", "center")
         self.tile_stale_secs = max(TILE_STALE_SECS, float(spec.get("tile_hold_secs", TILE_STALE_SECS)))
@@ -217,12 +219,19 @@ class Channel:
                 accel = HWAccel(self.hwaccel, device=self.hwaccel_device,
                                 allow_software_fallback=False)
                 cont = av.open(self.url, options=DECODE_OPTS, hwaccel=accel)
-                log(f"channel {self.name}: hardware decode={self.hwaccel}")
+                mode = f"hardware:{self.hwaccel}"
+                if self._reported_decode_mode != mode:
+                    log(f"channel {self.name}: opened container with hardware decode={self.hwaccel}", "INFO")
+                    self._reported_decode_mode = mode
                 return cont
             except Exception as e:  # noqa: BLE001
-                log(f"channel {self.name}: hardware decode unavailable ({e}); using software")
+                log(f"channel {self.name}: hardware decode={self.hwaccel} unavailable ({e}); using software", "WARNING")
                 self.hwaccel = None
-        return av.open(self.url, options=DECODE_OPTS)
+        cont = av.open(self.url, options=DECODE_OPTS)
+        if self._reported_decode_mode != "software":
+            log(f"channel {self.name}: opened container with software decode", "INFO")
+            self._reported_decode_mode = "software"
+        return cont
 
     def _make_fallback(self, logo):
         Y, U, V = black_planes(self.w, self.h)

@@ -602,7 +602,11 @@ class MultiviewServer:
                     message = f"{label}: {line}"
                     lower = line.lower()
                     traceback_active = traceback_active or "traceback" in lower or "exception in thread" in lower
-                    if traceback_active or any(marker in lower for marker in (
+                    if traceback_active or line.startswith("[mvworker] WARNING: "):
+                        logger.warning(message)
+                    elif line.startswith("[mvworker] INFO: "):
+                        logger.info(message)
+                    elif any(marker in lower for marker in (
                         "fatal", "traceback", "exception", " error", " failed", "giving up", " ended:",
                     )):
                         logger.warning(message)
