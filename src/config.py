@@ -22,6 +22,41 @@ def _load_plugin_config() -> dict:
 
 PLUGIN_CONFIG = _load_plugin_config()
 
+
+def load_settings():
+    """Normalize persisted settings while holding the shared database row lock."""
+    from django.db import transaction
+    from apps.plugins.models import PluginConfig
+
+    with transaction.atomic():
+        cfg = PluginConfig.objects.select_for_update().get(key="multiview")
+        settings, changed1 = ensure_layout_order(cfg.settings)
+        settings, changed2 = reconcile_layout_count(settings)
+        settings, changed3 = ensure_custom_layout_order(settings)
+        if changed1 or changed2 or changed3:
+            cfg.settings = settings
+            cfg.save(update_fields=["settings", "updated_at"])
+        return settings
+
+
+def update_settings(updates):
+    """Merge updates against the latest settings under the same row lock."""
+    from django.db import transaction
+    from apps.plugins.models import PluginConfig
+
+    with transaction.atomic():
+        cfg = PluginConfig.objects.select_for_update().get(key="multiview")
+        settings = dict(cfg.settings or {})
+        for key, value in updates.items():
+            if value is None:
+                settings.pop(key, None)
+            else:
+                settings[key] = value
+        if updates.get("multiview_order") is not None:
+            settings["multiview_count"] = len(settings["multiview_order"])
+        cfg.settings = settings
+        cfg.save(update_fields=["settings", "updated_at"])
+
 _ENCODER_OPTIONS = [
     {"value": "libx264",    "label": "Software (libx264)"},
     {"value": "h264_nvenc", "label": "NVIDIA NVENC (h264_nvenc)"},

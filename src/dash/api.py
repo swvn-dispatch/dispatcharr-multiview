@@ -70,39 +70,15 @@ def _verify_token(environ) -> bool:
 def _get_settings() -> dict:
     config_mod = _get_config_mod()
     try:
-        from apps.plugins.models import PluginConfig
-        cfg = PluginConfig.objects.get(key=_PLUGIN_KEY)
+        return config_mod.load_settings()
     except Exception:
         settings, _ = config_mod.ensure_layout_order({})
         settings, _ = config_mod.reconcile_layout_count(settings)
         settings, _ = config_mod.ensure_custom_layout_order(settings)
         return settings
 
-    settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
-    settings, changed2 = config_mod.reconcile_layout_count(settings)
-    settings, changed3 = config_mod.ensure_custom_layout_order(settings)
-    if changed1 or changed2 or changed3:
-        cfg.settings = settings
-        cfg.save()
-    return settings
-
-
 def _save_settings(updates: dict):
-    from apps.plugins.models import PluginConfig
-    cfg = PluginConfig.objects.get(key=_PLUGIN_KEY)
-    for k, v in updates.items():
-        if v is None:
-            cfg.settings.pop(k, None)
-        else:
-            cfg.settings[k] = v
-    # Keep the legacy multiview_count field (still authoritative for
-    # reconcile_layout_count, which detects native-settings-page edits) in
-    # sync whenever the dashboard itself changes multiview_order -- otherwise
-    # reconcile_layout_count treats the dashboard's own change as drift and
-    # deletes it back out on the very next settings read.
-    if updates.get("multiview_order") is not None:
-        cfg.settings["multiview_count"] = len(cfg.settings.get("multiview_order") or [])
-    cfg.save()
+    _get_config_mod().update_settings(updates)
     if updates.get("multiview_order") is not None:
         return _generate_m3u()
 
