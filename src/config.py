@@ -1136,7 +1136,32 @@ def build_plugin_fields(settings: dict, data_dir=None, *, dashboard=False) -> li
         layout_ch_opts = _build_layout_channel_options(layout_id, settings, ch_count, selector_type, regex_pattern)
         fields.extend(_build_multiview_block(layout_id, position, ch_count, selector_type, regex_pattern, epg_source_mode, layout_ch_opts, layout_style_options, dashboard=dashboard, channel_rows=settings.get(f"multiview_{layout_id}_channels", [])))
 
-    return fields
+    if dashboard:
+        return fields
+
+    # Section membership is explicit in Dispatcharr; visual order alone does not
+    # group fields. Keep the dashboard's existing projection unchanged.
+    section = None
+    grouped = []
+    for field in fields:
+        field = dict(field)
+        field_id = field.get("id", "")
+        if field_id == "_warnings_header":
+            section = field_id
+            field.update(label="Alerts", type="section", collapsed=False)
+            field.pop("description", None)
+        elif field_id in {"_global_settings_header", "_video_settings_header"}:
+            section = field_id
+            field.update(label="Global Settings" if field_id == "_global_settings_header" else "Video Settings", type="section", collapsed=False)
+            field.pop("description", None)
+        elif field_id.startswith("multiview_") and field_id.endswith("_header"):
+            section = "_" + field_id
+            field.update(id=section, label=field["label"].strip("─ "), type="section", collapsed=True)
+            field.pop("description", None)
+        elif section:
+            field["section"] = section
+        grouped.append(field)
+    return grouped
 
 
 # Default field list (1 layout, 4 channels) used as plugin.json fallback

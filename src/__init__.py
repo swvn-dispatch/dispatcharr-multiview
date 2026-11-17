@@ -233,10 +233,16 @@ class Plugin:
             if not arch:
                 return {"status": "error", "message": "PyAV is unavailable for this CPU architecture"}
             if params.get("automatic"):
-                return self._deps().maybe_auto_install(arch, context["data_dir"]) or {
-                    "status": "success", "message": "PyAV is current or automatic repair is not authorized"
-                }
-            return self._deps().install_pyav(arch, context["data_dir"])
+                result = self._deps().maybe_auto_install(arch, context["data_dir"])
+                if result is None:
+                    return {
+                        "status": "error", "message": "PyAV is current or automatic repair is not authorized"
+                    }
+            else:
+                result = self._deps().install_pyav(arch, context["data_dir"])
+            if result.get("status") == "success":
+                result = {**result, "_dispatcharr": {"refresh": "plugin"}}
+            return result
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 

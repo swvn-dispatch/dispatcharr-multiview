@@ -107,7 +107,7 @@ def install_pyav(arch: str, data_dir: str, *, automatic=False) -> dict:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 if automatic and not _get_settings().get(f"pyav_consent_{arch}"):
-                    return {"status": "success", "message": "Automatic PyAV installation is not authorized"}
+                    return {"status": "error", "message": "Automatic PyAV installation is not authorized"}
                 if pyav_status(arch, data_dir) != PYAV_VERSION:
                     url, fn, expected_digest = _find_wheel(arch)
                     with tempfile.TemporaryDirectory(prefix=".install-", dir=vendor) as tmp:

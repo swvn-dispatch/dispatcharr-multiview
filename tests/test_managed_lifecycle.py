@@ -112,7 +112,7 @@ class ManagedLifecycleTests(unittest.TestCase):
             result = self.plugin.run("install_pyav", {"automatic": True}, {"data_dir": "/durable"})
         deps.maybe_auto_install.assert_called_once_with("linux-aarch64", "/durable")
         deps.install_pyav.assert_not_called()
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "error")
 
     def test_manual_install_detects_architecture(self):
         deps = Mock()

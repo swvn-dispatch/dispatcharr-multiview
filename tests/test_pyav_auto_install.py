@@ -11,7 +11,7 @@ import unittest
 import zipfile
 from unittest.mock import patch
 
-from src import config, deps, server
+from src import Plugin, config, deps, server
 
 
 def wheel_bytes():
@@ -55,6 +55,38 @@ class PyavAutoInstallTests(unittest.TestCase):
             fields = config.build_plugin_fields({}, self.data_dir)
         self.assertIn("_warn_pyav_missing", [field["id"] for field in fields])
 
+    def test_action_requests_reload_only_after_successful_install(self):
+        instance = Plugin()
+        context = {"data_dir": self.data_dir}
+        for result, expected in [
+            ({"status": "success", "message": "installed"}, True),
+            ({"status": "error", "message": "failed"}, False),
+            ({"status": "partial", "message": "consent failed"}, False),
+        ]:
+            with self.subTest(result=result), patch.object(instance, "_deps", return_value=deps), \
+                 patch.object(deps, "detect_arch", return_value=self.arch), \
+                 patch.object(deps, "install_pyav", return_value=result):
+                response = instance.run("install_pyav", {}, context)
+                self.assertEqual(response.get("_dispatcharr") == {"refresh": "plugin"}, expected)
+
+    def test_automatic_noop_and_revoked_consent_do_not_reload(self):
+        instance = Plugin()
+        for result in (None, {"status": "error", "message": "Automatic PyAV installation is not authorized"}):
+            with self.subTest(result=result), patch.object(instance, "_deps", return_value=deps), \
+                 patch.object(deps, "detect_arch", return_value=self.arch), \
+                 patch.object(deps, "maybe_auto_install", return_value=result):
+                response = instance.run("install_pyav", {"automatic": True}, {"data_dir": self.data_dir})
+                self.assertEqual(response["status"], "error")
+                self.assertNotIn("_dispatcharr", response)
+
+    def test_successful_automatic_repair_requests_reload(self):
+        instance = Plugin()
+        with patch.object(instance, "_deps", return_value=deps), \
+             patch.object(deps, "detect_arch", return_value=self.arch), \
+             patch.object(deps, "maybe_auto_install", return_value={"status": "success"}):
+            response = instance.run("install_pyav", {"automatic": True}, {"data_dir": self.data_dir})
+        self.assertEqual(response["_dispatcharr"], {"refresh": "plugin"})
+
     @patch.object(deps, "_save_settings")
     @patch.object(deps, "_find_wheel", return_value=wheel_info())
     def test_install_is_published_in_durable_directory(self, find, save):
@@ -85,7 +117,7 @@ class PyavAutoInstallTests(unittest.TestCase):
     @patch.object(deps, "_get_settings", return_value={})
     def test_automatic_install_rechecks_consent_under_lock(self, settings, find):
         result = deps.install_pyav(self.arch, self.data_dir, automatic=True)
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "error")
         self.assertIn("not authorized", result["message"])
         find.assert_not_called()
 
