@@ -11,6 +11,7 @@ import logging
 import os
 import socket
 import threading
+from contextlib import closing
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,9 @@ class Plugin:
         if existing and existing.is_running():
             return
         try:
-            with socket.create_connection(("127.0.0.1", DEFAULT_SERVER_PORT), timeout=0.5):
+            with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+                sock.settimeout(0.5)
+                sock.connect(("127.0.0.1", DEFAULT_SERVER_PORT))
                 return
         except OSError:
             pass
