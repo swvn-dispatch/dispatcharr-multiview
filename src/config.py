@@ -765,7 +765,7 @@ def _build_warnings_fields(settings: dict, data_dir=None) -> list:
         "id": "_warnings_header",
         "label": "── Warnings ──────────────────────────",
         "type": "info",
-        "description": "Use the refresh button (top-right) or restart Dispatcharr to re-check warnings.",
+        "description": "Reload the plugin to re-check warnings.",
     }] + warnings
 
 

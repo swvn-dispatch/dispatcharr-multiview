@@ -209,6 +209,8 @@ class Plugin:
     # Action dispatcher
 
     def run(self, action: str, params: dict, context: dict):
+        if action == "refresh_ui":
+            return {"status": "success", "message": "Refreshing plugin settings", "_dispatcharr": {"refresh": "ui"}}
         if action == "generate_m3u":
             return self._generate_m3u(context, params)
         if action == "reload_active_multiviews":
