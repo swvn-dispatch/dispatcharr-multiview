@@ -3,17 +3,19 @@
 Dispatcharr caps plugin import size (DISPATCHARR_PLUGIN_IMPORT_MAX_BYTES, default
 200MB) and one PyAV wheel per arch is ~114MB, so we do NOT ship PyAV in the plugin
 zip. Instead the plugin exposes "Install PyAV" actions that fetch the matching
-wheel from PyPI at runtime and unpack it under vendor/<arch>/, where
+wheel from PyPI at runtime and unpack it under data_dir/vendor/<arch>/<version>/, where
 compositor_worker.py loads it.
 
 No pip is required (the container has none): we use the PyPI JSON API + urllib.
 """
 
 import json
+import fcntl
+import hashlib
 import logging
 import os
 import platform
-import shutil
+import secrets
 import tempfile
 import urllib.request
 import zipfile
@@ -22,9 +24,6 @@ logger = logging.getLogger(__name__)
 
 PYAV_VERSION = "18.1.0"
 PY_TAG = "cp313"
-
-_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-VENDOR_DIR = os.path.join(_PLUGIN_DIR, "vendor")
 
 # vendor subdir -> machine aliases + the manylinux wheel arch token
 ARCHES = {
@@ -42,19 +41,19 @@ def detect_arch() -> "str | None":
     return None
 
 
-def arch_dir(arch: str) -> str:
-    return os.path.join(VENDOR_DIR, arch)
+def arch_dir(arch: str, data_dir: str) -> str:
+    return os.path.join(data_dir, "vendor", arch, PYAV_VERSION)
 
 
-def pyav_status(arch: str) -> "str | None":
-    """Installed PyAV version string under vendor/<arch>, or None if absent."""
-    d = arch_dir(arch)
-    if not os.path.isdir(d):
+def pyav_status(arch: str, data_dir: str) -> "str | None":
+    """Return the required installed PyAV version, or None if absent."""
+    d = arch_dir(arch, data_dir)
+    if not os.path.isdir(os.path.join(d, "av")):
         return None
     for name in os.listdir(d):
         if name.startswith("av-") and name.endswith(".dist-info"):
             return name[len("av-"):-len(".dist-info")]
-    return "installed" if os.path.isdir(os.path.join(d, "av")) else None
+    return "installed"
 
 
 def _get_settings() -> dict:
@@ -81,93 +80,99 @@ def _matches_wheel(fn: str, arch: str) -> bool:
 
 
 def _find_wheel(arch: str):
-    """Return (url, filename) of the compatible manylinux wheel for *arch*."""
+    """Return the URL, filename and SHA-256 of a compatible PyPI wheel."""
     api = f"https://pypi.org/pypi/av/{PYAV_VERSION}/json"
     with urllib.request.urlopen(api, timeout=30) as r:
         data = json.load(r)
     for f in data.get("urls", []):
         fn = f.get("filename", "")
-        if _matches_wheel(fn, arch):
-            return f["url"], fn
+        digest = f.get("digests", {}).get("sha256", "")
+        if _matches_wheel(fn, arch) and os.path.basename(fn) == fn and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            return f["url"], fn, digest
     raise RuntimeError(
-        f"no {PY_TAG} manylinux {info['token']} wheel in av {PYAV_VERSION} on PyPI")
+        f"no {PY_TAG} manylinux {ARCHES[arch]['token']} wheel in av {PYAV_VERSION} on PyPI")
 
 
-def install_pyav(arch: str) -> dict:
-    """Download + unpack the PyAV wheel for `arch` into vendor/<arch>/."""
+def install_pyav(arch: str, data_dir: str, *, automatic=False) -> dict:
+    """Stage and publish the required PyAV wheel in durable plugin data."""
     if arch not in ARCHES:
         return {"status": "error", "message": f"Unsupported arch: {arch!r}"}
+    vendor = os.path.join(data_dir, "vendor")
+    dest = arch_dir(arch, data_dir)
     try:
-        url, fn = _find_wheel(arch)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"multiview: PyAV wheel lookup failed: {e}")
-        return {"status": "error", "message": f"Could not find PyAV wheel: {e}"}
-
-    tmp = tempfile.mkdtemp(prefix="mv-pyav-")
-    try:
-        whl = os.path.join(tmp, fn)
-        logger.info(f"multiview: downloading {fn} for {arch}...")
-        urllib.request.urlretrieve(url, whl)
-        dest = arch_dir(arch)
-        shutil.rmtree(dest, ignore_errors=True)
-        os.makedirs(dest, exist_ok=True)
-        with zipfile.ZipFile(whl) as z:
-            z.extractall(dest)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(os.path.join(vendor, f".{arch}.lock"), "a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                if automatic and not _get_settings().get(f"pyav_consent_{arch}"):
+                    return {"status": "success", "message": "Automatic PyAV installation is not authorized"}
+                if pyav_status(arch, data_dir) != PYAV_VERSION:
+                    url, fn, expected_digest = _find_wheel(arch)
+                    with tempfile.TemporaryDirectory(prefix=".install-", dir=vendor) as tmp:
+                        whl = os.path.join(tmp, fn)
+                        logger.info("multiview: downloading %s for %s", fn, arch)
+                        with urllib.request.urlopen(url, timeout=30) as response, open(whl, "wb") as output:
+                            digest = hashlib.sha256()
+                            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                                output.write(chunk)
+                        if digest.hexdigest() != expected_digest:
+                            raise ValueError("Downloaded PyAV wheel failed SHA-256 verification")
+                        staged = os.path.join(tmp, "staged")
+                        os.makedirs(staged)
+                        with zipfile.ZipFile(whl) as wheel:
+                            wheel.extractall(staged)
+                        if not os.path.isdir(os.path.join(staged, "av")) or not os.path.isdir(os.path.join(staged, f"av-{PYAV_VERSION}.dist-info")):
+                            raise ValueError("Downloaded wheel is missing PyAV or its version metadata")
+                        previous = None
+                        if os.path.lexists(dest):
+                            previous = os.path.join(vendor, f".{arch}-incomplete-{secrets.token_hex(16)}")
+                            os.rename(dest, previous)
+                        try:
+                            os.rename(staged, dest)
+                        except Exception:
+                            if previous:
+                                os.rename(previous, dest)
+                            raise
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     except PermissionError as e:
         logger.error(f"multiview: PyAV install permission error: {e}")
         return {"status": "error", "message": (
-            f"Install failed (permission denied writing {VENDOR_DIR}). The plugin "
-            f"directory must be writable by the Dispatcharr user. Details: {e}")}
+            f"Install failed (permission denied writing {vendor}). Details: {e}")}
     except Exception as e:  # noqa: BLE001
         logger.error(f"multiview: PyAV install failed: {e}", exc_info=True)
         return {"status": "error", "message": f"Install failed: {e}"}
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    ver = pyav_status(arch) or PYAV_VERSION
+    ver = pyav_status(arch, data_dir) or PYAV_VERSION
     msg = f"PyAV {ver} installed for {arch}."
     logger.info(f"multiview: {msg}")
     try:
         _save_settings({f"pyav_consent_{arch}": True, "pyav_auto_install_error": None})
     except Exception as e:  # noqa: BLE001
         logger.warning(f"multiview: could not record PyAV consent: {e}")
+        return {"status": "partial", "message": f"{msg} Could not save automatic repair consent: {e}"}
     return {"status": "success", "message": msg}
 
 
-def maybe_auto_install(arch: "str | None" = None) -> "dict | None":
+def maybe_auto_install(arch: str, data_dir: str) -> "dict | None":
     """If the user has previously consented (a prior successful 'Install
     PyAV' run for this arch) and the vendored copy is now missing or
     doesn't match the pinned PYAV_VERSION (e.g. reset by a plugin update),
     reinstall it automatically. No-op if consent was never given, or the
     install is already current. Returns the install result dict, or None
     if nothing needed to be done."""
-    arch = arch or detect_arch()
     if not arch:
         return None
     settings = _get_settings()
     if not settings.get(f"pyav_consent_{arch}"):
         return None
-    if pyav_status(arch) == PYAV_VERSION:
+    if pyav_status(arch, data_dir) == PYAV_VERSION:
         return None
 
-    lockpath = os.path.join(VENDOR_DIR, f".autoinstall_{arch}.lock")
-    os.makedirs(VENDOR_DIR, exist_ok=True)
-    try:
-        with open(lockpath, "x"):
-            pass
-    except FileExistsError:
-        return None  # another worker is already handling this
-    try:
-        logger.info(f"multiview: auto-reinstalling PyAV for {arch} (consent on file)")
-        result = install_pyav(arch)
-        if result.get("status") != "success":
-            try:
-                _save_settings({"pyav_auto_install_error": result.get("message", "unknown error")})
-            except Exception:
-                pass
-        return result
-    finally:
+    result = install_pyav(arch, data_dir, automatic=True)
+    if result.get("status") != "success":
         try:
-            os.remove(lockpath)
-        except OSError:
+            _save_settings({"pyav_auto_install_error": result.get("message", "unknown error")})
+        except Exception:
             pass
+    return result

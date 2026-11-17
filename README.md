@@ -10,7 +10,7 @@ This project is maintained in my spare time. If it's saved you some headaches, a
 
 ---
 
-> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. It is a one-time step per host and takes about 30 seconds. Streams return a 503 until it completes. After that first run, the plugin remembers your consent and automatically reinstalls PyAV in the background if it's ever found missing or outdated (e.g. after a plugin update resets the vendored copy) -- no need to click it again.
+> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. Streams return a 503 until installation completes. PyAV is stored in durable plugin data. After the first successful install, the plugin remembers your consent and checks for the required version in the background at startup. Previously installed versions are retained when the required version changes.
 
 ---
 
@@ -42,7 +42,7 @@ npm run dev
 
 Each `/stream/{n}` request spawns a dedicated Python worker process with no gevent overhead, giving the compositor real OS threads and full CPU parallelism:
 
-- Each source channel is decoded in its own thread using PyAV (bundled). Frames are scaled and selected against a source-PTS clock at the configured output frame rate.
+- Each source channel is decoded in its own thread using PyAV. Frames are scaled and selected against a source-PTS clock at the configured output frame rate.
 - Software profiles composite tile frames onto a numpy YUV420p canvas. Hardware profiles automatically use matching FFmpeg CUDA, QSV, or VAAPI composition filters when available, then encode CBR MPEG-TS for the plugin's gevent server to stream.
 - Source channels are fetched through Dispatcharr's internal live proxy so they appear in stream stats and respect stream profiles.
 - A per-channel PTS rate limiter ensures playback stays at realtime regardless of how fast the host machine or source proxy delivers packets. Audio is aligned to the video PTS clock at startup and the audio buffer is flushed on reconnect to keep lip-sync stable.
