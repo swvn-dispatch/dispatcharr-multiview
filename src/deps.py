@@ -153,8 +153,8 @@ def maybe_auto_install(arch: "str | None" = None) -> "dict | None":
     lockpath = os.path.join(VENDOR_DIR, f".autoinstall_{arch}.lock")
     os.makedirs(VENDOR_DIR, exist_ok=True)
     try:
-        fd = os.open(lockpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
+        with open(lockpath, "x"):
+            pass
     except FileExistsError:
         return None  # another worker is already handling this
     try:
