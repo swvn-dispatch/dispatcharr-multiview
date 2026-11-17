@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_BACKGROUNDS_DIR = os.path.join(_PLUGIN_DIR, "style_backgrounds")
 _MAX_BACKGROUND_BYTES = 5 * 1024 * 1024
 _PLUGIN_KEY = "multiview"
 
@@ -84,12 +83,11 @@ def _save_settings(updates: dict):
 
 
 def _generate_m3u():
-    import sys
-
-    for mod in sys.modules.values():
-        if getattr(mod, "PLUGIN_DB_KEY", None) == _PLUGIN_KEY and hasattr(mod, "Plugin"):
-            return mod.Plugin.__new__(mod.Plugin)._generate_m3u()
-    raise RuntimeError("Plugin module not found")
+    server = globals().get("_server")
+    if server is None or server.dispatch_task is None:
+        raise RuntimeError("Managed Multiview service is not available")
+    server.dispatch_task("generate_m3u", {})
+    return {"status": "success", "message": "M3U and EPG refresh queued"}
 
 
 # ------------------------------------------------------------------
@@ -451,7 +449,7 @@ def handle_style_background(environ, start_response):
         filename = style.get("background_image") if style else None
         if not filename:
             return _json_error(start_response, "404 Not Found", "No background image set")
-        path = os.path.join(_BACKGROUNDS_DIR, filename)
+        path = os.path.join(_server.data_dir, "style_backgrounds", filename)
         if not os.path.isfile(path):
             return _json_error(start_response, "404 Not Found", "Background image file missing")
         try:
@@ -486,8 +484,9 @@ def handle_style_background(environ, start_response):
 
         stored_name = f"{style_id}_{_sanitize_filename(filename)}"
         try:
-            os.makedirs(_BACKGROUNDS_DIR, exist_ok=True)
-            with open(os.path.join(_BACKGROUNDS_DIR, stored_name), "wb") as f:
+            backgrounds_dir = os.path.join(_server.data_dir, "style_backgrounds")
+            os.makedirs(backgrounds_dir, exist_ok=True)
+            with open(os.path.join(backgrounds_dir, stored_name), "wb") as f:
                 f.write(raw)
         except OSError as e:
             return _json_error(start_response, "500 Internal Server Error", f"Failed to save image: {e}")

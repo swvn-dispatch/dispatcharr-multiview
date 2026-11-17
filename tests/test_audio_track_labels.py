@@ -21,7 +21,7 @@ class AudioTrackLabelFieldTests(unittest.TestCase):
 
 class AudioTrackLabelWorkerConfigTests(unittest.TestCase):
     def setUp(self):
-        self.server = server.MultiviewServer("127.0.0.1", 9292)
+        self.server = server.MultiviewServer("127.0.0.1", 9292, "/unused")
         self.tiles = [
             {"id": 1, "name": "CA | TSN One"},
             {"id": 2, "name": "CA | TSN Two"},

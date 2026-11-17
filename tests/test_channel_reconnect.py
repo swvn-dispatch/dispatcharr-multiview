@@ -114,7 +114,7 @@ class ChannelRetryTests(unittest.TestCase):
 
 class ServerReconnectTests(unittest.TestCase):
     def test_sends_to_all_matching_workers_despite_broken_pipe(self):
-        instance = server.MultiviewServer("127.0.0.1", 9292)
+        instance = server.MultiviewServer("127.0.0.1", 9292, "/unused")
         broken, good, other = Mock(), Mock(), Mock()
         broken.stdin.write.side_effect = BrokenPipeError()
         instance._active_procs = {broken: {"n": "a"}, good: {"n": "a"}, other: {"n": "b"}}
@@ -170,7 +170,7 @@ class DecodeLoggingTests(unittest.TestCase):
         log.assert_called_once_with("channel test: opened container with software decode", "INFO")
 
     def test_stderr_routes_explicit_levels_and_preserves_tracebacks(self):
-        instance = server.MultiviewServer("127.0.0.1", 9292)
+        instance = server.MultiviewServer("127.0.0.1", 9292, "/unused")
         proc = Mock(stderr=BytesIO(
             b"[mvworker] INFO: channel failed channel: hardware open\n"
             b"[mvworker] WARNING: fallback without marker\n"
