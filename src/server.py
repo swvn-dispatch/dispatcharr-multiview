@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-import socket
 import sys
 
 from . import config as _mvconfig
@@ -50,7 +49,6 @@ def _parse_resolution(settings: dict) -> tuple:
 
 CHUNK_SIZE = 65536
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compositor_worker.py")
-_BACKGROUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "style_backgrounds")
 
 _server_instance = None
 _dash_api = None
@@ -200,11 +198,12 @@ def _channel_logo(ch) -> "str | None":
 
 
 class MultiviewServer:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, data_dir: str, dispatch_task=None):
         self.host = host
         self.port = port
+        self.data_dir = data_dir
+        self.dispatch_task = dispatch_task
         self._server = None
-        self._greenlet = None
         self.running = False
         self._active_procs: dict = {}  # proc -> layout_n
 
@@ -383,7 +382,7 @@ class MultiviewServer:
             style = custom_registry.get(layout[len("custom:"):]) or {}
             bg_filename = style.get("background_image")
             if bg_filename:
-                bg_path = os.path.join(_BACKGROUNDS_DIR, bg_filename)
+                bg_path = os.path.join(self.data_dir, "style_backgrounds", bg_filename)
                 if os.path.isfile(bg_path):
                     background = bg_path
 
@@ -724,56 +723,48 @@ class MultiviewServer:
 
     # ------------------------------------------------------------- lifecycle
 
-    def start(self) -> bool:
-        if self.running:
-            logger.warning("Multiview server is already running")
-            return False
+    def serve(self, stop_event, on_ready=None, on_tick=None):
+        """Run the listener in a host-managed service thread until stopped."""
+        import gevent
+        from gevent import pywsgi
 
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, self.port))
-            sock.close()
-        except OSError as e:
-            logger.info(f"Multiview: port {self.port} already taken, skipping ({e})")
-            return False
+            for attempt in range(5):
+                if stop_event.is_set():
+                    return
+                self._server = pywsgi.WSGIServer((self.host, self.port), self.wsgi_app, log=None)
+                try:
+                    self._server.start()
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    gevent.sleep(0.25)
 
-        try:
-            from gevent import pywsgi
-            import gevent as _gevent
-        except ImportError:
-            logger.error("gevent is not installed; cannot start multiview server")
-            return False
-
-        def _run():
-            try:
-                self._server = pywsgi.WSGIServer(
-                    (self.host, self.port), self.wsgi_app, log=None,
-                )
-                self.running = True
-                set_server(self)
-                self._server.serve_forever()
-            except OSError as e:
-                # EADDRINUSE here means a concurrent worker won the race between
-                # our test-bind above and this re-bind -- expected on multi-worker
-                # startup, not an error.
-                logger.info(f"Multiview: port {self.port} taken by concurrent worker ({e})")
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Multiview server crashed: {e}", exc_info=True)
-            finally:
-                self.running = False
-
-        self._greenlet = _gevent.spawn(_run)
-        return True
+            if stop_event.is_set():
+                return
+            self.running = True
+            set_server(self)
+            if on_ready:
+                on_ready()
+            while not stop_event.is_set():
+                if on_tick:
+                    on_tick()
+                gevent.sleep(0.25)
+        finally:
+            self.stop()
+            _close_db_connections()
 
     def stop(self):
+        self.kill_active_streams()
         if self._server:
             try:
                 self._server.stop()
             except Exception:
                 pass
         self.running = False
-        set_server(None)
+        if get_server() is self:
+            set_server(None)
         logger.info("Multiview server stopped")
 
     def is_running(self) -> bool:

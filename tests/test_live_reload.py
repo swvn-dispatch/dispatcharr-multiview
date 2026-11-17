@@ -29,7 +29,7 @@ class LiveReloadFieldTests(unittest.TestCase):
         self.assertEqual(server.TILE_HOLD_SECONDS, 15)
 
     def test_worker_config_uses_live_edge_child_urls(self):
-        cfg = server.MultiviewServer("127.0.0.1", 9292)._worker_config(
+        cfg = server.MultiviewServer("127.0.0.1", 9292, "/unused")._worker_config(
             [{"id": 1, "name": "One", "logo": None}, {"id": 2, "name": "Two", "logo": None}],
             "auto", "0", {},
         )
@@ -46,7 +46,7 @@ class LiveReloadFieldTests(unittest.TestCase):
 
 class ActiveWorkerReloadTests(unittest.TestCase):
     def setUp(self):
-        self.server = server.MultiviewServer("127.0.0.1", 9292)
+        self.server = server.MultiviewServer("127.0.0.1", 9292, "/unused")
         self.proc = Mock()
         self.server._active_procs[self.proc] = {"n": "layout", "cfg": {"tiles": [{"url": "old"}]}}
 
@@ -165,7 +165,7 @@ class ActiveWorkerReloadTests(unittest.TestCase):
 
 class StreamLifecycleTests(unittest.TestCase):
     def setUp(self):
-        self.server = server.MultiviewServer("127.0.0.1", 9292)
+        self.server = server.MultiviewServer("127.0.0.1", 9292, "/unused")
         self.proc = Mock()
         self.proc.stdout = BytesIO(b"transport-stream")
         self.proc.poll.return_value = None
@@ -218,7 +218,7 @@ class PluginReloadActionTests(unittest.TestCase):
 
 class InternalReloadRouteTests(unittest.TestCase):
     def setUp(self):
-        self.server = server.MultiviewServer("127.0.0.1", 9292)
+        self.server = server.MultiviewServer("127.0.0.1", 9292, "/unused")
         self.proc = Mock()
         self.server._active_procs[self.proc] = {"n": "layout", "cfg": {}}
 

@@ -8,6 +8,13 @@ import src
 
 
 class ManifestActionTests(unittest.TestCase):
+    def test_manifest_declares_v2_and_required_managed_capabilities(self):
+        manifest_path = Path(__file__).resolve().parents[1] / "src" / "plugin.json"
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest["manifest_version"], 2)
+        self.assertEqual(manifest["min_dispatcharr_version"], "v0.34.0")
+        self.assertTrue({"background_tasks", "persistent_service", "network_listener"}.issubset(manifest["capabilities"]))
+
     def test_manifest_actions_are_plugin_actions(self):
         manifest_path = Path(__file__).resolve().parents[1] / "src" / "plugin.json"
         manifest = json.loads(manifest_path.read_text())
