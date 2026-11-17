@@ -27,6 +27,7 @@ from contextvars import copy_context
 from . import config as _mvconfig
 from . import dispatcharr as _dispatcharr
 from . import layouts as _layouts
+from . import storage as _storage
 from .parameters import resolve_preset
 from .regex_order import regex_sort_key
 
@@ -198,6 +199,7 @@ class MultiviewServer:
         self.host = host
         self.port = port
         self.data_dir = data_dir
+        self.storage = _storage
         self.dispatch_task = dispatch_task
         self._service_context = None
         self._server = None
@@ -402,9 +404,12 @@ class MultiviewServer:
             style = custom_registry.get(layout[len("custom:"):]) or {}
             bg_filename = style.get("background_image")
             if bg_filename:
-                bg_path = os.path.join(self.data_dir, "style_backgrounds", bg_filename)
-                if os.path.isfile(bg_path):
-                    background = bg_path
+                try:
+                    bg_path = self.storage.background_path(self.data_dir, bg_filename)
+                    if os.path.isfile(bg_path):
+                        background = bg_path
+                except (ValueError, TypeError):
+                    logger.warning("Ignoring invalid custom background path")
 
         # Which tiles contribute an audio track, and their language codes.
         if audio_source == "all":

@@ -73,7 +73,7 @@ class LegacyMigrationTests(unittest.TestCase):
         destination = self.data / "style_backgrounds" / "image.png"
         destination.parent.mkdir(parents=True)
         destination.symlink_to(self.root / "outside")
-        with self.assertRaises(OSError):
+        with self.assertRaises((OSError, ValueError)):
             migrate_backgrounds(settings, self.code, self.data)
 
     def test_failed_copy_preserves_source_and_does_not_publish_partial_file(self):
