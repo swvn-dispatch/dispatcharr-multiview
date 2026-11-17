@@ -21,9 +21,14 @@ class ManifestActionTests(unittest.TestCase):
         self.assertEqual(src.Plugin.actions, manifest["actions"])
         self.assertEqual(
             {action["id"] for action in manifest["actions"]},
-            {"generate_m3u", "reload_active_multiviews", "install_pyav"},
+            {"refresh_ui", "generate_m3u", "reload_active_multiviews", "install_pyav"},
         )
-        self.assertEqual(len(manifest["actions"]), 3)
+        self.assertEqual(len(manifest["actions"]), 4)
+
+    def test_refresh_ui_action_requests_ui_refresh_only(self):
+        result = src.Plugin().run("refresh_ui", {}, {})
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_dispatcharr"], {"refresh": "ui"})
 
 
 if __name__ == "__main__":

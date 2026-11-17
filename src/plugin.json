@@ -21,6 +21,14 @@
 
   "actions": [
     {
+      "id": "refresh_ui",
+      "label": "Refresh Settings",
+      "description": "Refresh the displayed plugin settings without restarting the plugin or active streams.",
+      "button_label": "Refresh Settings",
+      "button_variant": "filled",
+      "button_color": "blue"
+    },
+    {
       "id": "generate_m3u",
       "label": "Regenerate M3U & EPG",
       "description": "Write multiview.m3u and multiview_epg.xml, then refresh the M3U account and EPG source in Dispatcharr",
