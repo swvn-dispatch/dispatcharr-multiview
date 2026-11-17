@@ -447,12 +447,29 @@ class MultiviewServer:
         import gevent
 
         while proc in self._active_procs:
-            interval = _live_reload_interval_secs(_settings())
-            if interval is None:
+            try:
+                interval = _live_reload_interval_secs(_settings())
+            finally:
+                _close_db_connections()
+            if proc not in self._active_procs:
                 return
+            if interval is None:
+                # Keep watching so enabling automatic reload affects active workers.
+                self._active_procs[proc].pop("pending_reload_signature", None)
+                gevent.sleep(15)
+                continue
             gevent.sleep(interval)
             if proc not in self._active_procs:
                 return
+            try:
+                current_interval = _live_reload_interval_secs(_settings())
+            finally:
+                _close_db_connections()
+            if proc not in self._active_procs:
+                return
+            if current_interval != interval:
+                self._active_procs[proc].pop("pending_reload_signature", None)
+                continue
             if self._check_live_reload(proc, layout_id):
                 return
 
