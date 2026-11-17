@@ -519,7 +519,7 @@ def handle_fields(environ, start_response):
         import re
         settings = _get_settings()
         config_mod = _get_config_mod()
-        all_fields = config_mod.build_plugin_fields(settings)
+        all_fields = config_mod.build_plugin_fields(settings, _server.data_dir)
         order = settings.get("multiview_order", [])
 
         layout_re = re.compile(r"^multiview_([0-9a-f]{8})_")

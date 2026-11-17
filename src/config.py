@@ -539,7 +539,7 @@ def _audio_copy_may_drop_tracks(params: str) -> bool:
     return not complete_map or "-an" in tokens or any(value.startswith("-") for value in maps)
 
 
-def _build_warnings_fields(settings: dict) -> list:
+def _build_warnings_fields(settings: dict, data_dir=None) -> list:
     """Return warning info fields for the settings page. Empty list = no warnings = section hidden."""
     warnings = []
 
@@ -553,7 +553,7 @@ def _build_warnings_fields(settings: dict) -> list:
                 "description": (f"Unsupported CPU architecture ({_platform.machine()}); "
                                 f"PyAV is unavailable, streaming will not work."),
             })
-        elif not _deps.pyav_status(arch):
+        elif data_dir is not None and not _deps.pyav_status(arch, data_dir):
             if settings.get(f"pyav_consent_{arch}"):
                 desc = (
                     f"PyAV is not currently installed for {arch}. Since you've "
@@ -948,7 +948,7 @@ _VIDEO_SETTINGS_HEADER = {
 }
 
 
-def build_plugin_fields(settings: dict) -> list:
+def build_plugin_fields(settings: dict, data_dir=None) -> list:
     """Build the full field list based on current settings.
 
     Callers must run `ensure_layout_order()` on *settings* (and persist it if
@@ -971,7 +971,7 @@ def build_plugin_fields(settings: dict) -> list:
     count_field = dict(_MULTIVIEW_COUNT_FIELD)
     count_field["default"] = len(order)
 
-    fields = _build_warnings_fields(settings)
+    fields = _build_warnings_fields(settings, data_dir)
     fields.append(_GLOBAL_SETTINGS_HEADER)
     fields.extend(_GLOBAL_SETTINGS_FIELDS)
     fields.append(count_field)

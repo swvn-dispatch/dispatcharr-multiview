@@ -1,90 +1,159 @@
-"""Consent and locking tests for background PyAV repair."""
+"""Consent, durability and locking tests for PyAV installation."""
 
+import io
+import hashlib
 import os
 import tempfile
 import threading
+import sys
+import types
 import unittest
+import zipfile
 from unittest.mock import patch
 
-from src import deps
+from src import config, deps, server
+
+
+def wheel_bytes():
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr(zipfile.ZipInfo("av/__init__.py"), "")
+        archive.writestr(zipfile.ZipInfo(f"av-{deps.PYAV_VERSION}.dist-info/METADATA"), "")
+    return output.getvalue()
+
+
+def wheel_info():
+    return "https://example.test/wheel", "wheel.whl", hashlib.sha256(wheel_bytes()).hexdigest()
 
 
 class PyavAutoInstallTests(unittest.TestCase):
     def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tempdir.cleanup)
-        self.vendor = patch.object(deps, "VENDOR_DIR", self.tempdir.name)
-        self.vendor.start()
-        self.addCleanup(self.vendor.stop)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.data_dir = self.directory.name
         self.arch = "linux-x86_64"
-        self.lock = os.path.join(self.tempdir.name, f".autoinstall_{self.arch}.lock")
 
     @patch.object(deps, "install_pyav")
     @patch.object(deps, "_get_settings", return_value={})
     def test_no_consent_does_not_install(self, settings, install):
-        self.assertIsNone(deps.maybe_auto_install(self.arch))
+        self.assertIsNone(deps.maybe_auto_install(self.arch, self.data_dir))
         install.assert_not_called()
-        self.assertFalse(os.path.exists(self.lock))
 
-    @patch.object(deps, "install_pyav")
-    @patch.object(deps, "pyav_status", return_value=deps.PYAV_VERSION)
-    @patch.object(deps, "_get_settings", return_value={"pyav_consent_linux-x86_64": True})
-    def test_current_install_does_not_lock_or_install(self, settings, status, install):
-        self.assertIsNone(deps.maybe_auto_install(self.arch))
-        install.assert_not_called()
-        self.assertFalse(os.path.exists(self.lock))
-
-    @patch.object(deps, "install_pyav")
-    @patch.object(deps, "pyav_status", return_value=None)
-    @patch.object(deps, "_get_settings", return_value={"pyav_consent_linux-x86_64": True})
-    def test_existing_lock_is_not_removed(self, settings, status, install):
-        with open(self.lock, "w"):
-            pass
-        self.assertIsNone(deps.maybe_auto_install(self.arch))
-        install.assert_not_called()
-        self.assertTrue(os.path.exists(self.lock))
+    def test_native_fields_check_the_durable_directory(self):
+        with patch.object(deps, "detect_arch", return_value=self.arch):
+            fields = config.build_plugin_fields({}, self.data_dir)
+        self.assertIn("_warn_pyav_missing", [field["id"] for field in fields])
 
     @patch.object(deps, "_save_settings")
-    @patch.object(deps, "pyav_status", return_value=None)
+    @patch.object(deps, "_find_wheel", return_value=wheel_info())
+    def test_install_is_published_in_durable_directory(self, find, save):
+        with patch.object(deps.urllib.request, "urlopen", return_value=io.BytesIO(wheel_bytes())):
+            result = deps.install_pyav(self.arch, self.data_dir)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(deps.pyav_status(self.arch, self.data_dir), deps.PYAV_VERSION)
+        self.assertTrue(os.path.isdir(os.path.join(self.data_dir, "vendor", self.arch, deps.PYAV_VERSION, "av")))
+        save.assert_called_once_with({f"pyav_consent_{self.arch}": True, "pyav_auto_install_error": None})
+
+    @patch.object(deps, "_save_settings")
+    @patch.object(deps, "_find_wheel", return_value=wheel_info())
+    def test_incomplete_install_is_preserved_and_replaced(self, find, save):
+        incomplete = deps.arch_dir(self.arch, self.data_dir)
+        os.makedirs(incomplete)
+        with open(os.path.join(incomplete, "partial"), "w") as output:
+            output.write("keep")
+        with patch.object(deps.urllib.request, "urlopen", return_value=io.BytesIO(wheel_bytes())):
+            result = deps.install_pyav(self.arch, self.data_dir)
+        self.assertEqual(result["status"], "success")
+        vendor = os.path.join(self.data_dir, "vendor")
+        preserved = [name for name in os.listdir(vendor) if name.startswith(f".{self.arch}-incomplete-")]
+        self.assertEqual(len(preserved), 1)
+        self.assertTrue(os.path.isfile(os.path.join(vendor, preserved[0], "partial")))
+        self.assertEqual(deps.pyav_status(self.arch, self.data_dir), deps.PYAV_VERSION)
+
+    @patch.object(deps, "_find_wheel")
+    @patch.object(deps, "_get_settings", return_value={})
+    def test_automatic_install_rechecks_consent_under_lock(self, settings, find):
+        result = deps.install_pyav(self.arch, self.data_dir, automatic=True)
+        self.assertEqual(result["status"], "success")
+        self.assertIn("not authorized", result["message"])
+        find.assert_not_called()
+
+    @patch.object(deps, "_save_settings")
+    @patch.object(deps, "_find_wheel", return_value=wheel_info())
+    def test_failed_download_does_not_publish_partial_install(self, find, save):
+        with patch.object(deps.urllib.request, "urlopen", side_effect=OSError("network failure")):
+            result = deps.install_pyav(self.arch, self.data_dir)
+        self.assertEqual(result["status"], "error")
+        self.assertIsNone(deps.pyav_status(self.arch, self.data_dir))
+        save.assert_not_called()
+
+    @patch.object(deps, "_save_settings")
+    @patch.object(deps, "_find_wheel", return_value=("https://example.test/wheel", "wheel.whl", "0" * 64))
+    def test_checksum_mismatch_never_installs_or_records_consent(self, find, save):
+        with (
+            patch.object(deps.urllib.request, "urlopen", return_value=io.BytesIO(wheel_bytes())),
+            self.assertLogs(deps.logger, level="ERROR"),
+        ):
+            result = deps.install_pyav(self.arch, self.data_dir)
+        self.assertEqual(result["status"], "error")
+        self.assertIsNone(deps.pyav_status(self.arch, self.data_dir))
+        save.assert_not_called()
+
+    @patch.object(deps, "_save_settings")
     @patch.object(deps, "_get_settings", return_value={"pyav_consent_linux-x86_64": True})
-    def test_failed_install_records_error_and_releases_lock(self, settings, status, save):
-        result = {"status": "error", "message": "download failed"}
-
-        def install(arch):
-            self.assertEqual(arch, self.arch)
-            self.assertTrue(os.path.exists(self.lock))
-            return result
-
-        with patch.object(deps, "install_pyav", side_effect=install):
-            self.assertEqual(deps.maybe_auto_install(self.arch), result)
-        save.assert_called_once_with({"pyav_auto_install_error": "download failed"})
-        self.assertFalse(os.path.exists(self.lock))
-
-    @patch.object(deps, "pyav_status", return_value=None)
-    @patch.object(deps, "_get_settings", return_value={"pyav_consent_linux-x86_64": True})
-    def test_concurrent_repairs_only_install_once(self, settings, status):
+    @patch.object(deps, "_find_wheel", return_value=wheel_info())
+    def test_concurrent_repairs_download_once(self, find, settings, save):
         entered = threading.Event()
         release = threading.Event()
-        result = {"status": "success"}
+        results = []
 
-        def install(arch):
+        def download(*args, **kwargs):
             entered.set()
             if not release.wait(5):
-                raise TimeoutError("test did not release installer")
-            return result
+                raise TimeoutError("test did not release download")
+            return io.BytesIO(wheel_bytes())
 
-        with patch.object(deps, "install_pyav", side_effect=install) as installer:
-            worker = threading.Thread(target=deps.maybe_auto_install, args=(self.arch,))
-            worker.start()
+        def repair():
+            results.append(deps.maybe_auto_install(self.arch, self.data_dir))
+
+        with patch.object(deps.urllib.request, "urlopen", side_effect=download) as urlopen:
+            first = threading.Thread(target=repair)
+            second = threading.Thread(target=repair)
+            first.start()
             try:
                 self.assertTrue(entered.wait(5))
-                self.assertIsNone(deps.maybe_auto_install(self.arch))
+                second.start()
             finally:
                 release.set()
-                worker.join(5)
-            self.assertFalse(worker.is_alive())
-            installer.assert_called_once_with(self.arch)
-        self.assertFalse(os.path.exists(self.lock))
+                first.join(5)
+                if second.ident is not None:
+                    second.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            urlopen.assert_called_once()
+        self.assertEqual(deps.pyav_status(self.arch, self.data_dir), deps.PYAV_VERSION)
+        self.assertEqual(len(results), 2)
+
+    def test_stream_worker_receives_durable_vendor_path(self):
+        instance = server.MultiviewServer("127.0.0.1", 9292, self.data_dir)
+        gevent = types.ModuleType("gevent")
+        gevent.spawn = unittest.mock.Mock()
+        subprocess = types.ModuleType("gevent.subprocess")
+        subprocess.PIPE = object()
+        subprocess.Popen = unittest.mock.Mock()
+        gevent.subprocess = subprocess
+        config = {"out_w": 1920, "out_h": 1080, "fps": 30}
+        with (
+            patch.dict(sys.modules, {"gevent": gevent, "gevent.subprocess": subprocess}),
+            patch.object(instance, "_resolve_layout", return_value=([], "auto", "0")),
+            patch.object(instance, "_worker_config", return_value=config),
+            patch.object(server, "_settings", return_value={}),
+            patch.object(deps, "detect_arch", return_value=self.arch),
+            patch.object(deps, "pyav_status", return_value=deps.PYAV_VERSION),
+        ):
+            instance._serve_stream("layout", unittest.mock.Mock())
+        env = subprocess.Popen.call_args.kwargs["env"]
+        self.assertEqual(env["MULTIVIEW_VENDOR_DIR"], deps.arch_dir(self.arch, self.data_dir))
 
 
 if __name__ == "__main__":

@@ -341,7 +341,7 @@ class MultiviewServer:
 
         from . import deps as _deps
         arch = _deps.detect_arch()
-        if not arch or not _deps.pyav_status(arch):
+        if not arch or not _deps.pyav_status(arch, self.data_dir):
             logger.warning(f"Stream {layout_id}: PyAV not installed for {arch or 'this arch'}")
             start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
             return [(f"PyAV media engine not installed for {arch or 'this CPU arch'}. "
@@ -356,7 +356,8 @@ class MultiviewServer:
 
         import gevent
         import gevent.subprocess as gsub
-        proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE)
+        env = dict(os.environ, MULTIVIEW_VENDOR_DIR=_deps.arch_dir(arch, self.data_dir))
+        proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE, env=env)
         stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{layout_id}")
         self._active_procs[proc] = {"n": layout_id, "cfg": cfg}
         self._active_procs[proc]["reload_monitor"] = gevent.spawn(

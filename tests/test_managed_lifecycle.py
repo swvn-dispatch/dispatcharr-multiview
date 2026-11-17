@@ -108,8 +108,8 @@ class ManagedLifecycleTests(unittest.TestCase):
         deps = Mock()
         deps.maybe_auto_install.return_value = None
         with patch.object(self.plugin, "_deps", return_value=deps):
-            result = self.plugin.run("install_pyav_arm64", {"automatic": True}, {})
-        deps.maybe_auto_install.assert_called_once_with("linux-aarch64")
+            result = self.plugin.run("install_pyav_arm64", {"automatic": True}, {"data_dir": "/durable"})
+        deps.maybe_auto_install.assert_called_once_with("linux-aarch64", "/durable")
         deps.install_pyav.assert_not_called()
         self.assertEqual(result["status"], "success")
 

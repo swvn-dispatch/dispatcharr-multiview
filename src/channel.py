@@ -29,15 +29,10 @@ except ImportError:
         frame_can_resume, source_format_changed,
     )
 
-# Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
-# matching this machine and put it on the path before importing av.
-_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-_ARCH_DIR = {
-    "x86_64": "linux-x86_64", "amd64": "linux-x86_64",
-    "aarch64": "linux-aarch64", "arm64": "linux-aarch64",
-}.get(platform.machine().lower())
-if _ARCH_DIR and os.path.isdir(os.path.join(_VENDOR, _ARCH_DIR)):
-    sys.path.insert(0, os.path.join(_VENDOR, _ARCH_DIR))
+# The server supplies the host-specific durable PyAV directory to each worker.
+_VENDOR = os.environ.get("MULTIVIEW_VENDOR_DIR", "")
+if _VENDOR and os.path.isdir(_VENDOR):
+    sys.path.insert(0, _VENDOR)
 
 import numpy as np  # noqa: E402
 try:
@@ -45,7 +40,7 @@ try:
 except ImportError:
     sys.stderr.write(
         f"[mvworker] FATAL: PyAV not installed for arch '{platform.machine()}' "
-        f"(expected {_VENDOR}/{_ARCH_DIR}). Open the Multiview plugin settings and "
+        f"(expected {_VENDOR or 'a configured vendor directory'}). Open the Multiview plugin settings and "
         f"run the 'Install PyAV' action.\n")
     raise
 

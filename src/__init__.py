@@ -200,9 +200,8 @@ class Plugin:
 
     # Dynamic fields
 
-    @property
-    def fields(self):
-        """Regenerate fields from current DB settings on every request."""
+    def get_fields(self, context):
+        """Build discovery fields using the host's durable storage path."""
         config_mod = _config()
         try:
             settings = config_mod.load_settings()
@@ -210,7 +209,7 @@ class Plugin:
             settings, _changed = config_mod.ensure_layout_order({})
             settings, _changed = config_mod.reconcile_layout_count(settings)
             settings, _changed = config_mod.ensure_custom_layout_order(settings)
-        return config_mod.build_plugin_fields(settings)
+        return config_mod.build_plugin_fields(settings, context["data_dir"])
 
     # Action dispatcher
 
@@ -236,16 +235,16 @@ class Plugin:
             return {"status": "success", "message": f"Reloading {count} active multiview(s)"}
         if action == "install_pyav_amd64":
             if params.get("automatic"):
-                return self._deps().maybe_auto_install("linux-x86_64") or {
+                return self._deps().maybe_auto_install("linux-x86_64", context["data_dir"]) or {
                     "status": "success", "message": "PyAV is current or automatic repair is not authorized"
                 }
-            return self._deps().install_pyav("linux-x86_64")
+            return self._deps().install_pyav("linux-x86_64", context["data_dir"])
         if action == "install_pyav_arm64":
             if params.get("automatic"):
-                return self._deps().maybe_auto_install("linux-aarch64") or {
+                return self._deps().maybe_auto_install("linux-aarch64", context["data_dir"]) or {
                     "status": "success", "message": "PyAV is current or automatic repair is not authorized"
                 }
-            return self._deps().install_pyav("linux-aarch64")
+            return self._deps().install_pyav("linux-aarch64", context["data_dir"])
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
