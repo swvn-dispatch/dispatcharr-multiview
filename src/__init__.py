@@ -126,6 +126,7 @@ class Plugin:
         interval_secs = None
         next_refresh = None
         next_check = 0.0
+        last_refresh_problem = None
 
         def ready():
             try:
@@ -141,16 +142,20 @@ class Plugin:
                 _close_db_connections()
 
         def tick():
-            nonlocal interval_secs, next_refresh, next_check
+            nonlocal interval_secs, next_refresh, next_check, last_refresh_problem
             now = time.monotonic()
             if now < next_check:
                 return
             next_check = now + 5
             try:
                 from celery.result import AsyncResult
-                _load_submodule("refresh").advance(
+                state = _load_submodule("refresh").advance(
                     context["data_dir"], context["dispatch_internal_task"], AsyncResult,
                 )
+                problem = (state.get("phase"), state.get("error")) if state.get("phase") in {"blocked", "error"} else None
+                if problem and problem != last_refresh_problem:
+                    logger.warning("Multiview refresh %s: %s", *problem)
+                last_refresh_problem = problem
                 hours = max(0, int(context["get_settings"]().get("epg_refresh_hours", 24)))
                 current = hours * 3600
                 if current != interval_secs:
