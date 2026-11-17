@@ -108,58 +108,7 @@ class Plugin:
     version     = _PLUGIN_CONFIG["version"]
     author      = _PLUGIN_CONFIG["author"]
 
-    actions = [
-        {
-            "id": "generate_m3u",
-            "label": "Regenerate M3U & EPG",
-            "description": "Write multiview.m3u and multiview_epg.xml, then refresh the M3U account and EPG source in Dispatcharr",
-            "button_label": "Regenerate M3U & EPG",
-            "button_variant": "filled",
-            "button_color": "green",
-        },
-        {
-            "id": "reload_active_multiviews",
-            "label": "Reload All Active Multiviews",
-            "description": (
-                "Stop every active multiview compositor so Dispatcharr reconnects each "
-                "stream with its current configuration. Players may briefly buffer or "
-                "need to reconnect."
-            ),
-            "button_label": "Reload All Active Multiviews",
-            "button_variant": "filled",
-            "button_color": "orange",
-        },
-        {
-            "id": "install_pyav_amd64",
-            "label": "Install / Update PyAV (amd64 / x86_64)",
-            "description": (
-                "Download and install the PyAV media dependency for x86_64 hosts. "
-                "Required before streaming. Needs internet access. Running this "
-                "once is treated as consent for the plugin to automatically "
-                "reinstall PyAV for you later if it's ever found missing or "
-                "outdated (e.g. after a plugin update resets the vendored copy) "
-                "-- you shouldn't need to click this again after the first time."
-            ),
-            "button_label": "Install PyAV (amd64)",
-            "button_variant": "filled",
-            "button_color": "blue",
-        },
-        {
-            "id": "install_pyav_arm64",
-            "label": "Install / Update PyAV (arm64 / aarch64)",
-            "description": (
-                "Download and install the PyAV media dependency for aarch64 hosts. "
-                "Required before streaming. Needs internet access. Running this "
-                "once is treated as consent for the plugin to automatically "
-                "reinstall PyAV for you later if it's ever found missing or "
-                "outdated (e.g. after a plugin update resets the vendored copy) "
-                "-- you shouldn't need to click this again after the first time."
-            ),
-            "button_label": "Install PyAV (arm64)",
-            "button_variant": "filled",
-            "button_color": "blue",
-        },
-    ]
+    actions = _PLUGIN_CONFIG["actions"]
 
     # Lifecycle (init)
 
