@@ -1152,7 +1152,7 @@ def build_plugin_fields(settings: dict, data_dir=None, *, dashboard=False) -> li
             field.pop("description", None)
         elif field_id in {"_global_settings_header", "_video_settings_header"}:
             section = field_id
-            field.update(label="Global Settings" if field_id == "_global_settings_header" else "Video Settings", type="section", collapsed=False)
+            field.update(label="Global Settings" if field_id == "_global_settings_header" else "Video Settings", type="section", collapsed=field_id != "_global_settings_header")
             field.pop("description", None)
         elif field_id.startswith("multiview_") and field_id.endswith("_header"):
             section = "_" + field_id

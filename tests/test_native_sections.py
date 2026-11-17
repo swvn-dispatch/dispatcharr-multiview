@@ -15,7 +15,7 @@ class NativeSectionsTests(unittest.TestCase):
             fields = config.build_plugin_fields(settings)
         sections = [field for field in fields if field["type"] == "section"]
         self.assertEqual([s["label"] for s in sections], ["Alerts", "Global Settings", "Video Settings", "Layout 1", "Layout 2"])
-        self.assertEqual([s["collapsed"] for s in sections], [False, False, False, True, True])
+        self.assertEqual([s["collapsed"] for s in sections], [False, False, True, True, True])
         ids = {s["id"] for s in sections}
         for field in fields:
             if field["type"] != "section":
