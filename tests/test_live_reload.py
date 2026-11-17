@@ -92,6 +92,21 @@ class ActiveWorkerReloadTests(unittest.TestCase):
             self.server._monitor_live_reload(self.proc, "layout")
         check.assert_not_called()
 
+    def test_database_failure_does_not_kill_active_worker(self):
+        fake_gevent = types.ModuleType("gevent")
+        fake_gevent.sleep = Mock(side_effect=lambda _: self.server._active_procs.pop(self.proc))
+        with (
+            patch.dict(sys.modules, {"gevent": fake_gevent}),
+            patch.object(server, "_settings", side_effect=RuntimeError("database unavailable")),
+            patch.object(server, "_close_db_connections") as close,
+            patch.object(self.server, "_check_live_reload") as check,
+            self.assertLogs(server.logger, level="WARNING"),
+        ):
+            self.server._monitor_live_reload(self.proc, "layout")
+        close.assert_called_once_with()
+        check.assert_not_called()
+        self.proc.kill.assert_not_called()
+
     def test_unchanged_worker_is_not_reloaded(self):
         with (
             patch.object(server, "_settings", return_value={"multiview_order": ["layout"]}),

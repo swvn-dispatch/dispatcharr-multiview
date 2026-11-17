@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import sys
+from contextvars import copy_context
 
 from . import config as _mvconfig
 from . import dispatcharr as _dispatcharr
@@ -71,6 +72,7 @@ def _load_dash_api():
     api_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dash", "api.py")
     spec = importlib.util.spec_from_file_location(mod_name, api_path)
     mod = importlib.util.module_from_spec(spec)
+    mod.__builtins__ = __builtins__
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     _dash_api = mod
@@ -104,13 +106,7 @@ def set_server(s):
 
 
 def _settings() -> dict:
-    try:
-        return _mvconfig.load_settings()
-    except Exception:
-        settings, _ = _mvconfig.ensure_layout_order({})
-        settings, _ = _mvconfig.reconcile_layout_count(settings)
-        settings, _ = _mvconfig.ensure_custom_layout_order(settings)
-        return settings
+    return _mvconfig.load_settings()
 
 def _close_db_connections():
     """Release ORM connections opened by this standalone WSGI server."""
@@ -203,6 +199,7 @@ class MultiviewServer:
         self.port = port
         self.data_dir = data_dir
         self.dispatch_task = dispatch_task
+        self._service_context = None
         self._server = None
         self.running = False
         self._active_procs: dict = {}  # proc -> layout_n
@@ -216,6 +213,28 @@ class MultiviewServer:
         return None
 
     def wsgi_app(self, environ, start_response):
+        if self._service_context is None:
+            return self._wsgi_app(environ, start_response)
+        context = self._service_context.copy()
+        response = context.run(self._wsgi_app, environ, start_response)
+
+        def contextual_response():
+            iterator = context.run(iter, response)
+            try:
+                while True:
+                    try:
+                        chunk = context.run(next, iterator)
+                    except StopIteration:
+                        return
+                    yield chunk
+            finally:
+                close = getattr(response, "close", None)
+                if close:
+                    context.run(close)
+
+        return contextual_response()
+
+    def _wsgi_app(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
         loopback = environ.get("REMOTE_ADDR", "") in ("127.0.0.1", "::1")
 
@@ -447,10 +466,17 @@ class MultiviewServer:
         import gevent
 
         while proc in self._active_procs:
+            settings_failed = False
             try:
                 interval = _live_reload_interval_secs(_settings())
+            except Exception as exc:
+                logger.warning("Could not read live reload settings: %s", exc)
+                settings_failed = True
             finally:
                 _close_db_connections()
+            if settings_failed:
+                gevent.sleep(15)
+                continue
             if proc not in self._active_procs:
                 return
             if interval is None:
@@ -463,6 +489,9 @@ class MultiviewServer:
                 return
             try:
                 current_interval = _live_reload_interval_secs(_settings())
+            except Exception as exc:
+                logger.warning("Could not read live reload settings: %s", exc)
+                continue
             finally:
                 _close_db_connections()
             if proc not in self._active_procs:
@@ -677,7 +706,9 @@ class MultiviewServer:
         settings = _settings()
         n = layout_id  # short alias for the log/error messages below
 
-        ch_count = max(2, int(settings.get(f"multiview_{layout_id}_channel_count", 4)))
+        ch_count = int(settings.get(f"multiview_{layout_id}_channel_count", 4))
+        if not 2 <= ch_count <= 9:
+            raise LookupError(f"Layout {n} must have between 2 and 9 channel rows")
         layout = settings.get(f"multiview_{layout_id}_layout", "auto")
         selector_type = settings.get(f"multiview_{layout_id}_selector_type", "classic")
 
@@ -729,6 +760,7 @@ class MultiviewServer:
         import gevent
         from gevent import pywsgi
 
+        self._service_context = copy_context()
         try:
             for attempt in range(5):
                 if stop_event.is_set():

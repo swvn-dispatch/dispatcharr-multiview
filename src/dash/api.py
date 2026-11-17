@@ -67,14 +67,7 @@ def _verify_token(environ) -> bool:
 
 
 def _get_settings() -> dict:
-    config_mod = _get_config_mod()
-    try:
-        return config_mod.load_settings()
-    except Exception:
-        settings, _ = config_mod.ensure_layout_order({})
-        settings, _ = config_mod.reconcile_layout_count(settings)
-        settings, _ = config_mod.ensure_custom_layout_order(settings)
-        return settings
+    return _get_config_mod().load_settings()
 
 def _save_settings(updates: dict):
     _get_config_mod().update_settings(updates)
@@ -519,7 +512,7 @@ def handle_fields(environ, start_response):
         import re
         settings = _get_settings()
         config_mod = _get_config_mod()
-        all_fields = config_mod.build_plugin_fields(settings, _server.data_dir)
+        all_fields = config_mod.build_plugin_fields(settings, _server.data_dir, dashboard=True)
         order = settings.get("multiview_order", [])
 
         layout_re = re.compile(r"^multiview_([0-9a-f]{8})_")

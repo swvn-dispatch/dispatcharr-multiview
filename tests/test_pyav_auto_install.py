@@ -39,6 +39,17 @@ class PyavAutoInstallTests(unittest.TestCase):
         self.assertIsNone(deps.maybe_auto_install(self.arch, self.data_dir))
         install.assert_not_called()
 
+    def test_detects_supported_linux_platforms_only(self):
+        with patch.object(deps.platform, "system", return_value="Linux"):
+            with patch.object(deps.platform, "machine", return_value="x86_64"):
+                self.assertEqual(deps.detect_arch(), "linux-x86_64")
+            with patch.object(deps.platform, "machine", return_value="arm64"):
+                self.assertEqual(deps.detect_arch(), "linux-aarch64")
+            with patch.object(deps.platform, "machine", return_value="riscv64"):
+                self.assertIsNone(deps.detect_arch())
+        with patch.object(deps.platform, "system", return_value="Darwin"), patch.object(deps.platform, "machine", return_value="arm64"):
+            self.assertIsNone(deps.detect_arch())
+
     def test_native_fields_check_the_durable_directory(self):
         with patch.object(deps, "detect_arch", return_value=self.arch):
             fields = config.build_plugin_fields({}, self.data_dir)
@@ -81,7 +92,10 @@ class PyavAutoInstallTests(unittest.TestCase):
     @patch.object(deps, "_save_settings")
     @patch.object(deps, "_find_wheel", return_value=wheel_info())
     def test_failed_download_does_not_publish_partial_install(self, find, save):
-        with patch.object(deps.urllib.request, "urlopen", side_effect=OSError("network failure")):
+        with (
+            patch.object(deps.urllib.request, "urlopen", side_effect=OSError("network failure")),
+            self.assertLogs(deps.logger, level="ERROR"),
+        ):
             result = deps.install_pyav(self.arch, self.data_dir)
         self.assertEqual(result["status"], "error")
         self.assertIsNone(deps.pyav_status(self.arch, self.data_dir))

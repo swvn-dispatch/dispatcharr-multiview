@@ -2,6 +2,8 @@
 
 > Dispatcharr plugin that combines multiple channel streams into a single tiled MPEG-TS output. Define named layouts, pick your channels, and each layout appears as a standard M3U channel you can open in any player.
 
+Requires Dispatcharr 0.34.0 or later with plugin settings saves that preserve plugin-managed keys. Older Dispatcharr installations can use an earlier Multiview release. Some early 0.34 development images overwrite those keys and are not supported.
+
 ## Support
 
 This project is maintained in my spare time. If it's saved you some headaches, a tip is always appreciated.
@@ -67,7 +69,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 | Name | Shown in the M3U playlist |
 | Layout Style | Auto Grid, Featured, or Top Featured (see below) |
 | Channel Selection | Classic (dropdowns) or Regex (dynamic match) |
-| Channel Count | Number of tiles. Max 4 recommended. |
+| Channels | Classic layouts use one table row per tile; regex layouts use a maximum match count. Max 4 recommended. |
 | Audio Source | Single channel or All Channels (one AC3 track per tile) |
 | EPG fields | Title, subtitle, categories for the guide entry |
 
@@ -79,7 +81,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 **Channel selection modes:**
 
-- **Classic:** select each channel from a dropdown.
+- **Classic:** add one row per channel in the native settings table, in tile order. The dashboard retains its channel controls. Native table rows cannot currently be reordered, so change the selected channels to rearrange them. Reload the plugin after changing rows to refresh native audio and EPG channel options; this interrupts active streams.
 - **Regex:** enter a pattern (e.g. `TSN\s*\d` or `^CA \|`) matched case-insensitively against channel names. Channels are sorted by channel number. The channel count setting becomes the maximum number of matches to tile.
 
 **Audio source:**

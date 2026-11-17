@@ -45,6 +45,9 @@ def _load_submodule(name: str):
             full_name, os.path.join(_PLUGIN_DIR, f"{name}.py")
         )
         mod = importlib.util.module_from_spec(spec)
+        # File-path loaders bypass Dispatcharr's normal guarded source loader.
+        # Carry the host-provided builtins into sibling modules before execution.
+        mod.__builtins__ = __builtins__
         spec._initializing = True
         try:
             sys.modules[full_name] = mod
@@ -130,12 +133,8 @@ class Plugin:
 
         def ready():
             try:
-                action = {
-                    "linux-x86_64": "install_pyav_amd64",
-                    "linux-aarch64": "install_pyav_arm64",
-                }.get(self._deps().detect_arch())
-                if action and not stop_event.is_set():
-                    context["dispatch_task"](action, {"automatic": True})
+                if not stop_event.is_set():
+                    context["dispatch_task"]("install_pyav", {"automatic": True})
             except Exception:
                 logger.exception("Could not queue the automatic PyAV check")
             finally:
@@ -204,12 +203,7 @@ class Plugin:
     def get_fields(self, context):
         """Build discovery fields using the host's durable storage path."""
         config_mod = _config()
-        try:
-            settings = config_mod.load_settings()
-        except Exception:
-            settings, _changed = config_mod.ensure_layout_order({})
-            settings, _changed = config_mod.reconcile_layout_count(settings)
-            settings, _changed = config_mod.ensure_custom_layout_order(settings)
+        settings = config_mod.load_settings()
         return config_mod.build_plugin_fields(settings, context["data_dir"])
 
     # Action dispatcher
@@ -234,18 +228,15 @@ class Plugin:
             finally:
                 conn.close()
             return {"status": "success", "message": f"Reloading {count} active multiview(s)"}
-        if action == "install_pyav_amd64":
+        if action == "install_pyav":
+            arch = self._deps().detect_arch()
+            if not arch:
+                return {"status": "error", "message": "PyAV is unavailable for this CPU architecture"}
             if params.get("automatic"):
-                return self._deps().maybe_auto_install("linux-x86_64", context["data_dir"]) or {
+                return self._deps().maybe_auto_install(arch, context["data_dir"]) or {
                     "status": "success", "message": "PyAV is current or automatic repair is not authorized"
                 }
-            return self._deps().install_pyav("linux-x86_64", context["data_dir"])
-        if action == "install_pyav_arm64":
-            if params.get("automatic"):
-                return self._deps().maybe_auto_install("linux-aarch64", context["data_dir"]) or {
-                    "status": "success", "message": "PyAV is current or automatic repair is not authorized"
-                }
-            return self._deps().install_pyav("linux-aarch64", context["data_dir"])
+            return self._deps().install_pyav(arch, context["data_dir"])
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 

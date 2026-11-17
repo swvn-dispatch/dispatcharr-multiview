@@ -4,6 +4,7 @@ import sys
 import threading
 import types
 import unittest
+from contextvars import ContextVar, copy_context
 from unittest.mock import Mock, patch
 
 from src import server
@@ -63,6 +64,27 @@ class ManagedServerTests(unittest.TestCase):
         server.set_server(other)
         self.instance.stop()
         self.assertIs(server.get_server(), other)
+
+    def test_requests_and_stream_iteration_keep_the_service_context(self):
+        identity = ContextVar("plugin_identity", default="outside")
+        identity.set("plugin")
+        self.instance._service_context = copy_context()
+        identity.set("outside")
+        observed = []
+
+        def response():
+            observed.append(("stream", identity.get()))
+            yield b"chunk"
+
+        def app(environ, start_response):
+            observed.append(("request", identity.get()))
+            return response()
+
+        with patch.object(self.instance, "_wsgi_app", side_effect=app):
+            result = self.instance.wsgi_app({}, Mock())
+            self.assertEqual(list(result), [b"chunk"])
+        self.assertEqual(observed, [("request", "plugin"), ("stream", "plugin")])
+        self.assertEqual(identity.get(), "outside")
 
 
 if __name__ == "__main__":
