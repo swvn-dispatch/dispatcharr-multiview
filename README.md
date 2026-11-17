@@ -90,6 +90,8 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create or update the M3U account, and rebuild EPG data. The Auto-Refresh Interval controls how often this happens automatically.
 
+The refresh runs in the background. Dispatcharr's M3U refresh must succeed before the EPG refresh starts. If a known task takes too long, Multiview keeps checking it and resumes automatically after it finishes. If task submission has an uncertain outcome, Multiview stops further refreshes to avoid overlapping work and records the reason in its logs.
+
 ## Hardware acceleration
 
 Selecting NVIDIA NVENC, Intel QSV, or Intel/AMD VAAPI automatically attempts GPU tile composition as well as GPU encoding. There is no extra setting. The worker validates the selected device and FFmpeg's required hardware filters at startup. If either is unavailable, it logs the reason and keeps the stream running with the CPU compositor.
