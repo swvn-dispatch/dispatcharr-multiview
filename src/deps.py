@@ -109,7 +109,7 @@ def install_pyav(arch: str, data_dir: str, *, automatic=False) -> dict:
                 if automatic and not _get_settings().get(f"pyav_consent_{arch}"):
                     return {"status": "error", "message": "Automatic PyAV installation is not authorized"}
                 if automatic and pyav_status(arch, data_dir) == PYAV_VERSION:
-                    return {"status": "error", "reason": "current", "message": "PyAV is already current; no automatic repair was performed"}
+                    return {"status": "success", "reason": "current", "message": "PyAV is already current; no automatic repair was performed"}
                 if pyav_status(arch, data_dir) != PYAV_VERSION:
                     url, fn, expected_digest = _find_wheel(arch)
                     with tempfile.TemporaryDirectory(prefix=".install-", dir=vendor) as tmp:
@@ -172,15 +172,15 @@ def maybe_auto_install(arch: str, data_dir: str) -> dict:
     PyAV' run for this arch) and the vendored copy is now missing or
     doesn't match the pinned PYAV_VERSION (e.g. reset by a plugin update),
     reinstall it automatically. No-op if consent was never given, or the
-    install is already current. Returns an error when no repair is performed."""
+    install is already current. Reports the current and unauthorized cases separately."""
     state = auto_install_state(arch, data_dir)
     if state == "current":
-        return {"status": "error", "message": "PyAV is already current; no automatic repair was performed"}
+        return {"status": "success", "reason": "current", "message": "PyAV is already current; no automatic repair was performed"}
     if state == "unauthorized":
         return {"status": "error", "message": "Automatic PyAV installation is not authorized"}
 
     result = install_pyav(arch, data_dir, automatic=True)
-    if result.get("status") != "success" and result.get("reason") != "current":
+    if result.get("status") != "success":
         try:
             _save_settings({"pyav_auto_install_error": result.get("message", "unknown error")})
         except Exception:

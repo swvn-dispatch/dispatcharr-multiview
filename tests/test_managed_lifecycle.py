@@ -108,12 +108,13 @@ class ManagedLifecycleTests(unittest.TestCase):
     def test_automatic_install_action_uses_consent_checked_repair(self):
         deps = Mock()
         deps.detect_arch.return_value = "linux-aarch64"
-        deps.maybe_auto_install.return_value = {"status": "error", "message": "PyAV is already current"}
+        deps.maybe_auto_install.return_value = {"status": "success", "reason": "current", "message": "PyAV is already current"}
         with patch.object(self.plugin, "_deps", return_value=deps):
             result = self.plugin.run("install_pyav", {"automatic": True}, {"data_dir": "/durable"})
         deps.maybe_auto_install.assert_called_once_with("linux-aarch64", "/durable")
         deps.install_pyav.assert_not_called()
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status"], "success")
+        self.assertNotIn("_dispatcharr", result)
 
     @patch.object(src, "_close_db_connections")
     def test_ready_does_not_queue_current_or_unauthorized_repairs(self, close_connections):

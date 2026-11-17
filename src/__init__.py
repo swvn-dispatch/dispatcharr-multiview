@@ -241,7 +241,7 @@ class Plugin:
                 result = self._deps().maybe_auto_install(arch, context["data_dir"])
             else:
                 result = self._deps().install_pyav(arch, context["data_dir"])
-            if result.get("status") == "success":
+            if result.get("status") == "success" and result.get("reason") != "current":
                 result = {**result, "_dispatcharr": {"refresh": "plugin"}}
             return result
 
