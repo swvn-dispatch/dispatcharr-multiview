@@ -194,13 +194,11 @@ class PyavAutoInstallTests(unittest.TestCase):
         instance = server.MultiviewServer("127.0.0.1", 9292, self.data_dir)
         gevent = types.ModuleType("gevent")
         gevent.spawn = unittest.mock.Mock()
-        subprocess = types.ModuleType("gevent.subprocess")
-        subprocess.PIPE = object()
-        subprocess.Popen = unittest.mock.Mock()
-        gevent.subprocess = subprocess
+        start_compositor = unittest.mock.Mock()
         config = {"out_w": 1920, "out_h": 1080, "fps": 30}
         with (
-            patch.dict(sys.modules, {"gevent": gevent, "gevent.subprocess": subprocess}),
+            patch.dict(sys.modules, {"gevent": gevent}),
+            patch.object(server, "_start_compositor", start_compositor),
             patch.object(instance, "_resolve_layout", return_value=([], "auto", "0")),
             patch.object(instance, "_worker_config", return_value=config),
             patch.object(server, "_settings", return_value={}),
@@ -208,7 +206,7 @@ class PyavAutoInstallTests(unittest.TestCase):
             patch.object(deps, "pyav_status", return_value=deps.PYAV_VERSION),
         ):
             instance._serve_stream("layout", unittest.mock.Mock())
-        env = subprocess.Popen.call_args.kwargs["env"]
+        env = start_compositor.call_args.args[1]
         self.assertEqual(env["MULTIVIEW_VENDOR_DIR"], deps.arch_dir(self.arch, self.data_dir))
 
 

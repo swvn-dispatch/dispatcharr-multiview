@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 from contextvars import copy_context
 
@@ -95,6 +96,31 @@ def _python_exe() -> str:
         if found:
             return found
     return cand or "python3"
+
+
+def _start_compositor(cmd, env):
+    """Start a child without gevent's default-loop-only child watcher."""
+    from gevent import monkey
+    from gevent.fileobject import FileObjectPosix
+
+    if monkey.is_object_patched("subprocess", "Popen"):
+        raise RuntimeError("Cannot start a compositor with monkey-patched subprocess in a managed service thread")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env, bufsize=0)
+    try:
+        proc.stdin = FileObjectPosix(proc.stdin, mode="wb")
+        proc.stdout = FileObjectPosix(proc.stdout, mode="rb")
+        proc.stderr = FileObjectPosix(proc.stderr, mode="rb")
+    except Exception:
+        try:
+            proc.kill()
+            from gevent import get_hub
+            get_hub().threadpool.apply(proc.wait)
+        finally:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                pipe.close()
+        raise
+    return proc
 
 
 def get_server():
@@ -376,9 +402,8 @@ class MultiviewServer:
                      f"audio={audio_source}, {cfg['out_w']}x{cfg['out_h']}@{cfg['fps']}")
 
         import gevent
-        import gevent.subprocess as gsub
         env = dict(os.environ, MULTIVIEW_VENDOR_DIR=_deps.arch_dir(arch, self.data_dir))
-        proc = gsub.Popen(cmd, stdin=gsub.PIPE, stdout=gsub.PIPE, stderr=gsub.PIPE, env=env)
+        proc = _start_compositor(cmd, env)
         stderr_gl = gevent.spawn(self._drain_stderr, proc, f"worker-{layout_id}")
         self._active_procs[proc] = {"n": layout_id, "cfg": cfg}
         self._active_procs[proc]["reload_monitor"] = gevent.spawn(
@@ -624,12 +649,18 @@ class MultiviewServer:
                 pass
             try:
                 proc.kill()
-                proc.wait()
+                import gevent
+                gevent.get_hub().threadpool.apply(proc.wait)
             except Exception:
                 pass
             if stderr_gl is not None:
                 try:
                     stderr_gl.kill(block=False)
+                except Exception:
+                    pass
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
                 except Exception:
                     pass
             logger.debug(f"{label} ended, worker killed")
