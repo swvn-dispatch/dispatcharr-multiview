@@ -151,6 +151,7 @@ class Plugin:
                 from celery.result import AsyncResult
                 state = _load_submodule("refresh").advance(
                     context["data_dir"], context["dispatch_internal_task"], AsyncResult,
+                    context["dispatch_scheduled_task"],
                 )
                 problem = (state.get("phase"), state.get("error")) if state.get("phase") in {"blocked", "error"} else None
                 if problem and problem != last_refresh_problem:
@@ -215,7 +216,7 @@ class Plugin:
 
     def run(self, action: str, params: dict, context: dict):
         if action == "generate_m3u":
-            return self._generate_m3u(context)
+            return self._generate_m3u(context, params)
         if action == "reload_active_multiviews":
             conn = http.client.HTTPConnection("127.0.0.1", DEFAULT_SERVER_PORT, timeout=5)
             try:
@@ -254,15 +255,21 @@ class Plugin:
 
     # generate_m3u
 
-    def _generate_m3u(self, context) -> dict:
+    def _generate_m3u(self, context, params) -> dict:
         refresh = _load_submodule("refresh")
         with refresh.locked(context["data_dir"]):
             state = refresh.read_state(context["data_dir"])
-            if state.get("phase") in refresh._ACTIVE:
-                return {"status": "error", "message": "A refresh is already running or needs recovery"}
-            return self._generate_m3u_locked(context, refresh)
+            phase = state.get("phase")
+            retry = phase in {"dispatching_retry", "retry_queued"} and bool(params.get("refresh_retry_token")) and params["refresh_retry_token"] == state.get("retry_token")
+            if phase == "blocked":
+                return {"status": "error", "message": "A refresh needs recovery; inspect the plugin logs"}
+            if phase in refresh._ACTIVE and not retry:
+                state["pending"] = True
+                refresh.write_state(context["data_dir"], state)
+                return {"status": "success", "message": "Refresh queued behind the current refresh"}
+            return self._generate_m3u_locked(context, refresh, pending=bool(state.get("pending")) if retry else False)
 
-    def _generate_m3u_locked(self, context, refresh) -> dict:
+    def _generate_m3u_locked(self, context, refresh, *, pending=False) -> dict:
         config_mod = _config()
         try:
             settings = config_mod.load_settings()
@@ -297,10 +304,10 @@ class Plugin:
                 },
             )
             verb = "created" if created else "updated"
-            refresh.start(context["data_dir"], account.id, source_id, context["dispatch_internal_task"])
+            refresh.start(context["data_dir"], account.id, source_id, context["dispatch_internal_task"], pending=pending)
             return {
-                "status": "success",
-                "message": f"M3U account {verb}; Dispatcharr refresh queued",
+                "status": "success" if source_id is not None else "partial",
+                "message": f"M3U account {verb}; Dispatcharr refresh queued" + (" (EPG generation failed)" if source_id is None else ""),
             }
         except Exception as e:
             logger.error(f"Failed to create M3U account: {e}", exc_info=True)
