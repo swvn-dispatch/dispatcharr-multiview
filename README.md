@@ -12,7 +12,7 @@ This project is maintained in my spare time. If it's saved you some headaches, a
 
 ---
 
-> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. Streams return a 503 until installation completes. PyAV is stored in durable plugin data. After the first successful install, the plugin remembers your consent and checks for the required version in the background at startup. Previously installed versions are retained when the required version changes.
+> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. Streams return a 503 until installation completes. A successful installation reloads the plugin to refresh its settings and may interrupt active streams. PyAV is stored in durable plugin data. After the first successful install, the plugin remembers your consent and checks for the required version in the background at startup. Previously installed versions are retained when the required version changes.
 
 ---
 
