@@ -99,6 +99,7 @@ class ManagedLifecycleTests(unittest.TestCase):
         listener.serve.side_effect = lambda stop_event, on_ready, on_tick: on_ready()
         deps = Mock()
         deps.detect_arch.return_value = "linux-aarch64"
+        deps.auto_install_state.return_value = "needed"
         with patch.object(src, "_server") as module, patch.object(self.plugin, "_deps", return_value=deps):
             module.return_value.MultiviewServer.return_value = listener
             self.plugin._run_managed_service(self.stop, self.context)
@@ -107,12 +108,25 @@ class ManagedLifecycleTests(unittest.TestCase):
     def test_automatic_install_action_uses_consent_checked_repair(self):
         deps = Mock()
         deps.detect_arch.return_value = "linux-aarch64"
-        deps.maybe_auto_install.return_value = None
+        deps.maybe_auto_install.return_value = {"status": "error", "message": "PyAV is already current"}
         with patch.object(self.plugin, "_deps", return_value=deps):
             result = self.plugin.run("install_pyav", {"automatic": True}, {"data_dir": "/durable"})
         deps.maybe_auto_install.assert_called_once_with("linux-aarch64", "/durable")
         deps.install_pyav.assert_not_called()
         self.assertEqual(result["status"], "error")
+
+    @patch.object(src, "_close_db_connections")
+    def test_ready_does_not_queue_current_or_unauthorized_repairs(self, close_connections):
+        listener = Mock()
+        listener.serve.side_effect = lambda stop_event, on_ready, on_tick: on_ready()
+        deps = Mock()
+        deps.detect_arch.return_value = "linux-aarch64"
+        with patch.object(src, "_server") as module, patch.object(self.plugin, "_deps", return_value=deps):
+            module.return_value.MultiviewServer.return_value = listener
+            for state in ("current", "unauthorized"):
+                deps.auto_install_state.return_value = state
+                self.plugin._run_managed_service(self.stop, self.context)
+        self.context["dispatch_task"].assert_not_called()
 
     def test_manual_install_detects_architecture(self):
         deps = Mock()
