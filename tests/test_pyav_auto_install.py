@@ -36,8 +36,14 @@ class PyavAutoInstallTests(unittest.TestCase):
     @patch.object(deps, "install_pyav")
     @patch.object(deps, "_get_settings", return_value={})
     def test_no_consent_does_not_install(self, settings, install):
-        self.assertIsNone(deps.maybe_auto_install(self.arch, self.data_dir))
+        self.assertIn("not authorized", deps.maybe_auto_install(self.arch, self.data_dir)["message"])
         install.assert_not_called()
+
+    def test_current_install_is_distinct_from_missing_consent(self):
+        with patch.object(deps, "pyav_status", return_value=deps.PYAV_VERSION), \
+             patch.object(deps, "_get_settings", return_value={}):
+            self.assertEqual(deps.auto_install_state(self.arch, self.data_dir), "current")
+            self.assertIn("already current", deps.maybe_auto_install(self.arch, self.data_dir)["message"])
 
     def test_detects_supported_linux_platforms_only(self):
         with patch.object(deps.platform, "system", return_value="Linux"):
@@ -71,7 +77,8 @@ class PyavAutoInstallTests(unittest.TestCase):
 
     def test_automatic_noop_and_revoked_consent_do_not_reload(self):
         instance = Plugin()
-        for result in (None, {"status": "error", "message": "Automatic PyAV installation is not authorized"}):
+        for result in ({"status": "error", "message": "PyAV is already current"},
+                       {"status": "error", "message": "Automatic PyAV installation is not authorized"}):
             with self.subTest(result=result), patch.object(instance, "_deps", return_value=deps), \
                  patch.object(deps, "detect_arch", return_value=self.arch), \
                  patch.object(deps, "maybe_auto_install", return_value=result):
@@ -179,6 +186,9 @@ class PyavAutoInstallTests(unittest.TestCase):
             urlopen.assert_called_once()
         self.assertEqual(deps.pyav_status(self.arch, self.data_dir), deps.PYAV_VERSION)
         self.assertEqual(len(results), 2)
+        self.assertEqual(sorted(result["status"] for result in results), ["error", "success"])
+        self.assertTrue(any("already current" in result["message"] for result in results))
+        save.assert_called_once()
 
     def test_stream_worker_receives_durable_vendor_path(self):
         instance = server.MultiviewServer("127.0.0.1", 9292, self.data_dir)

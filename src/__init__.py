@@ -134,7 +134,10 @@ class Plugin:
         def ready():
             try:
                 if not stop_event.is_set():
-                    context["dispatch_task"]("install_pyav", {"automatic": True})
+                    deps = self._deps()
+                    arch = deps.detect_arch()
+                    if arch and deps.auto_install_state(arch, context["data_dir"]) == "needed":
+                        context["dispatch_task"]("install_pyav", {"automatic": True})
             except Exception:
                 logger.exception("Could not queue the automatic PyAV check")
             finally:
@@ -236,10 +239,6 @@ class Plugin:
                 return {"status": "error", "message": "PyAV is unavailable for this CPU architecture"}
             if params.get("automatic"):
                 result = self._deps().maybe_auto_install(arch, context["data_dir"])
-                if result is None:
-                    return {
-                        "status": "error", "message": "PyAV is current or automatic repair is not authorized"
-                    }
             else:
                 result = self._deps().install_pyav(arch, context["data_dir"])
             if result.get("status") == "success":

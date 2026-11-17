@@ -108,6 +108,8 @@ def install_pyav(arch: str, data_dir: str, *, automatic=False) -> dict:
             try:
                 if automatic and not _get_settings().get(f"pyav_consent_{arch}"):
                     return {"status": "error", "message": "Automatic PyAV installation is not authorized"}
+                if automatic and pyav_status(arch, data_dir) == PYAV_VERSION:
+                    return {"status": "error", "reason": "current", "message": "PyAV is already current; no automatic repair was performed"}
                 if pyav_status(arch, data_dir) != PYAV_VERSION:
                     url, fn, expected_digest = _find_wheel(arch)
                     with tempfile.TemporaryDirectory(prefix=".install-", dir=vendor) as tmp:
@@ -156,23 +158,29 @@ def install_pyav(arch: str, data_dir: str, *, automatic=False) -> dict:
     return {"status": "success", "message": msg}
 
 
-def maybe_auto_install(arch: str, data_dir: str) -> "dict | None":
+def auto_install_state(arch: str, data_dir: str) -> str:
+    """Check whether automatic repair is needed without starting a task."""
+    if pyav_status(arch, data_dir) == PYAV_VERSION:
+        return "current"
+    if not _get_settings().get(f"pyav_consent_{arch}"):
+        return "unauthorized"
+    return "needed"
+
+
+def maybe_auto_install(arch: str, data_dir: str) -> dict:
     """If the user has previously consented (a prior successful 'Install
     PyAV' run for this arch) and the vendored copy is now missing or
     doesn't match the pinned PYAV_VERSION (e.g. reset by a plugin update),
     reinstall it automatically. No-op if consent was never given, or the
-    install is already current. Returns the install result dict, or None
-    if nothing needed to be done."""
-    if not arch:
-        return None
-    settings = _get_settings()
-    if not settings.get(f"pyav_consent_{arch}"):
-        return None
-    if pyav_status(arch, data_dir) == PYAV_VERSION:
-        return None
+    install is already current. Returns an error when no repair is performed."""
+    state = auto_install_state(arch, data_dir)
+    if state == "current":
+        return {"status": "error", "message": "PyAV is already current; no automatic repair was performed"}
+    if state == "unauthorized":
+        return {"status": "error", "message": "Automatic PyAV installation is not authorized"}
 
     result = install_pyav(arch, data_dir, automatic=True)
-    if result.get("status") != "success":
+    if result.get("status") != "success" and result.get("reason") != "current":
         try:
             _save_settings({"pyav_auto_install_error": result.get("message", "unknown error")})
         except Exception:
