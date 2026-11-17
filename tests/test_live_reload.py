@@ -3,6 +3,8 @@
 import unittest
 import json
 import http.client
+import sys
+import types
 from io import BytesIO
 from unittest.mock import Mock, patch
 
@@ -51,6 +53,44 @@ class ActiveWorkerReloadTests(unittest.TestCase):
     def test_manual_interval_has_no_seconds_value(self):
         self.assertIsNone(server._live_reload_interval_secs({"live_reload_interval": "manual"}))
         self.assertEqual(server._live_reload_interval_secs({"live_reload_interval": "15"}), 15)
+
+    def test_enabling_auto_reload_is_detected_for_active_worker(self):
+        fake_gevent = types.ModuleType("gevent")
+        fake_gevent.sleep = Mock()
+        with (
+            patch.dict(sys.modules, {"gevent": fake_gevent}),
+            patch.object(server, "_settings", side_effect=[
+                {"live_reload_interval": "manual"},
+                {"live_reload_interval": "15"},
+                {"live_reload_interval": "15"},
+            ]),
+            patch.object(server, "_close_db_connections"),
+            patch.object(self.server, "_check_live_reload", return_value=True) as check,
+        ):
+            self.server._monitor_live_reload(self.proc, "layout")
+        self.assertEqual(fake_gevent.sleep.call_args_list, [unittest.mock.call(15), unittest.mock.call(15)])
+        check.assert_called_once_with(self.proc, "layout")
+
+    def test_switching_to_manual_during_sleep_skips_reload(self):
+        fake_gevent = types.ModuleType("gevent")
+
+        def sleep(_interval):
+            if fake_gevent.sleep.call_count == 2:
+                self.server._active_procs.pop(self.proc)
+
+        fake_gevent.sleep = Mock(side_effect=sleep)
+        with (
+            patch.dict(sys.modules, {"gevent": fake_gevent}),
+            patch.object(server, "_settings", side_effect=[
+                {"live_reload_interval": "15"},
+                {"live_reload_interval": "manual"},
+                {"live_reload_interval": "manual"},
+            ]),
+            patch.object(server, "_close_db_connections"),
+            patch.object(self.server, "_check_live_reload") as check,
+        ):
+            self.server._monitor_live_reload(self.proc, "layout")
+        check.assert_not_called()
 
     def test_unchanged_worker_is_not_reloaded(self):
         with (

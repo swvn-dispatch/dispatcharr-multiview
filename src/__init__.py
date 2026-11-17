@@ -217,8 +217,7 @@ class Plugin:
 
         m3u_path = os.path.join(_PLUGIN_DIR, "multiview.m3u")
         try:
-            with open(m3u_path, "w") as f:
-                f.write(m3u_content)
+            _load_submodule("storage").atomic_write_text(m3u_path, m3u_content)
         except OSError as e:
             return {"status": "error", "message": f"Failed to write M3U file: {e}"}
 
