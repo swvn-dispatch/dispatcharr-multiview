@@ -442,7 +442,10 @@ def handle_style_background(environ, start_response):
         filename = style.get("background_image") if style else None
         if not filename:
             return _json_error(start_response, "404 Not Found", "No background image set")
-        path = os.path.join(_server.data_dir, "style_backgrounds", filename)
+        try:
+            path = _server.storage.background_path(_server.data_dir, filename)
+        except (ValueError, TypeError):
+            return _json_error(start_response, "400 Bad Request", "Invalid background filename")
         if not os.path.isfile(path):
             return _json_error(start_response, "404 Not Found", "Background image file missing")
         try:
@@ -465,8 +468,10 @@ def handle_style_background(environ, start_response):
         style_id = body.get("style_id")
         filename = body.get("filename")
         data_b64 = body.get("data_base64")
-        if not style_id or not filename or not data_b64:
+        if not isinstance(style_id, str) or not isinstance(filename, str) or not isinstance(data_b64, str) or not style_id or not filename or not data_b64:
             return _json_error(start_response, "400 Bad Request", "style_id, filename, data_base64 required")
+        if style_id in {".", ".."} or any(c in style_id for c in ("/", "\\", "\x00")):
+            return _json_error(start_response, "400 Bad Request", "Invalid style_id")
 
         try:
             raw = base64.b64decode(data_b64)
@@ -477,10 +482,11 @@ def handle_style_background(environ, start_response):
 
         stored_name = f"{style_id}_{_sanitize_filename(filename)}"
         try:
-            backgrounds_dir = os.path.join(_server.data_dir, "style_backgrounds")
-            os.makedirs(backgrounds_dir, exist_ok=True)
-            with open(os.path.join(backgrounds_dir, stored_name), "wb") as f:
-                f.write(raw)
+            path = _server.storage.background_path(_server.data_dir, stored_name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _server.storage.atomic_write_bytes(path, raw)
+        except ValueError:
+            return _json_error(start_response, "400 Bad Request", "Invalid background path")
         except OSError as e:
             return _json_error(start_response, "500 Internal Server Error", f"Failed to save image: {e}")
 

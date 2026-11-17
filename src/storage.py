@@ -6,6 +6,21 @@ import shutil
 import stat
 
 
+def background_path(data_dir, filename):
+    """Resolve a background filename without escaping plugin data."""
+    if (not isinstance(filename, str) or not filename or filename in {".", ".."}
+            or "\x00" in filename or "/" in filename or "\\" in filename):
+        raise ValueError("Invalid background filename")
+    data_root = os.path.realpath(data_dir)
+    directory = os.path.realpath(os.path.join(data_root, "style_backgrounds"))
+    if directory != os.path.join(data_root, "style_backgrounds"):
+        raise ValueError("Background directory must not be a symlink")
+    path = os.path.join(directory, filename)
+    if os.path.commonpath((directory, os.path.realpath(path))) != directory:
+        raise ValueError("Background file escapes its directory")
+    return path
+
+
 def _open_temporary(directory, binary=False):
     for _ in range(10):
         temporary = os.path.join(directory, f".multiview-{secrets.token_hex(16)}.tmp")
@@ -17,10 +32,9 @@ def _open_temporary(directory, binary=False):
     raise FileExistsError("Could not allocate a temporary Multiview file")
 
 
-def atomic_write_text(path, content):
-    """Replace a UTF-8 text file only after its complete contents are written."""
+def _atomic_write(path, content, *, binary):
     directory = os.path.dirname(os.path.abspath(path))
-    temporary, output = _open_temporary(directory)
+    temporary, output = _open_temporary(directory, binary=binary)
 
     try:
         with output:
@@ -31,6 +45,16 @@ def atomic_write_text(path, content):
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def atomic_write_text(path, content):
+    """Replace a UTF-8 text file only after its complete contents are written."""
+    _atomic_write(path, content, binary=False)
+
+
+def atomic_write_bytes(path, content):
+    """Replace a binary file only after its complete contents are written."""
+    _atomic_write(path, content, binary=True)
 
 
 def copy_legacy_file(source, destination):
@@ -86,10 +110,8 @@ def migrate_backgrounds(settings, code_dir, data_dir):
         filename = style.get("background_image")
         if not filename:
             continue
-        if not isinstance(filename, str) or os.path.basename(filename) != filename or filename in (".", ".."):
-            raise ValueError("Invalid background filename in saved settings")
-        source = os.path.join(code_dir, "style_backgrounds", filename)
-        destination = os.path.join(data_dir, "style_backgrounds", filename)
+        source = background_path(code_dir, filename)
+        destination = background_path(data_dir, filename)
         if copy_legacy_file(source, destination) == "missing":
             missing.append(filename)
     return missing
