@@ -77,13 +77,13 @@ class PyavAutoInstallTests(unittest.TestCase):
 
     def test_automatic_noop_and_revoked_consent_do_not_reload(self):
         instance = Plugin()
-        for result in ({"status": "error", "message": "PyAV is already current"},
+        for result in ({"status": "success", "reason": "current", "message": "PyAV is already current"},
                        {"status": "error", "message": "Automatic PyAV installation is not authorized"}):
             with self.subTest(result=result), patch.object(instance, "_deps", return_value=deps), \
                  patch.object(deps, "detect_arch", return_value=self.arch), \
                  patch.object(deps, "maybe_auto_install", return_value=result):
                 response = instance.run("install_pyav", {"automatic": True}, {"data_dir": self.data_dir})
-                self.assertEqual(response["status"], "error")
+                self.assertEqual(response["status"], result["status"])
                 self.assertNotIn("_dispatcharr", response)
 
     def test_successful_automatic_repair_requests_reload(self):
@@ -186,7 +186,7 @@ class PyavAutoInstallTests(unittest.TestCase):
             urlopen.assert_called_once()
         self.assertEqual(deps.pyav_status(self.arch, self.data_dir), deps.PYAV_VERSION)
         self.assertEqual(len(results), 2)
-        self.assertEqual(sorted(result["status"] for result in results), ["error", "success"])
+        self.assertEqual([result["status"] for result in results], ["success", "success"])
         self.assertTrue(any("already current" in result["message"] for result in results))
         save.assert_called_once()
 
