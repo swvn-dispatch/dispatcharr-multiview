@@ -34,6 +34,8 @@ ARCHES = {
 
 def detect_arch() -> "str | None":
     """vendor subdir for this host, or None if unsupported."""
+    if platform.system().lower() != "linux":
+        return None
     m = platform.machine().lower()
     for arch, info in ARCHES.items():
         if m in info["machines"]:

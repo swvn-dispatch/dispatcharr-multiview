@@ -94,7 +94,7 @@ class ManagedLifecycleTests(unittest.TestCase):
         self.assertEqual(self.context["dispatch_scheduled_task"].call_count, 2)
 
     @patch.object(src, "_close_db_connections")
-    def test_ready_queues_architecture_specific_consent_aware_check(self, close_connections):
+    def test_ready_queues_consent_aware_check(self, close_connections):
         listener = Mock()
         listener.serve.side_effect = lambda stop_event, on_ready, on_tick: on_ready()
         deps = Mock()
@@ -102,16 +102,34 @@ class ManagedLifecycleTests(unittest.TestCase):
         with patch.object(src, "_server") as module, patch.object(self.plugin, "_deps", return_value=deps):
             module.return_value.MultiviewServer.return_value = listener
             self.plugin._run_managed_service(self.stop, self.context)
-        self.context["dispatch_task"].assert_called_once_with("install_pyav_arm64", {"automatic": True})
+        self.context["dispatch_task"].assert_called_once_with("install_pyav", {"automatic": True})
 
     def test_automatic_install_action_uses_consent_checked_repair(self):
         deps = Mock()
+        deps.detect_arch.return_value = "linux-aarch64"
         deps.maybe_auto_install.return_value = None
         with patch.object(self.plugin, "_deps", return_value=deps):
-            result = self.plugin.run("install_pyav_arm64", {"automatic": True}, {"data_dir": "/durable"})
+            result = self.plugin.run("install_pyav", {"automatic": True}, {"data_dir": "/durable"})
         deps.maybe_auto_install.assert_called_once_with("linux-aarch64", "/durable")
         deps.install_pyav.assert_not_called()
         self.assertEqual(result["status"], "success")
+
+    def test_manual_install_detects_architecture(self):
+        deps = Mock()
+        deps.detect_arch.return_value = "linux-x86_64"
+        deps.install_pyav.return_value = {"status": "success"}
+        with patch.object(self.plugin, "_deps", return_value=deps):
+            result = self.plugin.run("install_pyav", {}, {"data_dir": "/durable"})
+        deps.install_pyav.assert_called_once_with("linux-x86_64", "/durable")
+        self.assertEqual(result["status"], "success")
+
+    def test_unsupported_architecture_does_not_install(self):
+        deps = Mock()
+        deps.detect_arch.return_value = None
+        with patch.object(self.plugin, "_deps", return_value=deps):
+            result = self.plugin.run("install_pyav", {}, {"data_dir": "/durable"})
+        self.assertEqual(result["status"], "error")
+        deps.install_pyav.assert_not_called()
 
 
 class StorageStartupTests(unittest.TestCase):

@@ -11,6 +11,7 @@ import uuid
 from unittest.mock import patch
 
 import src
+from src import server
 
 
 class StartupModuleLoadingTests(unittest.TestCase):
@@ -113,6 +114,27 @@ class StartupModuleLoadingTests(unittest.TestCase):
         with patch.dict(sys.modules):
             del sys.modules["src"]
             self.assertTrue(src._load_submodule(self.name).ready)
+
+    def test_path_loader_inherits_host_builtins(self):
+        import builtins
+        self.write_module("observed = host_guard_marker\n")
+        guarded = dict(vars(builtins), host_guard_marker="guarded")
+        with patch.object(src, "__builtins__", guarded):
+            module = src._load_submodule(self.name)
+        self.assertEqual(module.observed, "guarded")
+        self.assertIs(module.__builtins__, guarded)
+
+    def test_dashboard_path_loader_inherits_host_builtins(self):
+        import builtins
+        guarded = dict(vars(builtins))
+        with (
+            patch.dict(sys.modules),
+            patch.object(server, "_dash_api", None),
+            patch.object(server, "__builtins__", guarded),
+        ):
+            sys.modules.pop("src.dash_api", None)
+            module = server._load_dash_api()
+        self.assertIs(module.__builtins__, guarded)
 
 
 if __name__ == "__main__":

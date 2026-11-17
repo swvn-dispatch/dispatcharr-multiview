@@ -21,9 +21,9 @@ class ManifestActionTests(unittest.TestCase):
         self.assertEqual(src.Plugin.actions, manifest["actions"])
         self.assertEqual(
             {action["id"] for action in manifest["actions"]},
-            {"generate_m3u", "reload_active_multiviews", "install_pyav_amd64", "install_pyav_arm64"},
+            {"generate_m3u", "reload_active_multiviews", "install_pyav"},
         )
-        self.assertEqual(len(manifest["actions"]), 4)
+        self.assertEqual(len(manifest["actions"]), 3)
 
 
 if __name__ == "__main__":
