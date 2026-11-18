@@ -14,7 +14,7 @@ import time
 
 try:
     from .audio_policy import samples_before_pts
-    from .frame_policy import FrameReduction
+    from .frame_policy import FrameReduction, PresentationStats
     from .stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
         is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
@@ -22,7 +22,7 @@ try:
     )
 except ImportError:
     from audio_policy import samples_before_pts
-    from frame_policy import FrameReduction
+    from frame_policy import FrameReduction, PresentationStats
     from stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
         is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
@@ -175,6 +175,7 @@ class Channel:
         # decouples that deterministic choice from decoder-thread wake timing.
         self.vlock = threading.Lock()
         self.vframes = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
+        self.presentation_stats = PresentationStats() if spec.get("diagnostic_logs", False) else None
         self.display = self.fallback
         # Video presentation has its own anchor. It must be reset after a
         # source rebase without disturbing the decoder/audio PTS clock.
@@ -488,15 +489,28 @@ class Channel:
         """Return the newest decoded frame due at *wall_time* by source PTS."""
         with self.vlock:
             if held_frame(self.latest, self.fallback, self.fresh_until, time.monotonic()) is self.fallback:
+                if self.presentation_stats is not None:
+                    self.presentation_stats.record(fallback=True)
                 return self.fallback
             if not self.vframes:
+                if self.presentation_stats is not None:
+                    self.presentation_stats.record()
                 return self.display
             self.present_pts, self.present_wall, target_pts = presentation_target(
                 self.present_pts, self.present_wall, self.vframes[0][0], wall_time,
             )
+            due = 0
+            selected_pts = None
             while self.vframes and self.vframes[0][0] <= target_pts:
-                _, self.display = self.vframes.popleft()
+                selected_pts, self.display = self.vframes.popleft()
+                due += 1
+            if self.presentation_stats is not None:
+                self.presentation_stats.record(due, target_pts - selected_pts if due else None)
             return self.display
+
+    def take_presentation_stats(self):
+        with self.vlock:
+            return self.presentation_stats.take(), len(self.vframes)
 
     def video_queue_depth(self):
         with self.vlock:

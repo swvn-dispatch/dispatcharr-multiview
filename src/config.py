@@ -138,6 +138,20 @@ _GLOBAL_SETTINGS_FIELDS = [
         ),
     },
     {
+        "id": "diagnostic_logs",
+        "label": "Per-Tile Diagnostic Logs",
+        "type": "select",
+        "default": "disabled",
+        "options": [
+            {"value": "disabled", "label": "Disabled"},
+            {"value": "enabled", "label": "Enabled"},
+        ],
+        "description": (
+            "Log per-tile frame rates, presentation counts and queue depth every "
+            "30 seconds. Applies when a stream starts or reloads. Off by default."
+        ),
+    },
+    {
         "id": "audio_track_labels",
         "label": "Audio Track Labels",
         "type": "select",
