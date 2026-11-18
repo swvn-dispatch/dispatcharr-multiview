@@ -333,7 +333,6 @@ class MultiviewServer:
             if environ.get("HTTP_ORIGIN") or environ.get("CONTENT_TYPE", "").split(";", 1)[0].strip().lower() != "application/json":
                 start_response("403 Forbidden", [("Content-Type", "text/plain")])
                 return [b"Forbidden\n"]
-            import json
             body = json.dumps({"count": self.kill_active_streams()}).encode("utf-8")
             start_response("200 OK", [("Content-Type", "application/json")])
             return [body]
