@@ -34,7 +34,7 @@
       "description": "Write multiview.m3u and multiview_epg.xml, then refresh the M3U account and EPG source in Dispatcharr",
       "button_label": "Regenerate",
       "button_variant": "filled",
-      "button_color": "orange"
+      "button_color": "green"
     },
     {
       "id": "reload_active_multiviews",
@@ -49,8 +49,8 @@
       "label": "Install / Update PyAV",
       "description": "Install PyAV for this host and allow automatic repairs.",
       "button_label": "Install PyAV",
-      "button_variant": "filled",
-      "button_color": "red",
+      "button_variant": "outline",
+      "button_color": "orange",
       "async": true
     },
     {

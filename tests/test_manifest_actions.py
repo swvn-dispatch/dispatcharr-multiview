@@ -37,8 +37,9 @@ class ManifestActionTests(unittest.TestCase):
         self.assertEqual(actions["refresh_ui"]["button_color"], "blue")
         self.assertEqual(actions["sample_diagnostics"]["button_color"], "orange")
         self.assertEqual(actions["sample_diagnostics"]["button_variant"], "outline")
-        self.assertEqual(actions["install_pyav"]["button_color"], "red")
-        self.assertEqual(actions["generate_m3u"]["button_color"], "orange")
+        self.assertEqual(actions["install_pyav"]["button_color"], "orange")
+        self.assertEqual(actions["install_pyav"]["button_variant"], "outline")
+        self.assertEqual(actions["generate_m3u"]["button_color"], "green")
         self.assertEqual(actions["reload_active_multiviews"]["button_color"], "orange")
 
     def test_refresh_ui_action_requests_ui_refresh_only(self):
