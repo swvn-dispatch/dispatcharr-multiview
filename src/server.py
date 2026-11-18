@@ -17,6 +17,7 @@ is the single client of /stream/{n} and fans out downstream; no client-sharing
 logic is needed here.
 """
 
+import importlib.util
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compositor_w
 _server_instance = None
 _dash_api = None
 _LIVE_RELOAD_INTERVALS = {"15": 15, "30": 30, "60": 60, "120": 120, "300": 300}
+_native_subprocess = None
 
 
 def _load_dash_api():
@@ -100,13 +102,19 @@ def _python_exe() -> str:
 
 def _start_compositor(cmd, env):
     """Start a child without gevent's default-loop-only child watcher."""
-    from gevent import monkey
     from gevent.fileobject import FileObjectPosix
 
-    if monkey.is_object_patched("subprocess", "Popen"):
-        raise RuntimeError("Cannot start a compositor with monkey-patched subprocess in a managed service thread")
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env, bufsize=0)
+    # Load a separate copy: gevent patches both Popen and private module globals
+    # used by the original class. Avoid patched posix_spawn child watchers too.
+    global _native_subprocess
+    if _native_subprocess is None:
+        spec = importlib.util.spec_from_file_location("_multiview_subprocess", subprocess.__file__)
+        native = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(native)
+        native._USE_POSIX_SPAWN = False
+        _native_subprocess = native
+    proc = _native_subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=env, bufsize=0)
     try:
         proc.stdin = FileObjectPosix(proc.stdin, mode="wb")
         proc.stdout = FileObjectPosix(proc.stdout, mode="rb")
