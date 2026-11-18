@@ -480,6 +480,7 @@ class MultiviewServer:
                 "lang": langs.get(i, "und"),
                 "featured": featured_layout and i == 0,
                 "output_fps": output_fps,
+                "diagnostic_logs": settings.get("diagnostic_logs") == "enabled",
                 "tile_hold_secs": hold_seconds,
                 "hwaccel": {"h264_nvenc": "cuda", "h264_vaapi": "vaapi", "h264_qsv": "qsv"}.get(encoder),
                 "hwaccel_device": (settings.get("render_device") if settings.get("render_device") not in (None, "", "auto") and encoder in ("h264_vaapi", "h264_qsv") else None),
@@ -494,6 +495,7 @@ class MultiviewServer:
             "video_encoder": encoder,
             "render_device": settings.get("render_device") or "auto",
             "audio_track_labels": settings.get("audio_track_labels", "enabled"),
+            "diagnostic_logs": settings.get("diagnostic_logs") == "enabled",
             "background": background,
             "tiles": tile_cfg,
         }

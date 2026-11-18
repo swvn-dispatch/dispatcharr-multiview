@@ -319,6 +319,15 @@ def main():
                                    f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}/"
                                    f"{c.recovery_status()}"
                                    for i, c in enumerate(channels))
+                if cfg.get("diagnostic_logs", False):
+                    for i, c in enumerate(channels):
+                        (fresh, repeated, skipped, fallback, lag_total, lag_max, lag_count), depth = c.take_presentation_stats()
+                        lag_mean_ms = 1000 * lag_total / lag_count if lag_count else 0.0
+                        log(f"tile={c.name!r} decode={(c.vcount - prev_counts[i]) / dt:.1f}fps "
+                            f"scale={(c.scaled_vcount - prev_scaled_counts[i]) / dt:.1f}fps "
+                            f"fresh={fresh} repeat={repeated} skipped={skipped} fallback={fallback} "
+                            f"queue={depth} pts_age_mean={lag_mean_ms:.1f}ms pts_age_max={1000 * lag_max:.1f}ms "
+                            f"interval={dt:.1f}s {c.recovery_status()}", "INFO")
                 audio = []
                 for i, c in enumerate(audio_chs):
                     last_pts, buffered, resyncs, first_pts = c.audio_status()

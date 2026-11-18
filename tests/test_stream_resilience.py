@@ -50,6 +50,30 @@ class StreamTransitionTests(unittest.TestCase):
         self.assertEqual((pts, wall, target), (500, 100, 500.5))
         self.assertEqual(stream_resilience.anchored_pts(pts, wall, 100.5), 500.5)
 
+    def test_presentation_tracks_cadence_change_and_pts_reanchor(self):
+        target = stream_resilience.presentation_target
+        pts, wall, _ = target(None, None, 100.0, 10.0)
+        self.assertAlmostEqual(target(pts, wall, 101.0, 11.0)[2], 101.0)
+        # A source can change frame interval while presentation remains tied
+        # to timestamps, rather than interpreting frame count as elapsed time.
+        source = [100 + i * 1001 / 60000 for i in range(120)]
+        source += [102.002 + i * 1001 / 30000 for i in range(60)]
+        selected = []
+        index = 0
+        for n in range(240):
+            _, _, due = target(pts, wall, source[index] if index < len(source) else 0, 10 + n / 60)
+            count = 0
+            while index < len(source) and source[index] <= due + 1e-9:
+                index += 1
+                count += 1
+            selected.append(count)
+        self.assertGreater(sum(bool(x) for x in selected[:120]), 115)
+        self.assertTrue(58 <= sum(bool(x) for x in selected[120:]) <= 61)
+        # A discontinuity clears the anchor and starts the new PTS epoch.
+        self.assertTrue(stream_resilience.is_pts_discontinuity(-90))
+        pts, wall, due = target(None, None, 12.0, 12.0)
+        self.assertEqual((pts, wall, due), (12.0, 12.0, 12.0))
+
     def test_provider_transition_waits_for_keyframe(self):
         previous = (1280, 720, "yuv420p")
         replacement = (1920, 1080, "yuv420p")
