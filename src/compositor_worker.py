@@ -30,7 +30,7 @@ import numpy as np  # noqa: E402
 from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_compositor_failure, validate_encoder  # noqa: E402
 from audio_metadata import generated_audio_metadata_args  # noqa: E402
 from audio_policy import PresentationClock  # noqa: E402
-from diagnostics import DiagnosticSampler  # noqa: E402
+from diagnostics import DiagnosticSampler, OutputMeter  # noqa: E402
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                           # FIFO forward to re-sync (see audio_feeder())
@@ -184,7 +184,11 @@ def main():
 
     for c in channels:
         threading.Thread(target=c.run, name=f"chan-{c.name}", daemon=True).start()
-    sampler = DiagnosticSampler(channels, lambda data: log("DIAGNOSTIC " + json.dumps(data)))
+    output_meter = OutputMeter()
+    output_info = {"configured_fps": cfg["fps"], "width": out_w, "height": out_h,
+                   "video_encoder": cfg.get("video_encoder", "libx264")}
+    sampler = DiagnosticSampler(channels, lambda data: log("DIAGNOSTIC " + json.dumps(data)),
+                                output_meter=output_meter, output_info=output_info)
     threading.Thread(target=stdin_listener, args=(channels, stop, sampler), name="stdin-ctrl", daemon=True).start()
 
     # Hardware profiles can place the already-letterboxed tiles in ffmpeg's
@@ -192,6 +196,7 @@ def main():
     # CPU canvas path rather than making a playable stream fail to start.
     compositor = gpu_compositor(cfg)
     gpu_composition = compositor is not None
+    output_info["compositor"] = compositor["name"] if gpu_composition else "cpu"
     if gpu_composition:
         log(f"compositor={compositor['name']} (hardware profile selected)")
         video_pipes = [os.pipe() for _ in channels]
@@ -287,6 +292,7 @@ def main():
     try:
         while not stop.is_set():
             frame_time = start + n / fps_f
+            write_seconds = 0.0
             for i, t in enumerate(channels):
                 Yt, Ut, Vt, ox, oy, tw, th = t.current_at(frame_time)
                 x, y, w, h = t.x, t.y, t.w, t.h
@@ -298,7 +304,11 @@ def main():
                     Yb[oy:oy + th, ox:ox + tw] = Yt
                     Ub[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Ut
                     Vb[oy // 2:(oy + th) // 2, ox // 2:(ox + tw) // 2] = Vt
-                    if not _write_all(video_write[i], memoryview(buf)):
+                    write_start = time.monotonic() if output_meter.active else None
+                    written = _write_all(video_write[i], memoryview(buf))
+                    if write_start is not None:
+                        write_seconds += time.monotonic() - write_start
+                    if not written:
                         stop.set()
                         break
                 else:
@@ -309,14 +319,20 @@ def main():
                     Yc[py:py + th, px:px + tw] = Yt
                     Uc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Ut
                     Vc[py // 2:(py + th) // 2, px // 2:(px + tw) // 2] = Vt
-            if not gpu_composition and not _write_all(video_write[0], memoryview(cbuf)):
-                break
+            if not gpu_composition:
+                write_start = time.monotonic() if output_meter.active else None
+                written = _write_all(video_write[0], memoryview(cbuf))
+                if write_start is not None:
+                    write_seconds += time.monotonic() - write_start
+                if not written:
+                    break
             if stop.is_set():
                 break
             # Audio must not advance while a video pipe write is blocked. Mark
             # this interval available only after FFmpeg has accepted its frame.
             presentation_clock.mark_presented(frame_time + 1 / fps_f)
             n += 1
+            output_meter.record(write_seconds)
             now = time.monotonic()
             if now >= log_at:   # heartbeat: per-channel decode fps (CPU health)
                 dt = now - prev_t

@@ -1,6 +1,15 @@
 """Small, dependency-free recovery rules for multiview child streams."""
 
 PTS_DISCONTINUITY_SECS = 2.0
+DECODE_AHEAD_SECS = 0.15
+PRESENTATION_PREROLL_SECS = 0.15
+
+
+def decode_pacing(gap, ahead=DECODE_AHEAD_SECS):
+    """Keep a small decode cushion without changing the source clock anchor."""
+    if is_pts_discontinuity(gap):
+        return 0.0, True
+    return max(0.0, gap - ahead), False
 
 
 def is_pts_discontinuity(gap):
@@ -20,10 +29,10 @@ def held_frame(latest, fallback, fresh_until, now):
     return latest if now < fresh_until else fallback
 
 
-def presentation_target(anchor_pts, anchor_wall, next_pts, wall_time):
+def presentation_target(anchor_pts, anchor_wall, next_pts, wall_time, preroll=0.0):
     """Return a video-only PTS anchor and the frame PTS due at wall_time."""
     if anchor_pts is None or anchor_wall is None:
-        return next_pts, wall_time, next_pts
+        return next_pts, wall_time + preroll, next_pts - preroll
     return anchor_pts, anchor_wall, anchor_pts + wall_time - anchor_wall
 
 

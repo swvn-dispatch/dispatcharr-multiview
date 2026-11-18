@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from src import Plugin, server
-from src.diagnostics import DiagnosticSampler
+from src.diagnostics import DiagnosticSampler, OutputMeter
 from src.frame_policy import PresentationStats
 
 
@@ -18,6 +18,9 @@ class FakeChannel:
 
     def start_presentation_stats(self):
         self.stats = PresentationStats()
+
+    def diagnostic_source_info(self):
+        return {"source_fps_estimate": 30.0, "source_width": 1920, "source_height": 1080}
 
     def take_presentation_stats(self, continue_sampling=False):
         stats = self.stats.take()
@@ -67,6 +70,53 @@ class DiagnosticSamplingTests(unittest.TestCase):
         self.assertEqual(result["tiles"][0]["decoded_fps"], 30)
         self.assertEqual(result["tiles"][0]["pts_age_mean_ms"], 2.5)
         self.assertEqual(result["tiles"][0]["pts_age_max_ms"], 4.0)
+
+    def test_one_second_intervals_include_timing_and_output_metrics(self):
+        channel = FakeChannel()
+        timer = Mock()
+        emitted = []
+        meter = OutputMeter()
+        sampler = DiagnosticSampler([channel], emitted.append,
+                                    Mock(side_effect=[0, 1, 2]), timer, meter)
+        self.assertTrue(sampler.start("a" * 32, duration=2))
+        self.assertEqual(timer.call_args.args[0], 1)
+        for i in range(2):
+            channel.vcount += 30
+            channel.scaled_vcount += 30
+            channel.stats.record(due=1, lag=0.01, queue_depth=i)
+            channel.stats.enqueue_lead(-0.005 if i == 0 else 0.04)
+            if i == 0:
+                channel.stats.event("recovery", 0.5)
+            meter.record(0.002)
+            callback = timer.call_args.args[1]
+            callback(*timer.call_args.kwargs["args"])
+        result = emitted[0]
+        self.assertEqual(len(result["intervals"]), 2)
+        tile = result["tiles"][0]
+        self.assertEqual(tile["queue_depth_min"], 0)
+        self.assertEqual(tile["queue_depth_max"], 1)
+        self.assertEqual(tile["queue_empty_percent"], 50)
+        self.assertEqual(tile["events"], [{"type": "recovery", "elapsed_seconds": 0.5}])
+        self.assertEqual(tile["source_fps_estimate"], 30.0)
+        self.assertEqual(result["output"]["encoder_pipe_write_ms"], 4.0)
+        self.assertEqual(result["output"]["fps"], 1.0)
+
+    def test_two_minute_timeline_fits_action_response(self):
+        channels = [FakeChannel() for _ in range(4)]
+        timer = Mock()
+        emitted = []
+        sampler = DiagnosticSampler(channels, emitted.append,
+                                    Mock(side_effect=range(121)), timer)
+        self.assertTrue(sampler.start("a" * 32))
+        for _ in range(120):
+            for channel in channels:
+                channel.vcount += 30
+                channel.scaled_vcount += 30
+                channel.stats.record(due=1, lag=0.01, queue_depth=2)
+            callback = timer.call_args.args[1]
+            callback(*timer.call_args.kwargs["args"])
+        self.assertEqual(len(emitted[0]["intervals"]), 120)
+        self.assertLess(len(json.dumps(emitted[0]).encode()), 4 * 1024 * 1024)
 
     def test_service_collects_worker_result_without_killing_worker(self):
         instance = server.MultiviewServer("127.0.0.1", 9292, "/unused")

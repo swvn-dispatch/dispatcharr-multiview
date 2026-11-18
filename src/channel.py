@@ -17,16 +17,16 @@ try:
     from .frame_policy import FrameReduction, PresentationStats
     from .stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
-        frame_can_resume, source_format_changed,
+        is_pts_progress, presentation_target, anchored_pts, resample_frame,
+        frame_can_resume, source_format_changed, decode_pacing, PRESENTATION_PREROLL_SECS,
     )
 except ImportError:
     from audio_policy import samples_before_pts
     from frame_policy import FrameReduction, PresentationStats
     from stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
-        frame_can_resume, source_format_changed,
+        is_pts_progress, presentation_target, anchored_pts, resample_frame,
+        frame_can_resume, source_format_changed, decode_pacing, PRESENTATION_PREROLL_SECS,
     )
 
 # The server supplies the host-specific durable PyAV directory to each worker.
@@ -292,6 +292,11 @@ class Channel:
             self.abuffered = 0
             self.last_taken_pts = None
         with self.vlock:
+            if self.presentation_stats is not None:
+                kind = ("source_format_change" if reason.startswith("format ") else
+                        "pts_discontinuity" if reason.startswith("PTS discontinuity") else
+                        "connection_opened" if reason == "connection opened" else "recovery")
+                self.presentation_stats.event(kind, time.monotonic())
             self.vframes.clear()
             self.present_pts = None
             self.present_wall = None
@@ -407,6 +412,8 @@ class Channel:
                                             self.clk_pts = None
                                             self.clk_wall = None
                                             with self.vlock:
+                                                if self.presentation_stats is not None:
+                                                    self.presentation_stats.event("pts_stall", now)
                                                 self.vframes.clear()
                                                 self.display = self.fallback
                                                 self.fresh_until = 0.0
@@ -417,10 +424,11 @@ class Channel:
                                         continue
                                     if self.clk_pts is not None:
                                         gap = (self.clk_wall + pts_s - self.clk_pts) - now
-                                        if 0 < gap < 2.0:
-                                            time.sleep(gap)
-                                        elif is_pts_discontinuity(gap):
+                                        delay, discontinuity = decode_pacing(gap)
+                                        if discontinuity:
                                             self._begin_recovery(f"PTS discontinuity {gap:+.1f}s")
+                                        elif delay:
+                                            time.sleep(delay)
                                 if not frame_can_resume(self.awaiting_keyframe,
                                                         bool(getattr(frame, "key_frame", False)
                                                              or getattr(packet, "is_keyframe", False))):
@@ -436,6 +444,9 @@ class Channel:
                                     self.latest = tile
                                     self.fresh_until = time.monotonic() + self.tile_stale_secs
                                     if frame.pts is not None:
+                                        if self.presentation_stats is not None and self.present_pts is not None:
+                                            target = anchored_pts(self.present_pts, self.present_wall, time.monotonic())
+                                            self.presentation_stats.enqueue_lead(pts_s - target)
                                         self.vframes.append((pts_s, tile))
                                     else:
                                         self.display = tile
@@ -490,14 +501,15 @@ class Channel:
         with self.vlock:
             if held_frame(self.latest, self.fallback, self.fresh_until, time.monotonic()) is self.fallback:
                 if self.presentation_stats is not None:
-                    self.presentation_stats.record(fallback=True)
+                    self.presentation_stats.record(fallback=True, queue_depth=len(self.vframes))
                 return self.fallback
             if not self.vframes:
                 if self.presentation_stats is not None:
-                    self.presentation_stats.record()
+                    self.presentation_stats.record(queue_depth=0)
                 return self.display
             self.present_pts, self.present_wall, target_pts = presentation_target(
                 self.present_pts, self.present_wall, self.vframes[0][0], wall_time,
+                preroll=PRESENTATION_PREROLL_SECS,
             )
             due = 0
             selected_pts = None
@@ -505,7 +517,8 @@ class Channel:
                 selected_pts, self.display = self.vframes.popleft()
                 due += 1
             if self.presentation_stats is not None:
-                self.presentation_stats.record(due, target_pts - selected_pts if due else None)
+                self.presentation_stats.record(due, target_pts - selected_pts if due else None,
+                                               queue_depth=len(self.vframes))
             return self.display
 
     def take_presentation_stats(self, continue_sampling=False):
@@ -518,6 +531,16 @@ class Channel:
     def start_presentation_stats(self):
         with self.vlock:
             self.presentation_stats = PresentationStats()
+
+    def diagnostic_source_info(self):
+        try:
+            rate = self.frame_reduction.source_fps()
+        except (RuntimeError, ZeroDivisionError):
+            rate = None
+        fmt = self.input_format
+        return {"source_fps_estimate": round(rate, 2) if rate is not None else None,
+                "source_width": fmt[0] if fmt else None,
+                "source_height": fmt[1] if fmt else None}
 
     def video_queue_depth(self):
         with self.vlock:
