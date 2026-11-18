@@ -14,30 +14,25 @@ import time
 
 try:
     from .audio_policy import samples_before_pts
-    from .frame_policy import FrameReduction
+    from .frame_policy import FrameReduction, PresentationStats
     from .stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
-        frame_can_resume, source_format_changed,
+        is_pts_progress, presentation_target, anchored_pts, resample_frame,
+        frame_can_resume, source_format_changed, decode_pacing, PRESENTATION_PREROLL_SECS,
     )
 except ImportError:
     from audio_policy import samples_before_pts
-    from frame_policy import FrameReduction
+    from frame_policy import FrameReduction, PresentationStats
     from stream_resilience import (
         PTS_DISCONTINUITY_SECS, decode_packet, held_frame,
-        is_pts_discontinuity, is_pts_progress, presentation_target, anchored_pts, resample_frame,
-        frame_can_resume, source_format_changed,
+        is_pts_progress, presentation_target, anchored_pts, resample_frame,
+        frame_can_resume, source_format_changed, decode_pacing, PRESENTATION_PREROLL_SECS,
     )
 
-# Vendored PyAV is shipped per-platform under vendor/<os-arch>/; pick the one
-# matching this machine and put it on the path before importing av.
-_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-_ARCH_DIR = {
-    "x86_64": "linux-x86_64", "amd64": "linux-x86_64",
-    "aarch64": "linux-aarch64", "arm64": "linux-aarch64",
-}.get(platform.machine().lower())
-if _ARCH_DIR and os.path.isdir(os.path.join(_VENDOR, _ARCH_DIR)):
-    sys.path.insert(0, os.path.join(_VENDOR, _ARCH_DIR))
+# The server supplies the host-specific durable PyAV directory to each worker.
+_VENDOR = os.environ.get("MULTIVIEW_VENDOR_DIR", "")
+if _VENDOR and os.path.isdir(_VENDOR):
+    sys.path.insert(0, _VENDOR)
 
 import numpy as np  # noqa: E402
 try:
@@ -45,7 +40,7 @@ try:
 except ImportError:
     sys.stderr.write(
         f"[mvworker] FATAL: PyAV not installed for arch '{platform.machine()}' "
-        f"(expected {_VENDOR}/{_ARCH_DIR}). Open the Multiview plugin settings and "
+        f"(expected {_VENDOR or 'a configured vendor directory'}). Open the Multiview plugin settings and "
         f"run the 'Install PyAV' action.\n")
     raise
 
@@ -53,7 +48,6 @@ TILE_STALE_SECS = 1.5
 VIDEO_PTS_STALL_SECS = 10.0
 RECONNECT_BASE    = 2.0   # first retry delay (seconds)
 RECONNECT_MAX     = 60.0  # cap on per-retry delay
-RECONNECT_RETRIES = 12    # consecutive failures before giving up (~8 min total)
 AUDIO_RATE = 48000
 AUDIO_LAYOUT = "stereo"
 VIDEO_QUEUE_FRAMES = 120
@@ -72,8 +66,9 @@ DECODE_OPTS = {
 }
 
 
-def log(msg):
-    sys.stderr.write(f"[mvworker] {msg}\n")
+def log(msg, level=None):
+    prefix = f"{level}: " if level else ""
+    sys.stderr.write(f"[mvworker] {prefix}{msg}\n")
     sys.stderr.flush()
 
 
@@ -162,6 +157,7 @@ class Channel:
         self.frame_reduction = FrameReduction(spec.get("output_fps", "30"))
         self.hwaccel = spec.get("hwaccel")
         self.hwaccel_device = spec.get("hwaccel_device")
+        self._reported_decode_mode = None
         self.valign = spec.get("valign", "center")
         self.halign = spec.get("halign", "center")
         self.tile_stale_secs = max(TILE_STALE_SECS, float(spec.get("tile_hold_secs", TILE_STALE_SECS)))
@@ -179,6 +175,7 @@ class Channel:
         # decouples that deterministic choice from decoder-thread wake timing.
         self.vlock = threading.Lock()
         self.vframes = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
+        self.presentation_stats = None
         self.display = self.fallback
         # Video presentation has its own anchor. It must be reset after a
         # source rebase without disturbing the decoder/audio PTS clock.
@@ -197,7 +194,8 @@ class Channel:
         # clk_pts reset. Protected by self.alock (same as aframes/abuffered).
         self.last_taken_pts: "float | None" = None
         self.audio_resyncs = 0
-        self._reconnect_requested = False
+        self._reconnect_event = threading.Event()
+        self._reconnect_lock = threading.Lock()
         # A provider may change coded size, pixel format, cadence, or PTS epoch
         # without closing this HTTP child stream. Preserve the current tile
         # through that handoff and resume only from a decoded key frame.
@@ -217,12 +215,19 @@ class Channel:
                 accel = HWAccel(self.hwaccel, device=self.hwaccel_device,
                                 allow_software_fallback=False)
                 cont = av.open(self.url, options=DECODE_OPTS, hwaccel=accel)
-                log(f"channel {self.name}: hardware decode={self.hwaccel}")
+                mode = f"hardware:{self.hwaccel}"
+                if self._reported_decode_mode != mode:
+                    log(f"channel {self.name}: opened container with hardware decode={self.hwaccel}", "INFO")
+                    self._reported_decode_mode = mode
                 return cont
             except Exception as e:  # noqa: BLE001
-                log(f"channel {self.name}: hardware decode unavailable ({e}); using software")
+                log(f"channel {self.name}: hardware decode={self.hwaccel} unavailable ({e}); using software", "WARNING")
                 self.hwaccel = None
-        return av.open(self.url, options=DECODE_OPTS)
+        cont = av.open(self.url, options=DECODE_OPTS)
+        if self._reported_decode_mode != "software":
+            log(f"channel {self.name}: opened container with software decode", "INFO")
+            self._reported_decode_mode = "software"
+        return cont
 
     def _make_fallback(self, logo):
         Y, U, V = black_planes(self.w, self.h)
@@ -264,8 +269,15 @@ class Channel:
             self.latest = fb
 
     def reconnect(self):
-        """Signal run() to drop and reconnect; checked inside the demux loop."""
-        self._reconnect_requested = True
+        """Interrupt backoff or request a reconnect inside the demux loop."""
+        with self._reconnect_lock:
+            self._reconnect_event.set()
+
+    def stop(self):
+        """Stop the decoder and wake it if it is waiting to retry."""
+        with self._reconnect_lock:
+            self.running = False
+            self._reconnect_event.set()
 
     def _begin_recovery(self, reason, retain_frame=True):
         """Reset timing state while preserving a valid tile through warm-up."""
@@ -280,6 +292,11 @@ class Channel:
             self.abuffered = 0
             self.last_taken_pts = None
         with self.vlock:
+            if self.presentation_stats is not None:
+                kind = ("source_format_change" if reason.startswith("format ") else
+                        "pts_discontinuity" if reason.startswith("PTS discontinuity") else
+                        "connection_opened" if reason == "connection opened" else "recovery")
+                self.presentation_stats.event(kind, time.monotonic())
             self.vframes.clear()
             self.present_pts = None
             self.present_wall = None
@@ -314,12 +331,12 @@ class Channel:
     def run(self):
         failures = 0
         while self.running:
-            if self._reconnect_requested:
-                self._reconnect_requested = False
-                failures = 0
-            if failures >= RECONNECT_RETRIES:
-                log(f"channel {self.name}: giving up after {RECONNECT_RETRIES} failed retries")
-                break
+            with self._reconnect_lock:
+                if self._reconnect_event.is_set():
+                    self._reconnect_event.clear()
+                    failures = 0
+                if not self.running:
+                    break
             cont = None
             # Keep an already displayed image while a replacement connection
             # warms up. Initial startup has no frame to preserve.
@@ -357,7 +374,7 @@ class Channel:
                     res = av.AudioResampler(format="s16", layout=AUDIO_LAYOUT, rate=AUDIO_RATE)
                 try:
                     for packet in cont.demux(*streams):
-                        if not self.running or self._reconnect_requested:
+                        if not self.running or self._reconnect_event.is_set():
                             break
                         if packet.dts is None:
                             continue
@@ -395,6 +412,8 @@ class Channel:
                                             self.clk_pts = None
                                             self.clk_wall = None
                                             with self.vlock:
+                                                if self.presentation_stats is not None:
+                                                    self.presentation_stats.event("pts_stall", now)
                                                 self.vframes.clear()
                                                 self.display = self.fallback
                                                 self.fresh_until = 0.0
@@ -405,10 +424,11 @@ class Channel:
                                         continue
                                     if self.clk_pts is not None:
                                         gap = (self.clk_wall + pts_s - self.clk_pts) - now
-                                        if 0 < gap < 2.0:
-                                            time.sleep(gap)
-                                        elif is_pts_discontinuity(gap):
+                                        delay, discontinuity = decode_pacing(gap)
+                                        if discontinuity:
                                             self._begin_recovery(f"PTS discontinuity {gap:+.1f}s")
+                                        elif delay:
+                                            time.sleep(delay)
                                 if not frame_can_resume(self.awaiting_keyframe,
                                                         bool(getattr(frame, "key_frame", False)
                                                              or getattr(packet, "is_keyframe", False))):
@@ -424,6 +444,9 @@ class Channel:
                                     self.latest = tile
                                     self.fresh_until = time.monotonic() + self.tile_stale_secs
                                     if frame.pts is not None:
+                                        if self.presentation_stats is not None and self.present_pts is not None:
+                                            target = anchored_pts(self.present_pts, self.present_wall, time.monotonic())
+                                            self.presentation_stats.enqueue_lead(pts_s - target)
                                         self.vframes.append((pts_s, tile))
                                     else:
                                         self.display = tile
@@ -468,24 +491,56 @@ class Channel:
                 failures = 0
             else:
                 failures += 1
-            if self.running and failures < RECONNECT_RETRIES:
-                delay = min(RECONNECT_BASE * (2 ** (failures - 1)), RECONNECT_MAX)
-                log(f"channel {self.name}: retry {failures}/{RECONNECT_RETRIES} in {delay:.0f}s")
-                time.sleep(delay)
+            if self.running:
+                delay = min(RECONNECT_BASE * (2 ** min(max(failures - 1, -1), 5)), RECONNECT_MAX)
+                log(f"channel {self.name}: retry after {failures} failures in {delay:.0f}s")
+                self._reconnect_event.wait(delay)
 
     def current_at(self, wall_time):
         """Return the newest decoded frame due at *wall_time* by source PTS."""
         with self.vlock:
             if held_frame(self.latest, self.fallback, self.fresh_until, time.monotonic()) is self.fallback:
+                if self.presentation_stats is not None:
+                    self.presentation_stats.record(fallback=True, queue_depth=len(self.vframes))
                 return self.fallback
             if not self.vframes:
+                if self.presentation_stats is not None:
+                    self.presentation_stats.record(queue_depth=0)
                 return self.display
             self.present_pts, self.present_wall, target_pts = presentation_target(
                 self.present_pts, self.present_wall, self.vframes[0][0], wall_time,
+                preroll=PRESENTATION_PREROLL_SECS,
             )
+            due = 0
+            selected_pts = None
             while self.vframes and self.vframes[0][0] <= target_pts:
-                _, self.display = self.vframes.popleft()
+                selected_pts, self.display = self.vframes.popleft()
+                due += 1
+            if self.presentation_stats is not None:
+                self.presentation_stats.record(due, target_pts - selected_pts if due else None,
+                                               queue_depth=len(self.vframes))
             return self.display
+
+    def take_presentation_stats(self, continue_sampling=False):
+        with self.vlock:
+            stats = self.presentation_stats.take()
+            if not continue_sampling:
+                self.presentation_stats = None
+            return stats, len(self.vframes)
+
+    def start_presentation_stats(self):
+        with self.vlock:
+            self.presentation_stats = PresentationStats()
+
+    def diagnostic_source_info(self):
+        try:
+            rate = self.frame_reduction.source_fps()
+        except (RuntimeError, ZeroDivisionError):
+            rate = None
+        fmt = self.input_format
+        return {"source_fps_estimate": round(rate, 2) if rate is not None else None,
+                "source_width": fmt[0] if fmt else None,
+                "source_height": fmt[1] if fmt else None}
 
     def video_queue_depth(self):
         with self.vlock:

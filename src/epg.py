@@ -269,8 +269,8 @@ def generate_epg(settings: dict, plugin_dir: str) -> "int | None":
     xmltv = _build_xmltv(settings, order, window_start, window_end)
 
     xml_path = os.path.join(plugin_dir, "multiview_epg.xml")
-    with open(xml_path, "w", encoding="utf-8") as f:
-        f.write(xmltv)
+    from .storage import atomic_write_text
+    atomic_write_text(xml_path, xmltv)
 
     source, _ = EPGSource.objects.update_or_create(
         name="Dispatcharr Multiview",

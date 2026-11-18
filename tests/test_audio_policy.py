@@ -2,8 +2,11 @@
 
 import unittest
 import threading
+from collections import deque
+from unittest.mock import patch
 
 from src.audio_policy import PresentationClock, samples_before_pts
+from src.stream_resilience import presentation_target
 
 try:
     import numpy as np
@@ -39,6 +42,13 @@ class AudioPolicyTests(unittest.TestCase):
                 self.assertEqual(samples_before_pts(audio_pts, 960, video_pts, 48000), 0)
                 self.assertEqual(samples_before_pts(audio_pts, 960, audio_pts, 48000), 0)
                 self.assertEqual(samples_before_pts(audio_pts, 960, audio_pts + 0.01, 48000), 480)
+
+    def test_preroll_holds_audio_until_video_pts(self):
+        pts, wall, target = presentation_target(None, None, 5.0, 10.0, 0.15)
+        self.assertEqual(samples_before_pts(5.0, 960, target, 48000), 0)
+        _, _, target = presentation_target(pts, wall, 5.0, 10.16, 0.15)
+        self.assertAlmostEqual(target, 5.01)
+        self.assertEqual(samples_before_pts(5.0, 960, target, 48000), 480)
 
     @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
     def test_take_limits_partial_chunk_without_overfilling_output(self):
@@ -90,12 +100,30 @@ class AudioPolicyTests(unittest.TestCase):
         self.assertEqual(track.last_taken_pts, 5.0 + 100 / AUDIO_RATE)
 
     @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
-    def test_audio_pts_now_accepts_the_video_presentation_time(self):
+    def test_presentation_pts_uses_the_video_clock(self):
         track = Channel.__new__(Channel)
-        track.clk_pts = 100.0
-        track.clk_wall = 10.0
+        track.vlock = threading.Lock()
+        track.present_pts = 100.0
+        track.present_wall = 10.0
 
-        self.assertEqual(track.audio_pts_now(10.125), 100.125)
+        self.assertEqual(track.presentation_pts_now(10.125), 100.125)
+
+    @unittest.skipUnless(np is not None, "compositor runtime dependencies unavailable")
+    def test_preroll_keeps_video_and_audio_on_same_anchor(self):
+        track = Channel.__new__(Channel)
+        track.vlock = threading.Lock()
+        track.latest = "new frame"
+        track.fallback = "fallback"
+        track.display = track.fallback
+        track.fresh_until = 100.0
+        track.vframes = deque([(100.0, "new frame")])
+        track.present_pts = track.present_wall = None
+        track.presentation_stats = None
+        with patch("src.channel.time.monotonic", return_value=10.0):
+            self.assertEqual(track.current_at(10.0), "fallback")
+            self.assertAlmostEqual(track.presentation_pts_now(10.0), 99.85)
+            self.assertEqual(track.current_at(10.151), "new frame")
+            self.assertAlmostEqual(track.presentation_pts_now(10.151), 100.001)
 
 
 if __name__ == "__main__":

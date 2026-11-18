@@ -4,7 +4,9 @@ import datetime
 import glob
 import json
 import os
+import re
 import secrets
+import shlex
 
 try:
     from .regex_order import regex_sort_key
@@ -19,6 +21,49 @@ def _load_plugin_config() -> dict:
 
 
 PLUGIN_CONFIG = _load_plugin_config()
+
+
+def load_settings():
+    """Normalize persisted settings while holding the shared database row lock."""
+    from django.db import transaction
+    from apps.plugins.models import PluginConfig
+
+    with transaction.atomic():
+        cfg = PluginConfig.objects.select_for_update().get(key="multiview")
+        settings, changed1 = ensure_layout_order(cfg.settings)
+        settings, changed2 = reconcile_layout_count(settings)
+        settings, changed3 = ensure_custom_layout_order(settings)
+        settings, changed4 = migrate_channel_rows(settings)
+        settings, changed5 = sync_channel_audio(settings)
+        if changed1 or changed2 or changed3 or changed4 or changed5:
+            cfg.settings = settings
+            cfg.save(update_fields=["settings", "updated_at"])
+        return project_channel_rows(settings)
+
+
+def update_settings(updates):
+    """Merge updates against the latest settings under the same row lock."""
+    from django.db import transaction
+    from apps.plugins.models import PluginConfig
+
+    with transaction.atomic():
+        cfg = PluginConfig.objects.select_for_update().get(key="multiview")
+        settings = dict(cfg.settings or {})
+        settings, _ = ensure_layout_order(settings)
+        settings, _ = migrate_channel_rows(settings)
+        settings, _ = sync_channel_audio(settings)
+        for key, value in updates.items():
+            if value is None:
+                settings.pop(key, None)
+            else:
+                settings[key] = value
+        if updates.get("multiview_order") is not None:
+            settings["multiview_count"] = len(settings["multiview_order"])
+        settings, _ = migrate_channel_rows(settings)
+        settings = apply_dashboard_channel_updates(settings, updates)
+        settings, _ = sync_channel_audio(settings, explicit_audio=set(updates))
+        cfg.settings = settings
+        cfg.save(update_fields=["settings", "updated_at"])
 
 _ENCODER_OPTIONS = [
     {"value": "libx264",    "label": "Software (libx264)"},
@@ -131,8 +176,10 @@ _VIDEO_OUTPUT_FIELDS = [
         "options": [
             {"value": "24", "label": "24 fps"},
             {"value": "25", "label": "25 fps"},
+            {"value": "30000/1001", "label": "29.97 fps"},
             {"value": "30", "label": "30 fps"},
             {"value": "50", "label": "50 fps"},
+            {"value": "60000/1001", "label": "59.94 fps"},
             {"value": "60", "label": "60 fps"},
         ],
         "description": "Frame rate of the tiled output. Higher rates are smoother but use more CPU.",
@@ -302,7 +349,7 @@ def _new_layout_id() -> str:
     return secrets.token_hex(4)
 
 
-_BACKUP_KEYS = ("multiview_pre_migration_backup", "multiview_pre_reconcile_backup")
+_BACKUP_KEYS = ("multiview_pre_migration_backup", "multiview_pre_reconcile_backup", "multiview_pre_channel_table_backup")
 
 
 def _snapshot_before(settings: dict, backup_key: str) -> dict:
@@ -320,10 +367,129 @@ def _snapshot_before(settings: dict, backup_key: str) -> dict:
     clean = {k: v for k, v in settings.items() if k not in _BACKUP_KEYS}
     new_settings = dict(settings)
     new_settings[backup_key] = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "settings": clean,
     }
     return new_settings
+
+
+def migrate_channel_rows(settings: dict) -> tuple:
+    """Move legacy channel slots into one ordered table per layout."""
+    missing = [layout_id for layout_id in settings.get("multiview_order", [])
+               if f"multiview_{layout_id}_channels" not in settings]
+    if not missing:
+        return settings, False
+    result = _snapshot_before(settings, "multiview_pre_channel_table_backup")
+    for layout_id in missing:
+        prefix = f"multiview_{layout_id}_"
+        count = max(2, int(result.get(prefix + "channel_count", 4)))
+        result[prefix + "channels"] = [
+            {"channel": str(result.get(f"{prefix}channel_{index}") or "_none")}
+            for index in range(1, count + 1)
+        ]
+        for key in list(result):
+            if re.fullmatch(re.escape(prefix) + r"channel_\d+", key):
+                result.pop(key)
+    return result, True
+
+
+def project_channel_rows(settings: dict) -> dict:
+    """Expose classic channel slots to runtime and dashboard from table rows."""
+    result = dict(settings)
+    for layout_id in result.get("multiview_order", []):
+        prefix = f"multiview_{layout_id}_"
+        rows = result.get(prefix + "channels", [])
+        if not isinstance(rows, list):
+            raise ValueError(f"Invalid channel table for layout {layout_id}")
+        if result.get(prefix + "selector_type", "classic") == "classic":
+            result[prefix + "channel_count"] = len(rows)
+        for index, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                raise ValueError(f"Invalid channel row for layout {layout_id}")
+            result[f"{prefix}channel_{index}"] = str(row.get("channel") or "_none")
+    return result
+
+
+def sync_channel_audio(settings: dict, explicit_audio=frozenset()) -> tuple:
+    """Keep a classic layout's audio attached to the same row after deletion."""
+    result = dict(settings)
+    changed = False
+    for layout_id in result.get("multiview_order", []):
+        prefix = f"multiview_{layout_id}_"
+        key = prefix + "channels"
+        rows = result.get(key, [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"Invalid channel table for layout {layout_id}")
+        updated_rows = []
+        seen = set()
+        for row in rows:
+            row = dict(row)
+            row_id = row.get("_row_id")
+            if not isinstance(row_id, str) or not row_id or row_id in seen:
+                row_id = secrets.token_hex(8)
+                row["_row_id"] = row_id
+                changed = True
+            seen.add(row_id)
+            updated_rows.append(row)
+        if updated_rows != rows:
+            result[key] = updated_rows
+        audio_key = prefix + "audio_source"
+        value = str(result.get(audio_key, "0"))
+        if result.get(prefix + "selector_type", "classic") != "classic":
+            if value not in {"all", "regex_first", "regex_lowest"}:
+                result[audio_key] = "regex_first"
+                changed = True
+            continue
+        if value in {"regex_first", "regex_lowest"}:
+            value = "0"
+            result[audio_key] = value
+            changed = True
+        anchor_key = prefix + "channel_audio_anchor"
+        anchor = result.get(anchor_key)
+        if not isinstance(anchor, dict):
+            anchor = {}
+        if audio_key not in explicit_audio and value == anchor.get("value") and anchor.get("row_id"):
+            matching = next((i for i, row in enumerate(updated_rows) if row["_row_id"] == anchor["row_id"]), None)
+            if matching is None:
+                matching = 0
+            if matching is not None and str(matching) != value:
+                value = str(matching)
+                result[audio_key] = value
+                changed = True
+        index = int(value) if value.isdigit() else -1
+        row_id = updated_rows[index]["_row_id"] if 0 <= index < len(updated_rows) else None
+        new_anchor = {"value": value, "row_id": row_id}
+        if new_anchor != result.get(anchor_key):
+            result[anchor_key] = new_anchor
+            changed = True
+    return result, changed
+
+
+def apply_dashboard_channel_updates(settings: dict, updates: dict) -> dict:
+    """Translate dashboard slot edits into the canonical channel table."""
+    result = dict(settings)
+    for layout_id in result.get("multiview_order", []):
+        prefix = f"multiview_{layout_id}_"
+        rows = [dict(row) for row in result.get(prefix + "channels", [])]
+        count_key = prefix + "channel_count"
+        classic = result.get(prefix + "selector_type", "classic") == "classic"
+        if classic and count_key in updates and updates[count_key] is not None:
+            count = int(updates[count_key])
+            if not 2 <= count <= 9:
+                raise ValueError("Channel count must be between 2 and 9")
+            rows = rows[:count] + [{"channel": "_none"} for _ in range(max(0, count - len(rows)))]
+        for key, value in updates.items():
+            match = re.fullmatch(re.escape(prefix) + r"channel_(\d+)", key)
+            if match:
+                index = int(match.group(1)) - 1
+                if not 0 <= index < 9:
+                    raise ValueError("Channel index must be between 1 and 9")
+                while len(rows) <= index:
+                    rows.append({"channel": "_none"})
+                rows[index]["channel"] = str(value or "_none")
+                result.pop(key, None)
+        result[prefix + "channels"] = rows
+    return result
 
 
 def _backfill_layout_names(settings: dict) -> tuple:
@@ -482,7 +648,25 @@ def _get_multiview_profile_params() -> str:
         return ""
 
 
-def _build_warnings_fields(settings: dict) -> list:
+def _audio_copy_may_drop_tracks(params: str) -> bool:
+    """Identify copy profiles without a clearly complete input-zero audio map."""
+    try:
+        tokens = shlex.split(params)
+    except ValueError:
+        # A malformed command cannot establish a safe mapping.
+        return bool(re.search(r'(?:^|\s)-(?:c|codec|c:a|codec:a|acodec)\s+copy(?:\s|$)', params))
+
+    copy_options = {"-c", "-codec", "-c:a", "-codec:a", "-acodec"}
+    if not any(option in copy_options and value == "copy"
+               for option, value in zip(tokens, tokens[1:])):
+        return False
+
+    maps = [value for option, value in zip(tokens, tokens[1:]) if option == "-map"]
+    complete_map = any(value in {"0", "0?", "0:a", "0:a?"} for value in maps)
+    return not complete_map or "-an" in tokens or any(value.startswith("-") for value in maps)
+
+
+def _build_warnings_fields(settings: dict, data_dir=None) -> list:
     """Return warning info fields for the settings page. Empty list = no warnings = section hidden."""
     warnings = []
 
@@ -496,7 +680,7 @@ def _build_warnings_fields(settings: dict) -> list:
                 "description": (f"Unsupported CPU architecture ({_platform.machine()}); "
                                 f"PyAV is unavailable, streaming will not work."),
             })
-        elif not _deps.pyav_status(arch):
+        elif data_dir is not None and not _deps.pyav_status(arch, data_dir):
             if settings.get(f"pyav_consent_{arch}"):
                 desc = (
                     f"PyAV is not currently installed for {arch}. Since you've "
@@ -521,16 +705,16 @@ def _build_warnings_fields(settings: dict) -> list:
         })
 
     params = _get_multiview_profile_params()
-    if params and any(t in params for t in ("-c copy", "-c:a copy", "-codec:a copy", "acodec copy")):
+    if params and _audio_copy_may_drop_tracks(params):
         warnings.append({
             "id": "_warn_audio_copy",
-            "label": "Audio: multi-track will be dropped",
+            "label": "Audio: multi-track may be dropped",
             "type": "info",
             "description": (
-                "The default stream profile uses audio copy (-c copy) without mapping "
-                "all tracks. Multi-track audio from multiview will be silently dropped "
-                "-- players will only see one audio track. Fix: create a stream profile "
-                "that includes '-map 0' or '-map 0:a' and set it as the default."
+                "The default stream profile uses audio copy but does not clearly map "
+                "all audio tracks. Players may not see every multiview audio track. "
+                "Use '-map 0' in the default stream profile, or combine '-map 0:a' "
+                "with an appropriate video map such as '-map 0:v'."
             ),
         })
 
@@ -581,7 +765,7 @@ def _build_warnings_fields(settings: dict) -> list:
         "id": "_warnings_header",
         "label": "── Warnings ──────────────────────────",
         "type": "info",
-        "description": "Use the refresh button (top-right) or restart Dispatcharr to re-check warnings.",
+        "description": "Reload the plugin to re-check warnings.",
     }] + warnings
 
 
@@ -670,7 +854,7 @@ def _build_layout_channel_options(layout_id: str, settings: dict, ch_count: int,
     return opts
 
 
-def _build_multiview_block(layout_id: str, position: int, ch_count: int, selector_type: str = "classic", regex_pattern: str = "", epg_source_mode: str = "dummy", layout_channel_options: list = None, layout_style_options: list = None) -> list:
+def _build_multiview_block(layout_id: str, position: int, ch_count: int, selector_type: str = "classic", regex_pattern: str = "", epg_source_mode: str = "dummy", layout_channel_options: list = None, layout_style_options: list = None, dashboard: bool = False, channel_rows=None) -> list:
     """Return the list of fields for multiview layout *layout_id* with *ch_count* channel slots.
 
     *position* is only for human-readable labels ("Layout 2 Name") -- the
@@ -721,7 +905,10 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
                 "After changing, save and refresh to see the relevant fields."
             ),
         },
-        {
+    ]
+
+    if is_regex or dashboard:
+        fields.append({
             "id": f"multiview_{layout_id}_channel_count",
             "label": f"Layout {n} Max Channels" if is_regex else f"Layout {n} Channel Count",
             "type": "number",
@@ -737,8 +924,7 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
                 "After changing, save and refresh to see the new channel slots."
             ),
             "placeholder": "4",
-        },
-    ]
+        })
 
     if is_regex:
         fields.append(
@@ -778,18 +964,34 @@ def _build_multiview_block(layout_id: str, position: int, ch_count: int, selecto
         ]
         audio_default = "regex_first"
     else:
-        channel_options = _build_channel_options()
-        for m in range(1, ch_count + 1):
-            fields.append(
-                {
-                    "id": f"multiview_{layout_id}_channel_{m}",
-                    "label": f"Layout {n}: Channel {m}",
-                    "type": "select",
-                    "default": "_none",
-                    "options": channel_options,
-                    "description": "",
-                }
-            )
+        channel_options = list(_build_channel_options())
+        known = {str(option["value"]) for option in channel_options}
+        for row in channel_rows or []:
+            value = str(row.get("channel") or "_none")
+            if value not in known:
+                channel_options.append({"value": value, "label": f"Unavailable channel ({value})"})
+                known.add(value)
+        if dashboard:
+            for m in range(1, ch_count + 1):
+                fields.append(
+                    {
+                        "id": f"multiview_{layout_id}_channel_{m}",
+                        "label": f"Layout {n}: Channel {m}",
+                        "type": "select",
+                        "default": "_none",
+                        "options": channel_options,
+                        "description": "",
+                    }
+                )
+        else:
+            fields.append({
+                "id": f"multiview_{layout_id}_channels",
+                "label": f"Layout {n} Channels",
+                "type": "table",
+                "default": [{"channel": "_none"} for _ in range(4)],
+                "description": "Add 2 to 9 channels in tile order. The first channel is featured in featured layouts.",
+                "columns": [{"id": "channel", "label": "Channel", "type": "select", "options": channel_options}],
+            })
         audio_opts = [{"value": "all", "label": "All channels (selectable in player)"}]
         for m in range(1, ch_count + 1):
             audio_opts.append({"value": str(m - 1), "label": f"Channel {m}"})
@@ -891,7 +1093,7 @@ _VIDEO_SETTINGS_HEADER = {
 }
 
 
-def build_plugin_fields(settings: dict) -> list:
+def build_plugin_fields(settings: dict, data_dir=None, *, dashboard=False) -> list:
     """Build the full field list based on current settings.
 
     Callers must run `ensure_layout_order()` on *settings* (and persist it if
@@ -914,7 +1116,7 @@ def build_plugin_fields(settings: dict) -> list:
     count_field = dict(_MULTIVIEW_COUNT_FIELD)
     count_field["default"] = len(order)
 
-    fields = _build_warnings_fields(settings)
+    fields = _build_warnings_fields(settings, data_dir)
     fields.append(_GLOBAL_SETTINGS_HEADER)
     fields.extend(_GLOBAL_SETTINGS_FIELDS)
     fields.append(count_field)
@@ -932,9 +1134,34 @@ def build_plugin_fields(settings: dict) -> list:
         regex_pattern = settings.get(f"multiview_{layout_id}_regex_pattern", "")
         epg_source_mode = settings.get(f"multiview_{layout_id}_epg_source_mode", "dummy")
         layout_ch_opts = _build_layout_channel_options(layout_id, settings, ch_count, selector_type, regex_pattern)
-        fields.extend(_build_multiview_block(layout_id, position, ch_count, selector_type, regex_pattern, epg_source_mode, layout_ch_opts, layout_style_options))
+        fields.extend(_build_multiview_block(layout_id, position, ch_count, selector_type, regex_pattern, epg_source_mode, layout_ch_opts, layout_style_options, dashboard=dashboard, channel_rows=settings.get(f"multiview_{layout_id}_channels", [])))
 
-    return fields
+    if dashboard:
+        return fields
+
+    # Section membership is explicit in Dispatcharr; visual order alone does not
+    # group fields. Keep the dashboard's existing projection unchanged.
+    section = None
+    grouped = []
+    for field in fields:
+        field = dict(field)
+        field_id = field.get("id", "")
+        if field_id == "_warnings_header":
+            section = field_id
+            field.update(label="Alerts", type="section", collapsed=False)
+            field.pop("description", None)
+        elif field_id in {"_global_settings_header", "_video_settings_header"}:
+            section = field_id
+            field.update(label="Global Settings" if field_id == "_global_settings_header" else "Video Settings", type="section", collapsed=field_id != "_global_settings_header")
+            field.pop("description", None)
+        elif field_id.startswith("multiview_") and field_id.endswith("_header"):
+            section = "_" + field_id
+            field.update(id=section, label=field["label"].strip("─ "), type="section", collapsed=True)
+            field.pop("description", None)
+        elif section:
+            field["section"] = section
+        grouped.append(field)
+    return grouped
 
 
 # Default field list (1 layout, 4 channels) used as plugin.json fallback

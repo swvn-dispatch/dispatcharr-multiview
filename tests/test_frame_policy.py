@@ -3,7 +3,7 @@
 import unittest
 
 from src import deps
-from src.frame_policy import FrameReduction
+from src.frame_policy import FrameReduction, PresentationStats
 
 
 class FrameReductionTests(unittest.TestCase):
@@ -38,6 +38,29 @@ class FrameReductionTests(unittest.TestCase):
         for i in range(10):
             policy.keep(i / 25)
         self.assertAlmostEqual(policy.source_fps(), 25, places=3)
+
+    def test_source_cadence_switch_is_remeasured(self):
+        policy = FrameReduction("60")
+        for i in range(90):
+            self.assertTrue(policy.keep(i * 1001 / 60000))
+        self.assertAlmostEqual(policy.source_fps(), 60000 / 1001, places=2)
+        start = 90 * 1001 / 60000
+        for i in range(90):
+            self.assertTrue(policy.keep(start + i * 1001 / 30000))
+        self.assertAlmostEqual(policy.source_fps(), 30000 / 1001, places=2)
+
+    def test_presentation_stats_distinguish_repeats_skips_and_fallback(self):
+        stats = PresentationStats()
+        stats.record(due=1, lag=0.01)
+        stats.record()
+        stats.record(due=3, lag=0.03)
+        stats.record(fallback=True)
+        fresh, repeat, skipped, fallback, lag_sum, lag_max, count, details = stats.take()
+        self.assertEqual((fresh, repeat, skipped, fallback, count), (2, 1, 2, 1, 2))
+        self.assertAlmostEqual(lag_sum, 0.04)
+        self.assertAlmostEqual(lag_max, 0.03)
+        self.assertEqual(details["depths"], [0, 0, 0, 0])
+        self.assertEqual(stats.take()[:7], (0, 0, 0, 0, 0.0, 0.0, 0))
 
 
 class PyAVWheelTests(unittest.TestCase):

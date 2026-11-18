@@ -2,6 +2,8 @@
 
 > Dispatcharr plugin that combines multiple channel streams into a single tiled MPEG-TS output. Define named layouts, pick your channels, and each layout appears as a standard M3U channel you can open in any player.
 
+Requires Dispatcharr 0.34.0 or later with plugin settings saves that preserve plugin-managed keys. Older Dispatcharr installations can use an earlier Multiview release. Some early 0.34 development images overwrite those keys and are not supported.
+
 ## Support
 
 This project is maintained in my spare time. If it's saved you some headaches, a tip is always appreciated.
@@ -10,7 +12,7 @@ This project is maintained in my spare time. If it's saved you some headaches, a
 
 ---
 
-> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. It is a one-time step per host and takes about 30 seconds. Streams return a 503 until it completes. After that first run, the plugin remembers your consent and automatically reinstalls PyAV in the background if it's ever found missing or outdated (e.g. after a plugin update resets the vendored copy) -- no need to click it again.
+> **Before any stream will play:** open the plugin settings page and run the **Install PyAV** action. This downloads the media engine the compositor depends on. Streams return a 503 until installation completes. A successful installation reloads the plugin to refresh its settings and may interrupt active streams. PyAV is stored in durable plugin data. After the first successful install, the plugin remembers your consent and checks for the required version in the background at startup. Previously installed versions are retained when the required version changes.
 
 ---
 
@@ -42,7 +44,7 @@ npm run dev
 
 Each `/stream/{n}` request spawns a dedicated Python worker process with no gevent overhead, giving the compositor real OS threads and full CPU parallelism:
 
-- Each source channel is decoded in its own thread using PyAV (bundled). Frames are scaled and selected against a source-PTS clock at the configured output frame rate.
+- Each source channel is decoded in its own thread using PyAV. Frames are scaled and selected against a source-PTS clock at the configured output frame rate.
 - Software profiles composite tile frames onto a numpy YUV420p canvas. Hardware profiles automatically use matching FFmpeg CUDA, QSV, or VAAPI composition filters when available, then encode CBR MPEG-TS for the plugin's gevent server to stream.
 - Source channels are fetched through Dispatcharr's internal live proxy so they appear in stream stats and respect stream profiles.
 - A per-channel PTS rate limiter ensures playback stays at realtime regardless of how fast the host machine or source proxy delivers packets. Audio is aligned to the video PTS clock at startup and the audio buffer is flushed on reconnect to keep lip-sync stable.
@@ -67,7 +69,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 | Name | Shown in the M3U playlist |
 | Layout Style | Auto Grid, Featured, or Top Featured (see below) |
 | Channel Selection | Classic (dropdowns) or Regex (dynamic match) |
-| Channel Count | Number of tiles. Max 4 recommended. |
+| Channels | Classic layouts use one table row per tile; regex layouts use a maximum match count. Max 4 recommended. |
 | Audio Source | Single channel or All Channels (one AC3 track per tile) |
 | EPG fields | Title, subtitle, categories for the guide entry |
 
@@ -79,7 +81,7 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 **Channel selection modes:**
 
-- **Classic:** select each channel from a dropdown.
+- **Classic:** add one row per channel in the native settings table, in tile order. The dashboard retains its channel controls. Native table rows cannot currently be reordered, so change the selected channels to rearrange them. Reload the plugin after changing rows to refresh native audio and EPG channel options; this interrupts active streams.
 - **Regex:** enter a pattern (e.g. `TSN\s*\d` or `^CA \|`) matched case-insensitively against channel names. Channels are sorted by channel number. The channel count setting becomes the maximum number of matches to tile.
 
 **Audio source:**
@@ -90,11 +92,17 @@ Each `/stream/{n}` request spawns a dedicated Python worker process with no geve
 
 After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create or update the M3U account, and rebuild EPG data. The Auto-Refresh Interval controls how often this happens automatically.
 
+The refresh runs in the background. Dispatcharr's M3U refresh must succeed before the EPG refresh starts. Requests received during a refresh are combined into a follow-up run. If a known task takes too long, Multiview keeps checking it and resumes automatically after it finishes. If task submission has an uncertain outcome, Multiview stops further refreshes to avoid overlapping work and records the reason in its logs.
+
+**Gather Diagnostics** collects two minutes of per-tile timing and presentation counts from currently running multiviews without restarting playback. The report includes totals and one-second intervals. Open the plugin's **Tasks**, select **View history**, and choose **Download output** for the JSON report. Tile indices are zero-based and follow layout order. The report includes channel names but excludes source URLs and credentials; review it before sharing. If a stream stops during sampling, the report marks it incomplete.
+
+Queue depth is measured after each presentation decision. Enqueue lead compares a frame's PTS to the tile's presentation clock when scaling completes; a negative value means the frame arrived after its target. Encoder pipe write time includes all write time, not just time spent blocked.
+
 ## Hardware acceleration
 
 Selecting NVIDIA NVENC, Intel QSV, or Intel/AMD VAAPI automatically attempts GPU tile composition as well as GPU encoding. There is no extra setting. The worker validates the selected device and FFmpeg's required hardware filters at startup. If either is unavailable, it logs the reason and keeps the stream running with the CPU compositor.
 
-PyAV source decode, source reconnect handling, PTS scheduling, and audio processing remain on the CPU. A custom layout background image also uses the CPU compositor for now, so its letterbox padding remains correct. Check the worker log for `compositor=cuda`, `compositor=qsv`, `compositor=vaapi`, or a CPU fallback reason.
+With a hardware encoder selected, PyAV also attempts hardware source decoding when the device is supported. The log reports each tile's selected decode path, including a warning when hardware setup falls back to software. A successful hardware container open does not by itself verify that frames are being decoded on the GPU. Source reconnect handling, PTS scheduling, and audio processing remain on the CPU. A custom layout background image also uses the CPU compositor for now, so its letterbox padding remains correct. Check the worker log for `compositor=cuda`, `compositor=qsv`, `compositor=vaapi`, or a CPU fallback reason.
 
 4K output has four times the pixel workload of 1080p. In a four-tile grid, each tile receives a 1920×1080 region. Use capable hardware, hardware encoding/composition where available, and enough output bitrate for the source material.
 

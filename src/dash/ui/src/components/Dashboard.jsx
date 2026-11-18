@@ -29,6 +29,7 @@ function toExportObject(settings, order, pluginVersion, dispatcharrVersion) {
     for (const [key, value] of Object.entries(settings)) {
       const m = key.match(LAYOUT_KEY_RE);
       if (!m || m[1] !== id) continue;
+      if (m[2] === 'channel_audio_anchor') continue;
       const chMatch = m[2].match(/^channel_(\d+)$/);
       if (chMatch) channels[parseInt(chMatch[1], 10) - 1] = value;
       else obj[m[2]] = value;
@@ -40,7 +41,7 @@ function toExportObject(settings, order, pluginVersion, dispatcharrVersion) {
   const global = {};
   for (const [key, value] of Object.entries(settings)) {
     if (key === 'multiview_order' || key === 'multiview_count' || key === 'multiview_custom_layouts' || key === 'multiview_custom_layouts_order') continue;
-    if (key === 'multiview_pre_migration_backup' || key === 'multiview_pre_reconcile_backup') continue;
+    if (key === 'multiview_pre_migration_backup' || key === 'multiview_pre_reconcile_backup' || key === 'multiview_pre_channel_table_backup') continue;
     if (LAYOUT_KEY_RE.test(key)) continue;
     global[key] = value; // dash_enabled, output_resolution, video_encoder, stray keys, etc.
   }

@@ -4,6 +4,47 @@ from collections import deque
 from fractions import Fraction
 
 
+class PresentationStats:
+    """Interval counts for output-frame selection, not source content motion."""
+
+    def __init__(self):
+        self.take()
+
+    def record(self, due=0, lag=None, fallback=False, queue_depth=0):
+        self.depths.append(queue_depth)
+        if fallback:
+            self.fallback += 1
+        elif due:
+            self.fresh += 1
+            self.skipped += due - 1
+            if lag is not None:
+                self.lag_total += max(0.0, lag)
+                self.lag_max = max(self.lag_max, lag)
+                self.lag_count += 1
+                self.ages.append(max(0.0, lag))
+        else:
+            self.repeated += 1
+
+    def enqueue_lead(self, seconds):
+        self.leads.append(seconds)
+
+    def event(self, kind, monotonic_time):
+        self.events.append((kind, monotonic_time))
+
+    def take(self):
+        result = (getattr(self, "fresh", 0), getattr(self, "repeated", 0),
+                  getattr(self, "skipped", 0), getattr(self, "fallback", 0),
+                  getattr(self, "lag_total", 0.0), getattr(self, "lag_max", 0.0),
+                  getattr(self, "lag_count", 0),
+                  {"depths": getattr(self, "depths", []), "ages": getattr(self, "ages", []),
+                   "leads": getattr(self, "leads", []), "events": getattr(self, "events", [])})
+        self.fresh = self.repeated = self.skipped = self.fallback = 0
+        self.lag_total = self.lag_max = 0.0
+        self.lag_count = 0
+        self.depths, self.ages, self.leads, self.events = [], [], [], []
+        return result
+
+
 class FrameReduction:
     """Keep one complete frame per output presentation interval.
 

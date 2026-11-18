@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_BACKGROUNDS_DIR = os.path.join(_PLUGIN_DIR, "style_backgrounds")
 _MAX_BACKGROUND_BYTES = 5 * 1024 * 1024
 _PLUGIN_KEY = "multiview"
 
@@ -68,52 +67,20 @@ def _verify_token(environ) -> bool:
 
 
 def _get_settings() -> dict:
-    config_mod = _get_config_mod()
-    try:
-        from apps.plugins.models import PluginConfig
-        cfg = PluginConfig.objects.get(key=_PLUGIN_KEY)
-    except Exception:
-        settings, _ = config_mod.ensure_layout_order({})
-        settings, _ = config_mod.reconcile_layout_count(settings)
-        settings, _ = config_mod.ensure_custom_layout_order(settings)
-        return settings
-
-    settings, changed1 = config_mod.ensure_layout_order(cfg.settings)
-    settings, changed2 = config_mod.reconcile_layout_count(settings)
-    settings, changed3 = config_mod.ensure_custom_layout_order(settings)
-    if changed1 or changed2 or changed3:
-        cfg.settings = settings
-        cfg.save()
-    return settings
-
+    return _get_config_mod().load_settings()
 
 def _save_settings(updates: dict):
-    from apps.plugins.models import PluginConfig
-    cfg = PluginConfig.objects.get(key=_PLUGIN_KEY)
-    for k, v in updates.items():
-        if v is None:
-            cfg.settings.pop(k, None)
-        else:
-            cfg.settings[k] = v
-    # Keep the legacy multiview_count field (still authoritative for
-    # reconcile_layout_count, which detects native-settings-page edits) in
-    # sync whenever the dashboard itself changes multiview_order -- otherwise
-    # reconcile_layout_count treats the dashboard's own change as drift and
-    # deletes it back out on the very next settings read.
-    if updates.get("multiview_order") is not None:
-        cfg.settings["multiview_count"] = len(cfg.settings.get("multiview_order") or [])
-    cfg.save()
+    _get_config_mod().update_settings(updates)
     if updates.get("multiview_order") is not None:
         return _generate_m3u()
 
 
 def _generate_m3u():
-    import sys
-
-    for mod in sys.modules.values():
-        if getattr(mod, "PLUGIN_DB_KEY", None) == _PLUGIN_KEY and hasattr(mod, "Plugin"):
-            return mod.Plugin.__new__(mod.Plugin)._generate_m3u()
-    raise RuntimeError("Plugin module not found")
+    server = globals().get("_server")
+    if server is None or server.dispatch_task is None:
+        raise RuntimeError("Managed Multiview service is not available")
+    server.dispatch_task("generate_m3u", {})
+    return {"status": "success", "message": "M3U and EPG refresh queued"}
 
 
 # ------------------------------------------------------------------
@@ -475,7 +442,10 @@ def handle_style_background(environ, start_response):
         filename = style.get("background_image") if style else None
         if not filename:
             return _json_error(start_response, "404 Not Found", "No background image set")
-        path = os.path.join(_BACKGROUNDS_DIR, filename)
+        try:
+            path = _server.storage.background_path(_server.data_dir, filename)
+        except (ValueError, TypeError):
+            return _json_error(start_response, "400 Bad Request", "Invalid background filename")
         if not os.path.isfile(path):
             return _json_error(start_response, "404 Not Found", "Background image file missing")
         try:
@@ -498,8 +468,10 @@ def handle_style_background(environ, start_response):
         style_id = body.get("style_id")
         filename = body.get("filename")
         data_b64 = body.get("data_base64")
-        if not style_id or not filename or not data_b64:
+        if not isinstance(style_id, str) or not isinstance(filename, str) or not isinstance(data_b64, str) or not style_id or not filename or not data_b64:
             return _json_error(start_response, "400 Bad Request", "style_id, filename, data_base64 required")
+        if style_id in {".", ".."} or any(c in style_id for c in ("/", "\\", "\x00")):
+            return _json_error(start_response, "400 Bad Request", "Invalid style_id")
 
         try:
             raw = base64.b64decode(data_b64)
@@ -510,9 +482,11 @@ def handle_style_background(environ, start_response):
 
         stored_name = f"{style_id}_{_sanitize_filename(filename)}"
         try:
-            os.makedirs(_BACKGROUNDS_DIR, exist_ok=True)
-            with open(os.path.join(_BACKGROUNDS_DIR, stored_name), "wb") as f:
-                f.write(raw)
+            path = _server.storage.background_path(_server.data_dir, stored_name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _server.storage.atomic_write_bytes(path, raw)
+        except ValueError:
+            return _json_error(start_response, "400 Bad Request", "Invalid background path")
         except OSError as e:
             return _json_error(start_response, "500 Internal Server Error", f"Failed to save image: {e}")
 
@@ -544,7 +518,7 @@ def handle_fields(environ, start_response):
         import re
         settings = _get_settings()
         config_mod = _get_config_mod()
-        all_fields = config_mod.build_plugin_fields(settings)
+        all_fields = config_mod.build_plugin_fields(settings, _server.data_dir, dashboard=True)
         order = settings.get("multiview_order", [])
 
         layout_re = re.compile(r"^multiview_([0-9a-f]{8})_")
