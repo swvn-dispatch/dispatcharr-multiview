@@ -216,6 +216,8 @@ class Plugin:
             return {"status": "success", "message": "Refreshing plugin settings", "_dispatcharr": {"refresh": "ui"}}
         if action == "generate_m3u":
             return self._generate_m3u(context, params)
+        if action == "sample_diagnostics":
+            return self._sample_diagnostics(context)
         if action == "reload_active_multiviews":
             conn = http.client.HTTPConnection("127.0.0.1", DEFAULT_SERVER_PORT, timeout=5)
             try:
@@ -246,6 +248,45 @@ class Plugin:
             return result
 
         return {"status": "error", "message": f"Unknown action: {action}"}
+
+    def _sample_diagnostics(self, context):
+        def request(method, path):
+            conn = http.client.HTTPConnection("127.0.0.1", DEFAULT_SERVER_PORT, timeout=5)
+            try:
+                conn.request(method, path, body=b"{}" if method == "POST" else None,
+                             headers={"Content-Type": "application/json"})
+                response = conn.getresponse()
+                data = json.loads(response.read(262145))
+                if response.status != 200:
+                    raise ValueError(data.get("error", "diagnostic service unavailable"))
+                return data
+            finally:
+                conn.close()
+
+        try:
+            started = request("POST", "/internal/diagnostics")
+            sample_id = started["sample_id"]
+            if not isinstance(sample_id, str) or len(sample_id) != 32 or any(c not in "0123456789abcdef" for c in sample_id):
+                raise ValueError("invalid sample identifier")
+            report_progress = context.get("report_progress", lambda *args: None)
+            deadline = time.monotonic() + 135
+            while True:
+                result = request("GET", f"/internal/diagnostics/{sample_id}")
+                if not result["pending"] or time.monotonic() >= deadline:
+                    break
+                elapsed = 135 - (deadline - time.monotonic())
+                report_progress(min(99, int(elapsed * 100 / 120)), "Sampling active multiviews")
+                time.sleep(5)
+            incomplete = result["pending"] or any("error" in item for item in result["workers"])
+            return {"status": "partial" if incomplete else "ok",
+                    "message": "Diagnostic sample incomplete" if incomplete else "Diagnostic sample complete",
+                    "plugin_version": self.version, "requested_duration_seconds": 120,
+                    "pending_workers": result["pending"], "multiviews": result["workers"]}
+        except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Diagnostic sampling failed: %s", exc)
+            expected = {"no active multiviews", "a diagnostic sample is already in progress"}
+            message = str(exc) if str(exc) in expected else "Could not collect diagnostic sample"
+            return {"status": "error", "message": message, "plugin_version": self.version}
 
     @staticmethod
     def _deps():

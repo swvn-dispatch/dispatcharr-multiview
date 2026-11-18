@@ -94,6 +94,8 @@ After saving settings, click **Regenerate M3U** to write `multiview.m3u`, create
 
 The refresh runs in the background. Dispatcharr's M3U refresh must succeed before the EPG refresh starts. Requests received during a refresh are combined into a follow-up run. If a known task takes too long, Multiview keeps checking it and resumes automatically after it finishes. If task submission has an uncertain outcome, Multiview stops further refreshes to avoid overlapping work and records the reason in its logs.
 
+**Gather Diagnostics** collects two minutes of per-tile timing and presentation counts from currently running multiviews without restarting playback. Open the plugin's **Tasks**, select **View history**, and choose **Download output** for the JSON report. Tile indices are zero-based and follow layout order. The report excludes source URLs and credentials; review it before sharing. If a stream stops during sampling, the report marks it incomplete.
+
 ## Hardware acceleration
 
 Selecting NVIDIA NVENC, Intel QSV, or Intel/AMD VAAPI automatically attempts GPU tile composition as well as GPU encoding. There is no extra setting. The worker validates the selected device and FFmpeg's required hardware filters at startup. If either is unavailable, it logs the reason and keeps the stream running with the CPU compositor.

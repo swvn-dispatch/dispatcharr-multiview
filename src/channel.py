@@ -175,7 +175,7 @@ class Channel:
         # decouples that deterministic choice from decoder-thread wake timing.
         self.vlock = threading.Lock()
         self.vframes = collections.deque(maxlen=VIDEO_QUEUE_FRAMES)
-        self.presentation_stats = PresentationStats() if spec.get("diagnostic_logs", False) else None
+        self.presentation_stats = None
         self.display = self.fallback
         # Video presentation has its own anchor. It must be reset after a
         # source rebase without disturbing the decoder/audio PTS clock.
@@ -510,7 +510,13 @@ class Channel:
 
     def take_presentation_stats(self):
         with self.vlock:
-            return self.presentation_stats.take(), len(self.vframes)
+            stats = self.presentation_stats.take()
+            self.presentation_stats = None
+            return stats, len(self.vframes)
+
+    def start_presentation_stats(self):
+        with self.vlock:
+            self.presentation_stats = PresentationStats()
 
     def video_queue_depth(self):
         with self.vlock:

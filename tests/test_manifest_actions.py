@@ -21,9 +21,25 @@ class ManifestActionTests(unittest.TestCase):
         self.assertEqual(src.Plugin.actions, manifest["actions"])
         self.assertEqual(
             {action["id"] for action in manifest["actions"]},
-            {"refresh_ui", "generate_m3u", "reload_active_multiviews", "install_pyav"},
+            {"refresh_ui", "generate_m3u", "reload_active_multiviews", "install_pyav", "sample_diagnostics"},
         )
-        self.assertEqual(len(manifest["actions"]), 4)
+        self.assertEqual(len(manifest["actions"]), 5)
+        self.assertEqual([action["id"] for action in manifest["actions"]], [
+            "refresh_ui", "generate_m3u", "reload_active_multiviews", "install_pyav", "sample_diagnostics",
+        ])
+        actions = {action["id"]: action for action in manifest["actions"]}
+        self.assertEqual(actions["refresh_ui"]["label"], "Refresh Settings")
+        self.assertEqual(actions["refresh_ui"]["button_label"], "Refresh")
+        self.assertEqual(actions["generate_m3u"]["button_label"], "Regenerate")
+        self.assertEqual(actions["reload_active_multiviews"]["button_label"], "Reload Active")
+        self.assertTrue(actions["sample_diagnostics"]["async"])
+        self.assertEqual(actions["sample_diagnostics"]["button_label"], "Gather Diagnostics")
+        self.assertEqual(actions["refresh_ui"]["button_color"], "blue")
+        self.assertEqual(actions["sample_diagnostics"]["button_color"], "orange")
+        self.assertEqual(actions["sample_diagnostics"]["button_variant"], "outline")
+        self.assertEqual(actions["install_pyav"]["button_color"], "red")
+        self.assertEqual(actions["generate_m3u"]["button_color"], "orange")
+        self.assertEqual(actions["reload_active_multiviews"]["button_color"], "orange")
 
     def test_refresh_ui_action_requests_ui_refresh_only(self):
         result = src.Plugin().run("refresh_ui", {}, {})
