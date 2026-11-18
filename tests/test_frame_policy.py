@@ -55,11 +55,12 @@ class FrameReductionTests(unittest.TestCase):
         stats.record()
         stats.record(due=3, lag=0.03)
         stats.record(fallback=True)
-        fresh, repeat, skipped, fallback, lag_sum, lag_max, count = stats.take()
+        fresh, repeat, skipped, fallback, lag_sum, lag_max, count, details = stats.take()
         self.assertEqual((fresh, repeat, skipped, fallback, count), (2, 1, 2, 1, 2))
         self.assertAlmostEqual(lag_sum, 0.04)
         self.assertAlmostEqual(lag_max, 0.03)
-        self.assertEqual(stats.take(), (0, 0, 0, 0, 0.0, 0.0, 0))
+        self.assertEqual(details["depths"], [0, 0, 0, 0])
+        self.assertEqual(stats.take()[:7], (0, 0, 0, 0, 0.0, 0.0, 0))
 
 
 class PyAVWheelTests(unittest.TestCase):

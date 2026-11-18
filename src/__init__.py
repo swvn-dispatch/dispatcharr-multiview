@@ -257,7 +257,7 @@ class Plugin:
                 conn.request(method, path, body=b"{}" if method == "POST" else None,
                              headers={"Content-Type": "application/json"})
                 response = conn.getresponse()
-                data = json.loads(response.read(262145))
+                data = json.loads(response.read(4194305))
                 if response.status != 200:
                     raise ValueError(data.get("error", "diagnostic service unavailable"))
                 return data
