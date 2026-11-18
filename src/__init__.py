@@ -8,6 +8,7 @@ number of channel inputs and either an auto-grid or featured arrangement.
 import json
 import http.client
 import logging
+import math
 import os
 import time
 
@@ -269,13 +270,18 @@ class Plugin:
             if not isinstance(sample_id, str) or len(sample_id) != 32 or any(c not in "0123456789abcdef" for c in sample_id):
                 raise ValueError("invalid sample identifier")
             report_progress = context.get("report_progress", lambda *args: None)
-            deadline = time.monotonic() + 135
+            start_time = time.monotonic()
+            deadline = start_time + 135
             while True:
                 result = request("GET", f"/internal/diagnostics/{sample_id}")
-                if not result["pending"] or time.monotonic() >= deadline:
+                now = time.monotonic()
+                if not result["pending"] or now >= deadline:
                     break
-                elapsed = 135 - (deadline - time.monotonic())
-                report_progress(min(99, int(elapsed * 100 / 120)), "Sampling active multiviews")
+                elapsed = now - start_time
+                remaining = max(0, math.ceil(120 - elapsed))
+                message = (f"Sampling active multiviews: {remaining // 60}:{remaining % 60:02d} remaining"
+                           if remaining else "Finishing diagnostic sample")
+                report_progress(min(99, max(0, int(elapsed * 100 / 120))), message)
                 time.sleep(5)
             incomplete = result["pending"] or any("error" in item for item in result["workers"])
             return {"status": "partial" if incomplete else "ok",

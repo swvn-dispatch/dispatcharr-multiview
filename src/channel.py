@@ -508,10 +508,11 @@ class Channel:
                 self.presentation_stats.record(due, target_pts - selected_pts if due else None)
             return self.display
 
-    def take_presentation_stats(self):
+    def take_presentation_stats(self, continue_sampling=False):
         with self.vlock:
             stats = self.presentation_stats.take()
-            self.presentation_stats = None
+            if not continue_sampling:
+                self.presentation_stats = None
             return stats, len(self.vframes)
 
     def start_presentation_stats(self):
