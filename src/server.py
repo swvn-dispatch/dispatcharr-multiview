@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import types
 from contextvars import copy_context
 
 from . import config as _mvconfig
@@ -102,6 +103,7 @@ def _python_exe() -> str:
 
 def _start_compositor(cmd, env):
     """Start a child without gevent's default-loop-only child watcher."""
+    from gevent import monkey
     from gevent.fileobject import FileObjectPosix
 
     # Load a separate copy: gevent patches both Popen and private module globals
@@ -112,6 +114,14 @@ def _start_compositor(cmd, env):
         native = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(native)
         native._USE_POSIX_SPAWN = False
+        # Patched os.close defers pipe closure until the hub runs, but Popen
+        # immediately blocks on its exec-error pipe. Use real close only in
+        # this private module, before any of its pipes have gevent watchers.
+        native_os = types.ModuleType("_multiview_os")
+        native_os.__dict__.update(vars(os))
+        native_os.close = monkey.get_original("os", "close")
+        native_os.waitpid = monkey.get_original("os", "waitpid")
+        native.os = native_os
         _native_subprocess = native
     proc = _native_subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, env=env, bufsize=0)

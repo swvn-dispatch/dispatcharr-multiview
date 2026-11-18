@@ -54,9 +54,12 @@ from gevent import monkey
 monkey.patch_all()
 import os, sys, gevent
 from gevent.threadpool import ThreadPool
+from gevent.pywsgi import WSGIServer
 from src import server
 
 def run():
+    # A running hub makes gevent's patched os.close defer closing pipes.
+    gevent.get_hub()
     cmd = [sys.executable, "-u", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.readline()); sys.stdout.flush(); sys.stderr.write('notice\\\\n'); sys.stderr.flush()"]
     proc = server._start_compositor(cmd, dict(os.environ))
     out = gevent.spawn(proc.stdout.readline)
@@ -71,6 +74,25 @@ def run():
     assert gevent.get_hub().threadpool.apply(proc.wait) == 0
     for pipe in (proc.stdin, proc.stdout, proc.stderr):
         pipe.close()
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"healthy"]
+
+    listener = WSGIServer(("127.0.0.1", 0), app, log=None)
+    listener.start()
+    code = "import urllib.request,sys; sys.stdout.buffer.write(urllib.request.urlopen(sys.argv[1], timeout=3).read()); sys.stdout.flush()"
+    proc = server._start_compositor(
+        [sys.executable, "-u", "-c", code, "http://127.0.0.1:%d/health" % listener.server_port],
+        dict(os.environ),
+    )
+    try:
+        assert proc.stdout.read(7) == b"healthy"
+        assert gevent.get_hub().threadpool.apply(proc.wait) == 0
+    finally:
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            pipe.close()
+        listener.stop()
 
 pool = ThreadPool(1)
 try:
