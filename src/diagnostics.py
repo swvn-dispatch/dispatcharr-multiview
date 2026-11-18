@@ -13,38 +13,77 @@ class DiagnosticSampler:
         self.lock = threading.Lock()
         self.active = False
 
+    def _counts(self):
+        return [(c.vcount, c.scaled_vcount, c.reduced_vcount) for c in self.channels]
+
+    def _schedule(self, state, delay):
+        timer = self.timer(delay, self._tick, args=(state,))
+        timer.daemon = True
+        timer.start()
+
     def start(self, sample_id, duration=120):
         with self.lock:
             if self.active:
                 return False
             self.active = True
             started = self.clock()
-            counts = [(c.vcount, c.scaled_vcount, c.reduced_vcount) for c in self.channels]
+            state = {"id": sample_id, "started": started, "last": started,
+                     "duration": duration, "counts": self._counts(),
+                     "totals": [None] * len(self.channels), "intervals": []}
             for channel in self.channels:
                 channel.start_presentation_stats()
-            timer = self.timer(duration, self.finish, args=(sample_id, started, counts))
-            timer.daemon = True
-            timer.start()
+            self._schedule(state, min(30, duration))
             return True
 
-    def finish(self, sample_id, started, counts):
+    @staticmethod
+    def _tile(index, name, counts, stats, depth, duration):
+        fresh, repeated, skipped, fallback, lag_total, lag_max, lag_count = stats
+        return {
+            "tile_index": index, "channel_name": name,
+            "decoded_fps": round(counts[0] / duration, 2),
+            "scaled_fps": round(counts[1] / duration, 2),
+            "reduced_frames": counts[2],
+            "fresh_frames": fresh, "repeated_frames": repeated,
+            "skipped_frames": skipped, "fallback_frames": fallback,
+            "queue_depth_at_end": depth,
+            "pts_age_mean_ms": round(1000 * lag_total / lag_count, 2) if lag_count else None,
+            "pts_age_max_ms": round(1000 * lag_max, 2) if lag_count else None,
+        }
+
+    def _tick(self, state):
+        result = None
         with self.lock:
             if not self.active:
                 return
-            duration = max(self.clock() - started, 0.001)
+            now = self.clock()
+            elapsed = max(now - state["started"], 0.001)
+            interval = max(now - state["last"], 0.001)
+            final = elapsed >= state["duration"]
+            counts = self._counts()
             tiles = []
-            for index, (channel, initial) in enumerate(zip(self.channels, counts)):
-                (fresh, repeated, skipped, fallback, lag_total, lag_max, lag_count), depth = channel.take_presentation_stats()
-                tiles.append({
-                    "tile_index": index,
-                    "decoded_fps": round((channel.vcount - initial[0]) / duration, 2),
-                    "scaled_fps": round((channel.scaled_vcount - initial[1]) / duration, 2),
-                    "reduced_frames": channel.reduced_vcount - initial[2],
-                    "fresh_frames": fresh, "repeated_frames": repeated,
-                    "skipped_frames": skipped, "fallback_frames": fallback,
-                    "queue_depth_at_end": depth,
-                    "pts_age_mean_ms": round(1000 * lag_total / lag_count, 2) if lag_count else None,
-                    "pts_age_max_ms": round(1000 * lag_max, 2) if lag_count else None,
-                })
-            self.active = False
-        self.emit({"sample_id": sample_id, "duration_seconds": round(duration, 2), "tiles": tiles})
+            for index, channel in enumerate(self.channels):
+                stats, depth = channel.take_presentation_stats(continue_sampling=not final)
+                delta = tuple(value - old for value, old in zip(counts[index], state["counts"][index]))
+                tiles.append(self._tile(index, channel.name, delta, stats, depth, interval))
+                previous = state["totals"][index]
+                if previous is None:
+                    state["totals"][index] = (delta, stats, depth)
+                else:
+                    old_counts, old_stats, _ = previous
+                    totals = tuple(a + b for a, b in zip(old_counts, delta))
+                    combined = tuple(max(a, b) if i == 5 else a + b
+                                     for i, (a, b) in enumerate(zip(old_stats, stats)))
+                    state["totals"][index] = (totals, combined, depth)
+            state["intervals"].append({"elapsed_seconds": round(elapsed, 2),
+                                       "duration_seconds": round(interval, 2), "tiles": tiles})
+            state["counts"], state["last"] = counts, now
+            if final:
+                aggregate = [self._tile(i, c.name, *state["totals"][i], elapsed)
+                             for i, c in enumerate(self.channels)]
+                result = {"sample_id": state["id"], "duration_seconds": round(elapsed, 2),
+                          "tiles": aggregate, "intervals": state["intervals"]}
+                self.active = False
+            else:
+                self._schedule(state, min(30, state["duration"] - elapsed))
+        if result is not None:
+            self.emit(result)

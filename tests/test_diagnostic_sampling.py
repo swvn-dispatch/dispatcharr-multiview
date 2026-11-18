@@ -12,15 +12,17 @@ from src.frame_policy import PresentationStats
 
 class FakeChannel:
     def __init__(self):
+        self.name = "Example Channel"
         self.vcount = self.scaled_vcount = self.reduced_vcount = 0
         self.stats = None
 
     def start_presentation_stats(self):
         self.stats = PresentationStats()
 
-    def take_presentation_stats(self):
+    def take_presentation_stats(self, continue_sampling=False):
         stats = self.stats.take()
-        self.stats = None
+        if not continue_sampling:
+            self.stats = None
         return stats, 2
 
 
@@ -41,8 +43,30 @@ class DiagnosticSamplingTests(unittest.TestCase):
         self.assertEqual(result["duration_seconds"], 120)
         self.assertEqual(result["tiles"][0]["decoded_fps"], 30)
         self.assertEqual(result["tiles"][0]["skipped_frames"], 1)
+        self.assertEqual(result["tiles"][0]["channel_name"], "Example Channel")
         self.assertIsNone(channel.stats)
         self.assertNotIn("url", json.dumps(result))
+
+    def test_four_intervals_and_aggregate(self):
+        channel = FakeChannel()
+        timer = Mock()
+        emitted = []
+        sampler = DiagnosticSampler([channel], emitted.append,
+                                    Mock(side_effect=[0, 30, 60, 90, 120]), timer)
+        self.assertTrue(sampler.start("a" * 32))
+        for i in range(4):
+            channel.vcount += 900
+            channel.scaled_vcount += 900
+            channel.stats.record(due=1, lag=(i + 1) / 1000)
+            callback = timer.call_args.args[1]
+            callback(*timer.call_args.kwargs["args"])
+        result = emitted[0]
+        self.assertEqual([item["elapsed_seconds"] for item in result["intervals"]], [30, 60, 90, 120])
+        self.assertEqual([item["tiles"][0]["fresh_frames"] for item in result["intervals"]], [1, 1, 1, 1])
+        self.assertEqual(result["tiles"][0]["fresh_frames"], 4)
+        self.assertEqual(result["tiles"][0]["decoded_fps"], 30)
+        self.assertEqual(result["tiles"][0]["pts_age_mean_ms"], 2.5)
+        self.assertEqual(result["tiles"][0]["pts_age_max_ms"], 4.0)
 
     def test_service_collects_worker_result_without_killing_worker(self):
         instance = server.MultiviewServer("127.0.0.1", 9292, "/unused")
@@ -124,3 +148,25 @@ class DiagnosticSamplingTests(unittest.TestCase):
             result = Plugin().run("sample_diagnostics", {}, {})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["message"], "no active multiviews")
+
+    def test_action_reports_countdown_and_finishing(self):
+        sample_id = "a" * 32
+        conn = Mock()
+        responses = [
+            {"sample_id": sample_id, "worker_count": 1},
+            {"pending": 1, "workers": []},
+            {"pending": 1, "workers": []},
+            {"pending": 1, "workers": []},
+            {"pending": 0, "workers": [{"layout_id": "x", "result": {}}]},
+        ]
+        conn.getresponse.side_effect = [Mock(status=200, read=Mock(return_value=json.dumps(item).encode()))
+                                        for item in responses]
+        progress = Mock()
+        with patch("src.http.client.HTTPConnection", return_value=conn), \
+             patch("src.time.monotonic", side_effect=[0, 0, 65, 121, 122]), \
+             patch("src.time.sleep"):
+            result = Plugin().run("sample_diagnostics", {}, {"report_progress": progress})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(progress.call_args_list[0].args, (0, "Sampling active multiviews: 2:00 remaining"))
+        self.assertEqual(progress.call_args_list[1].args, (54, "Sampling active multiviews: 0:55 remaining"))
+        self.assertEqual(progress.call_args_list[2].args, (99, "Finishing diagnostic sample"))
