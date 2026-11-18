@@ -88,6 +88,22 @@ class DiagnosticSamplingTests(unittest.TestCase):
         instance._wsgi_app(environ, start)
         self.assertEqual(start.call_args.args[0], "403 Forbidden")
 
+    def test_diagnostic_endpoint_serializes_start_and_status(self):
+        instance = server.MultiviewServer("127.0.0.1", 9292, "/unused")
+        proc = Mock()
+        proc.stdin = io.BytesIO()
+        instance._active_procs[proc] = {"n": "layout1"}
+        start = Mock()
+        environ = {"PATH_INFO": "/internal/diagnostics", "REQUEST_METHOD": "POST",
+                   "REMOTE_ADDR": "127.0.0.1", "CONTENT_TYPE": "application/json"}
+        body = b"".join(instance._wsgi_app(environ, start))
+        self.assertEqual(start.call_args.args[0], "200 OK")
+        sample_id = json.loads(body)["sample_id"]
+        environ.update(PATH_INFO=f"/internal/diagnostics/{sample_id}", REQUEST_METHOD="GET")
+        body = b"".join(instance._wsgi_app(environ, start))
+        self.assertEqual(start.call_args.args[0], "200 OK")
+        self.assertEqual(json.loads(body)["pending"], 1)
+
     def test_action_returns_task_history_output(self):
         sample_id = "a" * 32
         conn = Mock()
