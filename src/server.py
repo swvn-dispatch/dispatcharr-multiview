@@ -25,6 +25,8 @@ import re
 import subprocess
 import sys
 import types
+import time
+import uuid
 from contextvars import copy_context
 
 from . import config as _mvconfig
@@ -249,6 +251,7 @@ class MultiviewServer:
         self._server = None
         self.running = False
         self._active_procs: dict = {}  # proc -> layout_n
+        self._diagnostic_sample = None
 
     # ------------------------------------------------------------------ WSGI
 
@@ -306,6 +309,21 @@ class MultiviewServer:
         # Checked first, unconditionally, so a dash_path that happens to
         # collide with these reserved prefixes can't shadow the plugin's
         # actual streaming endpoints (see _normalized_dash_path's docstring).
+        if path == "/internal/diagnostics" or path.startswith("/internal/diagnostics/"):
+            if deny := self._loopback_only(loopback, start_response):
+                return deny
+            method = environ.get("REQUEST_METHOD")
+            if path == "/internal/diagnostics" and method == "POST":
+                if environ.get("HTTP_ORIGIN") or environ.get("CONTENT_TYPE", "").split(";", 1)[0].strip().lower() != "application/json":
+                    start_response("403 Forbidden", [("Content-Type", "text/plain")])
+                    return [b"Forbidden\n"]
+                status, data = self.start_diagnostic_sample()
+            elif path.startswith("/internal/diagnostics/") and method == "GET":
+                status, data = self.diagnostic_sample_status(path.rsplit("/", 1)[-1])
+            else:
+                status, data = "405 Method Not Allowed", {"error": "method not allowed"}
+            start_response(status, [("Content-Type", "application/json"), ("Cache-Control", "no-store")])
+            return [json.dumps(data).encode()]
         if path == "/internal/reload":
             if deny := self._loopback_only(loopback, start_response):
                 return deny
@@ -480,7 +498,6 @@ class MultiviewServer:
                 "lang": langs.get(i, "und"),
                 "featured": featured_layout and i == 0,
                 "output_fps": output_fps,
-                "diagnostic_logs": settings.get("diagnostic_logs") == "enabled",
                 "tile_hold_secs": hold_seconds,
                 "hwaccel": {"h264_nvenc": "cuda", "h264_vaapi": "vaapi", "h264_qsv": "qsv"}.get(encoder),
                 "hwaccel_device": (settings.get("render_device") if settings.get("render_device") not in (None, "", "auto") and encoder in ("h264_vaapi", "h264_qsv") else None),
@@ -495,7 +512,6 @@ class MultiviewServer:
             "video_encoder": encoder,
             "render_device": settings.get("render_device") or "auto",
             "audio_track_labels": settings.get("audio_track_labels", "enabled"),
-            "diagnostic_logs": settings.get("diagnostic_logs") == "enabled",
             "background": background,
             "tiles": tile_cfg,
         }
@@ -510,6 +526,44 @@ class MultiviewServer:
         order = _settings().get("multiview_order", [])
         order_rank = {layout_id: i for i, layout_id in enumerate(order)}
         return sorted(seen.values(), key=lambda s: order_rank.get(s["n"], len(order)))
+
+    def start_diagnostic_sample(self):
+        current = self._diagnostic_sample
+        if current and time.monotonic() < current["expires"]:
+            return "409 Conflict", {"error": "a diagnostic sample is already in progress"}
+        sample_id = uuid.uuid4().hex
+        sample = {"id": sample_id, "expires": time.monotonic() + 150,
+                  "workers": {proc: {"layout_id": info["n"], "result": None}
+                              for proc, info in self._active_procs.items()}}
+        if not sample["workers"]:
+            return "409 Conflict", {"error": "no active multiviews"}
+        self._diagnostic_sample = sample
+        command = json.dumps({"cmd": "diagnostic_sample", "sample_id": sample_id}).encode() + b"\n"
+        for proc, entry in sample["workers"].items():
+            try:
+                proc.stdin.write(command)
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                entry["error"] = "could not start sample"
+        return "200 OK", {"sample_id": sample_id, "worker_count": len(sample["workers"])}
+
+    def diagnostic_sample_status(self, sample_id):
+        sample = self._diagnostic_sample
+        if not sample or sample["id"] != sample_id:
+            return "404 Not Found", {"error": "diagnostic sample not found"}
+        workers = []
+        pending = 0
+        for proc, entry in sample["workers"].items():
+            if entry["result"] is not None:
+                workers.append({"layout_id": entry["layout_id"], "result": entry["result"]})
+            elif "error" in entry or proc not in self._active_procs:
+                workers.append({"layout_id": entry["layout_id"], "error": entry.get("error", "stream ended during sampling")})
+            else:
+                pending += 1
+                workers.append({"layout_id": entry["layout_id"], "pending": True})
+        if not pending:
+            sample["expires"] = 0
+        return "200 OK", {"pending": pending, "workers": workers}
 
     def _monitor_live_reload(self, proc, layout_id: str):
         """Watch one active worker until it exits or its desired config changes."""
@@ -691,6 +745,16 @@ class MultiviewServer:
             for raw in proc.stderr:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
+                    if line.startswith("[mvworker] DIAGNOSTIC "):
+                        try:
+                            result = json.loads(line[len("[mvworker] DIAGNOSTIC "):])
+                            sample = self._diagnostic_sample
+                            if sample and result.get("sample_id") == sample["id"] and proc in sample["workers"]:
+                                result.pop("sample_id", None)
+                                sample["workers"][proc]["result"] = result
+                        except (ValueError, TypeError, AttributeError):
+                            logger.warning("Invalid compositor diagnostic response")
+                        continue
                     message = f"{label}: {line}"
                     lower = line.lower()
                     traceback_active = traceback_active or "traceback" in lower or "exception in thread" in lower

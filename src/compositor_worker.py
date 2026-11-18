@@ -30,6 +30,7 @@ import numpy as np  # noqa: E402
 from parameters import fps_fraction, build_encoder_cmd, gpu_compositor, gpu_compositor_failure, validate_encoder  # noqa: E402
 from audio_metadata import generated_audio_metadata_args  # noqa: E402
 from audio_policy import PresentationClock  # noqa: E402
+from diagnostics import DiagnosticSampler  # noqa: E402
 
 DRIFT_THRESHOLD = 0.25  # seconds of audio-behind-video before we skip the
                           # FIFO forward to re-sync (see audio_feeder())
@@ -50,7 +51,7 @@ def _write_all(fd, data):
     return True
 
 
-def stdin_listener(channels, stop):
+def stdin_listener(channels, stop, sampler):
     """Read JSON control commands from stdin (sent by the plugin server)."""
     for line in sys.stdin:
         if stop.is_set():
@@ -71,6 +72,10 @@ def stdin_listener(channels, stop):
             log("reconnect all channels requested")
             for c in channels:
                 c.reconnect()
+        elif cmd.get("cmd") == "diagnostic_sample":
+            sample_id = cmd.get("sample_id")
+            if isinstance(sample_id, str) and len(sample_id) == 32 and all(c in "0123456789abcdef" for c in sample_id):
+                sampler.start(sample_id)
 
 
 def audio_feeder(track, fd, stop, presentation_clock):
@@ -179,7 +184,8 @@ def main():
 
     for c in channels:
         threading.Thread(target=c.run, name=f"chan-{c.name}", daemon=True).start()
-    threading.Thread(target=stdin_listener, args=(channels, stop), name="stdin-ctrl", daemon=True).start()
+    sampler = DiagnosticSampler(channels, lambda data: log("DIAGNOSTIC " + json.dumps(data)))
+    threading.Thread(target=stdin_listener, args=(channels, stop, sampler), name="stdin-ctrl", daemon=True).start()
 
     # Hardware profiles can place the already-letterboxed tiles in ffmpeg's
     # GPU filters. Unsupported filters/devices deliberately retain the proven
@@ -319,15 +325,6 @@ def main():
                                    f"drop{c.reduced_vcount - prev_reduced_counts[i]}/q{c.video_queue_depth()}/"
                                    f"{c.recovery_status()}"
                                    for i, c in enumerate(channels))
-                if cfg.get("diagnostic_logs", False):
-                    for i, c in enumerate(channels):
-                        (fresh, repeated, skipped, fallback, lag_total, lag_max, lag_count), depth = c.take_presentation_stats()
-                        lag_mean_ms = 1000 * lag_total / lag_count if lag_count else 0.0
-                        log(f"tile={c.name!r} decode={(c.vcount - prev_counts[i]) / dt:.1f}fps "
-                            f"scale={(c.scaled_vcount - prev_scaled_counts[i]) / dt:.1f}fps "
-                            f"fresh={fresh} repeat={repeated} skipped={skipped} fallback={fallback} "
-                            f"queue={depth} pts_age_mean={lag_mean_ms:.1f}ms pts_age_max={1000 * lag_max:.1f}ms "
-                            f"interval={dt:.1f}s {c.recovery_status()}", "INFO")
                 audio = []
                 for i, c in enumerate(audio_chs):
                     last_pts, buffered, resyncs, first_pts = c.audio_status()
